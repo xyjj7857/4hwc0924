@@ -10,10 +10,18 @@ import { MarketDataManager } from "./server/marketDataManager";
 
 // Initialize SQLite database
 const dbPath = process.env.DATABASE_PATH || "trading.db";
+try {
+  const dbDir = path.dirname(dbPath);
+  if (dbDir && dbDir !== "." && !fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+} catch (e) {
+  console.warn("Could not create database directory:", e);
+}
 const db = new Database(dbPath);
 db.pragma("journal_mode = WAL");
 
-const AUDIO_UPLOAD_DIR = path.join(process.cwd(), "uploads", "audio");
+const AUDIO_UPLOAD_DIR = process.env.AUDIO_UPLOAD_DIR || path.join(process.cwd(), "uploads", "audio");
 try {
   if (!fs.existsSync(AUDIO_UPLOAD_DIR)) {
     fs.mkdirSync(AUDIO_UPLOAD_DIR, { recursive: true });
@@ -1475,7 +1483,7 @@ setTimeout(() => {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   // 启动行情数据管道与 WebSocket 实时流
   marketDataManager.startPipeline().catch(err => {

@@ -1,19 +1,45 @@
 services:
-  binance-monitor:
+  trading-app:
     build:
       context: .
-      dockerfile: deploy.Dockerfile
-    container_name: binance-monitor-app
-    restart: always
+      dockerfile: Dockerfile
+    container_name: binance-trading-terminal
+    restart: unless-stopped
     ports:
+      # 映射主机端口 3000 到容器内部端口 3000（如需改用 80 或 8080 端口，可改为 "80:3000"）
       - "3000:3000"
-    volumes:
-      # Persistent SQLite database storage on the host
-      - ./data:/app/data
     environment:
+      # 生产环境模式
       - NODE_ENV=production
       - PORT=3000
-      # Change this to any secret key for encrypting local api configurations
+      # 默认中国标准时间（可按需修改，如 UTC）
+      - TZ=Asia/Shanghai
+      # 数据库与告警音频持久化路径
+      - DATABASE_PATH=/app/data/trading.db
+      - AUDIO_UPLOAD_DIR=/app/uploads/audio
+      # 本地数据库敏感凭证加密密钥（建议在生产环境替换为您自设的高强度随机字符串）
       - API_ENCRYPTION_KEY=BinanceTradingS3cr3tK3y!@#
-      # You can add other server-side environment variables here if needed
-      # - GEMINI_API_KEY=your_gemini_api_key_if_used
+    volumes:
+      # 持久化挂载 1：数据库目录（确保容器重启或更新镜像时，持仓历史、API密钥、自定义报警配置永不丢失）
+      - ./data:/app/data
+      # 持久化挂载 2：音频素材目录（确保用户自定义上传的报警提示音文件持久保留）
+      - ./uploads:/app/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/server-info || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        # 限制单日志文件最大 20MB，最多保留 5 个，防止 VPS 磁盘被海量 WebSocket 日志撑满
+        max-size: "20m"
+        max-file: "5"
+    # 资源保护限制（适配 1G ~ 2G 内存的 Ubuntu 服务器）
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+        reservations:
+          memory: 256M
