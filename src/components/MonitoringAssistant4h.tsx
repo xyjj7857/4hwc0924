@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
   Play, 
   Square, 
@@ -16,13 +16,20 @@ import {
   Upload,
   Pause,
   ChevronRight,
+  ChevronLeft,
+  ChevronDown,
+  ChevronUp,
   RefreshCw,
   Activity,
   Zap,
   HelpCircle,
   ClipboardList,
   Trash2,
-  Music
+  Music,
+  ArrowUpDown,
+  Info,
+  Lock,
+  ListOrdered
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TradeLog, Position } from '../types';
@@ -63,17 +70,47 @@ interface SymbolData {
   openPrice: number;
   lastPrice: number;
   change: number;
+  highChange?: number;
   change24h: number;
   amplitude?: number;
+  fundingRate?: number;
+  fundingIntervalHours?: number;
+  settlementCycle?: string;
+  nextFundingTime?: number;
+  listingOpen?: number;
+  listingTime?: number;
+  historicalHigh?: number;
+  historicalLow?: number;
+  highTime?: number;
+  lowTime?: number;
+  laterExtreme?: 'high' | 'low' | 'same';
+  candlesCount?: number;
 }
 
 interface VolumeSpikeData {
   symbol: string;
   ratio: number;
-  current1hVol: number;
-  prev1hVol: number;
-  volume24h: number;
+  current1hVol?: number;
+  currVolume?: number;
+  prev1hVol?: number;
+  prevVolume?: number;
+  volume24h?: number;
   change: number;
+  highChange?: number;
+  openPrice?: number;
+  lastPrice?: number;
+  fundingRate?: number;
+  fundingIntervalHours?: number;
+  settlementCycle?: string;
+  nextFundingTime?: number;
+  listingOpen?: number;
+  listingTime?: number;
+  historicalHigh?: number;
+  historicalLow?: number;
+  highTime?: number;
+  lowTime?: number;
+  laterExtreme?: 'high' | 'low' | 'same';
+  candlesCount?: number;
 }
 
 interface FundingRateData {
@@ -140,6 +177,9 @@ const TRANSLATIONS = {
   gainer24h: "24小时涨幅榜",
   loser24h: "24小时跌幅榜",
   tableSymbol: "币种",
+  tableLivePrice: "当前价",
+  tableOpenPrice: "4H开盘价",
+  tableFundingCycle: "资金费率(周期)",
   tableRate: "费率",
   tableCycle: "周期",
   table24hVol: "24h成交额（万）",
@@ -148,6 +188,10 @@ const TRANSLATIONS = {
   table1hChange: "1h涨跌幅",
   tableGain: "涨幅",
   tableLoss: "跌幅",
+  tableHighGain: "高涨幅",
+  tableHighLoss: "高跌幅",
+  gainModeStandard: "常规模式",
+  gainModeHigh: "高涨幅模式",
   tableAmplitude: "振幅",
   loading: "加载中...",
   currentTime: "当前时间",
@@ -239,6 +283,314 @@ export default function MonitoringAssistant4h({
   const [apiError, setApiError] = useState<string | null>(null);
   const [isScanning4hManual, setIsScanning4hManual] = useState(false);
   const [isScanningSpikeManual, setIsScanningSpikeManual] = useState(false);
+
+  // 区域1向左折叠状态 (默认收起)
+  const [isArea1Collapsed, setIsArea1Collapsed] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('area1_collapsed_4h');
+      return saved !== null ? saved === 'true' : true; // 默认收起
+    } catch {
+      return true;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('area1_collapsed_4h', String(isArea1Collapsed));
+    } catch {}
+  }, [isArea1Collapsed]);
+
+  // 区域2各模块向上折叠状态
+  const [collapsedModules, setCollapsedModules] = useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem('area2_collapsed_modules_4h');
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const toggleModuleCollapse = (id: string) => {
+    setCollapsedModules(prev => {
+      const updated = { ...prev, [id]: !prev[id] };
+      try {
+        localStorage.setItem('area2_collapsed_modules_4h', JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+  };
+
+  const collapseAllModules = () => {
+    const all: Record<string, boolean> = {
+      gainers4h: true,
+      losers4h: true,
+      amplitude4h: true,
+      volumeSpike1h: true,
+      gainers24h: true,
+      losers24h: true,
+    };
+    setCollapsedModules(all);
+    try {
+      localStorage.setItem('area2_collapsed_modules_4h', JSON.stringify(all));
+    } catch {}
+  };
+
+  const expandAllModules = () => {
+    setCollapsedModules({});
+    try {
+      localStorage.removeItem('area2_collapsed_modules_4h');
+    } catch {}
+  };
+
+  // 涨跌幅计算模式：'standard' (常规模式：基准为4H开盘价) 或 'high' (高涨幅模式：基准为当前价)
+  // 公式：
+  // 常规模式 = (当前价 - 4H开盘价) / 4H开盘价 × 100%
+  // 高涨幅模式 = (当前价 - 4H开盘价) / 当前价 × 100%
+  const [gainMode, setGainMode] = useState<'standard' | 'high'>(() => {
+    try {
+      const saved = localStorage.getItem('monitor_4h_gain_mode');
+      if (saved === 'high' || saved === 'standard') return saved;
+    } catch {}
+    return 'standard';
+  });
+
+  const toggleGainMode = useCallback((mode: 'standard' | 'high') => {
+    setGainMode(mode);
+    try {
+      localStorage.setItem('monitor_4h_gain_mode', mode);
+    } catch {}
+  }, []);
+
+  // 排序方案状态：方案1、固定（默认，排序不发生变化） | 方案2、排序（随涨跌幅实时重排序）
+  const [sortScheme, setSortScheme] = useState<'fixed' | 'dynamic'>(() => {
+    try {
+      const saved = localStorage.getItem('monitor_4h_sort_scheme');
+      if (saved === 'dynamic' || saved === 'fixed') return saved;
+    } catch {}
+    return 'fixed'; // 默认方案1：固定
+  });
+
+  const toggleSortScheme = useCallback((scheme: 'fixed' | 'dynamic') => {
+    setSortScheme(scheme);
+    try {
+      localStorage.setItem('monitor_4h_sort_scheme', scheme);
+    } catch {}
+  }, []);
+
+  // 价格通用格式化辅助函数
+  const formatPriceVal = useCallback((price?: number | null) => {
+    if (price === undefined || price === null || isNaN(price) || price === 0) return '--';
+    const abs = Math.abs(price);
+    if (abs >= 1000) {
+      return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    if (abs >= 1) return price.toFixed(4);
+    if (abs >= 0.01) return price.toFixed(5);
+    if (abs >= 0.0001) return price.toFixed(6);
+    return price.toFixed(8);
+  }, []);
+
+  // 格式化涨跌幅文本（杜绝 +-1.00% 格式错误）
+  const formatChangeText = useCallback((val?: number | null) => {
+    if (val === undefined || val === null || isNaN(val)) return '0.00%';
+    const prefix = val > 0 ? '+' : '';
+    return `${prefix}${val.toFixed(2)}%`;
+  }, []);
+
+  // 聚合当前币种的最新显示数据（实时推送当前价、未完结4H开盘价、资金费率、结算周期、常规涨幅、高涨幅、历史最高最低价）
+  const getSymbolDisplayData = useCallback((item: SymbolData) => {
+    const livePriceObj = livePrices[item.symbol];
+    const currentPrice = (livePriceObj && livePriceObj.lastPrice > 0) ? livePriceObj.lastPrice : (item.lastPrice || 0);
+    const openPrice = item.openPrice || 0;
+
+    // 常规涨跌幅: (当前价 - 4H开盘价) / 4H开盘价 * 100
+    let standardChange = item.change;
+    if (currentPrice > 0 && openPrice > 0) {
+      standardChange = ((currentPrice - openPrice) / openPrice) * 100;
+    }
+
+    // 高涨幅模式: (当前价 - 4H开盘价) / 当前价 * 100
+    let highGain = item.highChange !== undefined ? item.highChange : standardChange;
+    if (currentPrice > 0 && openPrice > 0) {
+      highGain = ((currentPrice - openPrice) / currentPrice) * 100;
+    }
+
+    const effectiveChange = gainMode === 'high' ? highGain : standardChange;
+
+    // 资金费率与结算周期 (来自实时订阅或全市场缓存)
+    let fundingRate = item.fundingRate;
+    let settlementCycle = item.settlementCycle;
+    if (fundingRate === undefined || !settlementCycle) {
+      const found = fundingRates.find(f => f.symbol === item.symbol) || contextFundingRates?.find(f => f.symbol === item.symbol);
+      if (found) {
+        if (fundingRate === undefined) fundingRate = found.fundingRate;
+        if (!settlementCycle) settlementCycle = found.settlementCycle;
+      }
+    }
+
+    // 历史最高/最低价与后出标记
+    let historicalHigh = item.historicalHigh || 0;
+    let historicalLow = item.historicalLow || 0;
+    let highTime = item.highTime || 0;
+    let lowTime = item.lowTime || 0;
+    let laterExtreme = item.laterExtreme || 'same';
+
+    if (currentPrice > 0) {
+      if (historicalHigh === 0 || currentPrice > historicalHigh) {
+        historicalHigh = currentPrice;
+        highTime = Date.now();
+        laterExtreme = 'high';
+      }
+      if (historicalLow === 0 || currentPrice < historicalLow) {
+        historicalLow = currentPrice;
+        lowTime = Date.now();
+        laterExtreme = 'low';
+      }
+    }
+
+    return {
+      currentPrice,
+      openPrice,
+      standardChange,
+      highGain,
+      effectiveChange,
+      fundingRate: fundingRate !== undefined ? fundingRate : 0,
+      settlementCycle: settlementCycle || '8h',
+      listingOpen: item.listingOpen || 0,
+      listingTime: item.listingTime || 0,
+      historicalHigh,
+      historicalLow,
+      highTime,
+      lowTime,
+      laterExtreme,
+      candlesCount: item.candlesCount || 0
+    };
+  }, [livePrices, gainMode, fundingRates, contextFundingRates]);
+
+  // 聚合 1H 放量币对的实时信息
+  const getSpikeDisplayData = useCallback((item: VolumeSpikeData) => {
+    const livePriceObj = livePrices[item.symbol];
+    const currentPrice = (livePriceObj && livePriceObj.lastPrice > 0) ? livePriceObj.lastPrice : (item.lastPrice || 0);
+    let fundingRate = item.fundingRate;
+    let settlementCycle = item.settlementCycle;
+    if (fundingRate === undefined || !settlementCycle) {
+      const found = fundingRates.find(f => f.symbol === item.symbol) || contextFundingRates?.find(f => f.symbol === item.symbol);
+      if (found) {
+        if (fundingRate === undefined) fundingRate = found.fundingRate;
+        if (!settlementCycle) settlementCycle = found.settlementCycle;
+      }
+    }
+
+    let historicalHigh = item.historicalHigh || 0;
+    let historicalLow = item.historicalLow || 0;
+    let highTime = item.highTime || 0;
+    let lowTime = item.lowTime || 0;
+    let laterExtreme = item.laterExtreme || 'same';
+
+    if (currentPrice > 0) {
+      if (historicalHigh === 0 || currentPrice > historicalHigh) {
+        historicalHigh = currentPrice;
+        highTime = Date.now();
+        laterExtreme = 'high';
+      }
+      if (historicalLow === 0 || currentPrice < historicalLow) {
+        historicalLow = currentPrice;
+        lowTime = Date.now();
+        laterExtreme = 'low';
+      }
+    }
+
+    return {
+      currentPrice,
+      openPrice: item.openPrice || 0,
+      fundingRate: fundingRate !== undefined ? fundingRate : 0,
+      settlementCycle: settlementCycle || '8h',
+      listingOpen: item.listingOpen || 0,
+      listingTime: item.listingTime || 0,
+      historicalHigh,
+      historicalLow,
+      highTime,
+      lowTime,
+      laterExtreme,
+      candlesCount: item.candlesCount || 0
+    };
+  }, [livePrices, fundingRates, contextFundingRates]);
+
+  // 聚合 24H 榜单币对的实时信息
+  const get24hDisplayData = useCallback((item: SymbolData) => {
+    const livePriceObj = livePrices[item.symbol];
+    const currentPrice = (livePriceObj && livePriceObj.lastPrice > 0) ? livePriceObj.lastPrice : (item.lastPrice || 0);
+    let fundingRate = item.fundingRate;
+    let settlementCycle = item.settlementCycle;
+    if (fundingRate === undefined || !settlementCycle) {
+      const found = fundingRates.find(f => f.symbol === item.symbol) || contextFundingRates?.find(f => f.symbol === item.symbol);
+      if (found) {
+        if (fundingRate === undefined) fundingRate = found.fundingRate;
+        if (!settlementCycle) settlementCycle = found.settlementCycle;
+      }
+    }
+
+    let historicalHigh = item.historicalHigh || 0;
+    let historicalLow = item.historicalLow || 0;
+    let highTime = item.highTime || 0;
+    let lowTime = item.lowTime || 0;
+    let laterExtreme = item.laterExtreme || 'same';
+
+    if (currentPrice > 0) {
+      if (historicalHigh === 0 || currentPrice > historicalHigh) {
+        historicalHigh = currentPrice;
+        highTime = Date.now();
+        laterExtreme = 'high';
+      }
+      if (historicalLow === 0 || currentPrice < historicalLow) {
+        historicalLow = currentPrice;
+        lowTime = Date.now();
+        laterExtreme = 'low';
+      }
+    }
+
+    return {
+      currentPrice,
+      openPrice: item.openPrice || 0,
+      fundingRate: fundingRate !== undefined ? fundingRate : 0,
+      settlementCycle: settlementCycle || '8h',
+      listingOpen: item.listingOpen || 0,
+      listingTime: item.listingTime || 0,
+      historicalHigh,
+      historicalLow,
+      highTime,
+      lowTime,
+      laterExtreme,
+      candlesCount: item.candlesCount || 0
+    };
+  }, [livePrices, fundingRates, contextFundingRates]);
+
+  // 依据当前模式与排序方案展示 4H 榜单
+  // 方案1、固定：排序不发生变化，保持入榜固定排位，仅数值实时更新（默认方案）
+  // 方案2、排序：随涨跌幅或高涨幅变动实时重新排序排位
+  const displayGainers = useMemo(() => {
+    if (!fourHourBoards.gainers || fourHourBoards.gainers.length === 0) return [];
+    if (sortScheme === 'fixed') {
+      return fourHourBoards.gainers;
+    }
+    return [...fourHourBoards.gainers].sort((a, b) => {
+      const changeA = getSymbolDisplayData(a).effectiveChange;
+      const changeB = getSymbolDisplayData(b).effectiveChange;
+      return changeB - changeA;
+    });
+  }, [fourHourBoards.gainers, sortScheme, getSymbolDisplayData]);
+
+  const displayLosers = useMemo(() => {
+    if (!fourHourBoards.losers || fourHourBoards.losers.length === 0) return [];
+    if (sortScheme === 'fixed') {
+      return fourHourBoards.losers;
+    }
+    return [...fourHourBoards.losers].sort((a, b) => {
+      const changeA = getSymbolDisplayData(a).effectiveChange;
+      const changeB = getSymbolDisplayData(b).effectiveChange;
+      return changeA - changeB;
+    });
+  }, [fourHourBoards.losers, sortScheme, getSymbolDisplayData]);
 
   // Audio state
   const [audioFiles, setAudioFiles] = useState<{ gain: string | null; loss: string | null; amp: string | null; spike: string | null }>({
@@ -868,10 +1220,82 @@ export default function MonitoringAssistant4h({
     <div className="text-gray-100 font-sans selection:bg-red-500/30 min-h-[calc(100vh-170px)] flex flex-col gap-6">
       <audio ref={audioRef} />
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 mt-1 flex-1 items-stretch">
+      <div className="flex flex-col lg:flex-row gap-5 mt-1 flex-1 items-start w-full transition-all">
         
-        {/* Left Column: Config & Audio OR Funding Rate Ranking */}
-        <div className="lg:col-span-4 flex flex-col space-y-5 h-full">
+        {/* ========================================================================= */}
+        {/* 区域 1：控制中心 & 资金费率 (可向左折叠，默认收起) */}
+        {/* ========================================================================= */}
+        {isArea1Collapsed ? (
+          <>
+            {/* 桌面端折叠窄条 (向右展开) */}
+            <div className="hidden lg:flex flex-col items-center w-14 shrink-0 bg-[#141416]/80 rounded-2xl border border-white/10 p-2.5 py-4 shadow-xl sticky top-4 transition-all group select-none">
+              <button
+                type="button"
+                onClick={() => setIsArea1Collapsed(false)}
+                className="w-9 h-9 rounded-xl bg-purple-500/15 hover:bg-purple-500/30 border border-purple-500/40 text-purple-300 hover:text-white flex items-center justify-center transition-all cursor-pointer shadow-md group hover:scale-105"
+                title="向右展开控制面板与资金费率（区域1）"
+              >
+                <ChevronRight className="w-5 h-5 group-hover:translate-x-0.5 transition-transform" />
+              </button>
+
+              <div className="my-4 flex flex-col items-center gap-2">
+                <span 
+                  className={`w-2.5 h-2.5 rounded-full ${isRunning ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'}`} 
+                  title={isRunning ? "程序运行中" : "程序未启动"} 
+                />
+                <span 
+                  className={`w-2 h-2 rounded-full ${dataEngine?.markPriceActive ? 'bg-purple-400' : 'bg-amber-400'}`} 
+                  title="资金费率引擎状态" 
+                />
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setIsArea1Collapsed(false)}
+                className="flex-1 flex flex-col items-center justify-center py-6 cursor-pointer text-zinc-400 hover:text-purple-300 transition-colors"
+                title="点击向右展开区域1"
+              >
+                <span className="[writing-mode:vertical-rl] text-xs tracking-widest font-bold uppercase select-none">
+                  区域 1 · 控制中心 & 资金费率
+                </span>
+              </button>
+            </div>
+
+            {/* 移动端折叠横条 */}
+            <div className="lg:hidden w-full bg-[#141416]/80 border border-white/10 rounded-xl p-3 flex items-center justify-between shadow-md">
+              <div className="flex items-center gap-2 text-xs font-bold text-zinc-300">
+                <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'}`} />
+                <span>区域1 · 控制中心与资金费率 (已收起)</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsArea1Collapsed(false)}
+                className="px-3 py-1.5 rounded-lg bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 text-xs font-bold flex items-center gap-1 cursor-pointer"
+              >
+                <span>展开</span>
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </>
+        ) : (
+          /* 展开状态的区域1 */
+          <div className="w-full lg:w-[420px] xl:w-[440px] shrink-0 flex flex-col space-y-5">
+            {/* 区域1 头部控制栏：向左收起按钮 */}
+            <div className="bg-[#141416]/90 px-4 py-2.5 rounded-xl border border-white/10 flex items-center justify-between text-xs shadow-md">
+              <span className="font-bold text-zinc-300 flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-500'}`} />
+                <span>区域 1 · 控制中心与资金费率</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsArea1Collapsed(true)}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-300 hover:text-white border border-white/10 transition-all cursor-pointer font-bold text-xs"
+                title="向左收起区域1"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+                <span>向左收起</span>
+              </button>
+            </div>
           
           {showSettings ? (
             <>
@@ -1524,7 +1948,7 @@ export default function MonitoringAssistant4h({
                   <span className="text-zinc-400">活跃合约: <span className="text-purple-400 font-mono font-bold">{dataEngine.universeCount}</span></span>
                 </div>
                 <div className="flex items-center gap-3 text-zinc-400">
-                  <span>WS流: <span className="text-zinc-200 font-mono font-bold">{dataEngine.klineStreamsActive} 组</span></span>
+                  <span>数据流: <span className="text-zinc-200 font-mono font-bold">15m流聚合 (未订阅4H流)</span></span>
                   <span>资金费率WS: <span className={`font-bold ${dataEngine.markPriceActive ? "text-emerald-400" : "text-amber-400"}`}>{dataEngine.markPriceActive ? "实时连接" : "连接中"}</span></span>
                 </div>
               </div>
@@ -1608,10 +2032,132 @@ export default function MonitoringAssistant4h({
             )}
           </section>
 
-        </div>
+          </div>
+        )}
 
-        {/* Right Column: Results */}
-        <div className="lg:col-span-8 flex flex-col space-y-6 h-full">
+        {/* ========================================================================= */}
+        {/* 区域 2：行情异动与榜单监控 (纵向排列，每个模块支持向上折叠) */}
+        {/* ========================================================================= */}
+        <div className="flex-1 min-w-0 w-full flex flex-col space-y-5">
+          
+          {/* 区域2 顶部工具栏：模式切换 + 全部展开 / 全部折叠 */}
+          <div className="bg-[#141416]/90 px-4 py-2.5 rounded-xl border border-white/10 flex items-center justify-between flex-wrap gap-3 text-xs shadow-md">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
+              <span className="font-bold text-zinc-200 text-sm">区域 2 · 行情异动与榜单监控</span>
+              <span className="text-zinc-500 font-mono text-xs hidden sm:inline">(共 6 个榜单 · 纵向排列)</span>
+            </div>
+
+            <div className="flex items-center gap-3 flex-wrap">
+              {/* 涨幅计算模式切换 */}
+              <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/10 shadow-inner">
+                <span className="text-zinc-400 text-xs px-2 font-medium flex items-center gap-1">
+                  <ArrowUpDown className="w-3.5 h-3.5 text-purple-400" />
+                  模式:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => toggleGainMode('standard')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    gainMode === 'standard'
+                      ? 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/40 shadow-sm'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="常规模式：以4H开盘价为分母 (当前价 - 4H开盘价) ÷ 4H开盘价 × 100%"
+                >
+                  常规模式
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggleGainMode('high')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    gainMode === 'high'
+                      ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/40 shadow-sm'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="高涨幅模式：以推送当前价为分母 (当前价 - 4H开盘价) ÷ 当前价 × 100%"
+                >
+                  高涨幅模式
+                </button>
+                {/* 模式说明悬浮提示 */}
+                <div className="relative group/mode-tip ml-1">
+                  <span className="cursor-help text-zinc-400 hover:text-zinc-200 p-0.5 inline-block">
+                    <Info className="w-3.5 h-3.5 text-zinc-400" />
+                  </span>
+                  <div className="absolute right-0 top-full mt-2 hidden group-hover/mode-tip:block z-50 w-72 p-3 rounded-xl bg-[#121316] border border-white/20 shadow-2xl text-[11px] text-zinc-300 pointer-events-none leading-relaxed">
+                    <p className="font-bold text-white mb-1.5 pb-1 border-b border-white/10">涨跌幅计算模式说明</p>
+                    <p className="mb-1"><strong className="text-emerald-400">常规模式：</strong>(当前价 - 4H开盘价) ÷ 4H开盘价 × 100%（传统交易所行情基准）</p>
+                    <p><strong className="text-cyan-400">高涨幅模式：</strong>(当前价 - 4H开盘价) ÷ 当前价 × 100%（以推送现价为基准）</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 排序方案切换：方案1、固定（默认） | 方案2、排序 */}
+              <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/10 shadow-inner">
+                <span className="text-zinc-400 text-xs px-2 font-medium flex items-center gap-1">
+                  <ListOrdered className="w-3.5 h-3.5 text-purple-400" />
+                  排序方案:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => toggleSortScheme('fixed')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                    sortScheme === 'fixed'
+                      ? 'bg-purple-500/25 text-purple-200 border border-purple-500/40 shadow-sm'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="方案1·固定：排序不发生变化，保持入榜固定排位，仅数值实时更新（默认方案）"
+                >
+                  <Lock className="w-3 h-3 text-purple-300" />
+                  <span>方案1·固定</span>
+                  <span className="text-[10px] text-purple-300/80 font-normal">(默认)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggleSortScheme('dynamic')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                    sortScheme === 'dynamic'
+                      ? 'bg-purple-500/25 text-purple-200 border border-purple-500/40 shadow-sm'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="方案2·排序：随涨跌幅或高涨跌幅变化，实时重新对榜单排位进行排序"
+                >
+                  <ArrowUpDown className="w-3 h-3 text-purple-300" />
+                  <span>方案2·排序</span>
+                </button>
+                {/* 排序说明悬浮提示 */}
+                <div className="relative group/sort-tip ml-1">
+                  <span className="cursor-help text-zinc-400 hover:text-zinc-200 p-0.5 inline-block">
+                    <Info className="w-3.5 h-3.5 text-zinc-400" />
+                  </span>
+                  <div className="absolute right-0 top-full mt-2 hidden group-hover/sort-tip:block z-50 w-72 p-3 rounded-xl bg-[#121316] border border-white/20 shadow-2xl text-[11px] text-zinc-300 pointer-events-none leading-relaxed">
+                    <p className="font-bold text-white mb-1.5 pb-1 border-b border-white/10">榜单排序方案说明</p>
+                    <p className="mb-1"><strong className="text-purple-300">方案1·固定（默认）：</strong>涨跌幅或高涨跌幅数值发生变动时，行排位固定不跳动，保持上轮结算顺序。</p>
+                    <p><strong className="text-purple-300">方案2·排序：</strong>涨跌幅或高涨跌幅数值发生变动时，实时动态重新排序排位。</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={expandAllModules}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 active:scale-95 text-zinc-300 hover:text-white border border-white/10 transition-all font-medium text-xs cursor-pointer"
+                  title="一键展开全部 6 个榜单模块"
+                >
+                  全部展开
+                </button>
+                <button
+                  type="button"
+                  onClick={collapseAllModules}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 active:scale-95 text-zinc-300 hover:text-white border border-white/10 transition-all font-medium text-xs cursor-pointer"
+                  title="一键向上折叠全部 6 个榜单模块"
+                >
+                  全部折叠
+                </button>
+              </div>
+            </div>
+          </div>
           
           {/* Alert Banner */}
           <AnimatePresence>
@@ -1655,20 +2201,52 @@ export default function MonitoringAssistant4h({
             )}
           </AnimatePresence>
 
-          {/* 4H Level Boards (Top 3) */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-[300px]">
+          {/* 纵向排列的 6 个榜单模块 (每个均支持向上折叠) */}
+          <div className="flex flex-col space-y-4">
             
-            {/* 4H Gainers */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center border border-emerald-500/20 shadow-md">
+            {/* 1. 4小时涨幅榜 */}
+            <section className="bg-[#141416]/60 rounded-2xl border border-white/10 overflow-hidden shadow-xl transition-all">
+              <div 
+                onClick={() => toggleModuleCollapse('gainers4h')}
+                className="px-4 py-3 bg-white/[0.03] hover:bg-white/[0.06] border-b border-white/5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center border border-emerald-500/20 shadow-md shrink-0">
                     <TrendingUp className="w-5 h-5 text-emerald-500 animate-pulse" />
                   </div>
-                  <h2 className="text-[24px] font-bold text-emerald-500 tracking-tight">{t.gainer4h}</h2>
+                  <h2 className="text-[20px] sm:text-[22px] font-bold text-emerald-500 tracking-tight whitespace-nowrap">
+                    {gainMode === 'high' ? '4小时高涨幅榜' : t.gainer4h}
+                  </h2>
+
+                  {/* 模式标签 */}
+                  <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${
+                    gainMode === 'high' 
+                      ? 'bg-cyan-500/15 border-cyan-500/30 text-cyan-300' 
+                      : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
+                  }`}>
+                    {gainMode === 'high' ? '高涨幅模式' : '常规模式'}
+                  </span>
+
+                  {/* 排序方案标签 (可点击切换) */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleSortScheme(sortScheme === 'fixed' ? 'dynamic' : 'fixed');
+                    }}
+                    className={`text-[11px] font-bold px-2 py-0.5 rounded-full border shrink-0 flex items-center gap-1 transition-all cursor-pointer ${
+                      sortScheme === 'fixed'
+                        ? 'bg-purple-500/15 border-purple-500/30 text-purple-300 hover:bg-purple-500/25'
+                        : 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/25'
+                    }`}
+                    title="点击切换排序方案：方案1·固定(默认) / 方案2·排序"
+                  >
+                    {sortScheme === 'fixed' ? <Lock className="w-2.5 h-2.5" /> : <ArrowUpDown className="w-2.5 h-2.5" />}
+                    <span>{sortScheme === 'fixed' ? '方案1:固定' : '方案2:排序'}</span>
+                  </button>
 
                   {/* 说明书 */}
-                  <div className="relative group/gain4h-help flex items-center">
+                  <div className="relative group/gain4h-help flex items-center" onClick={e => e.stopPropagation()}>
                     <button
                       type="button"
                       className="p-1 rounded-full text-white hover:text-emerald-300 hover:bg-white/10 transition-all cursor-help focus:outline-none flex items-center justify-center"
@@ -1705,7 +2283,8 @@ export default function MonitoringAssistant4h({
                           </div>
                           <div className="text-zinc-400 pl-3 space-y-1">
                             <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT 且 4h成交额 ≥ {formatVolume(config.n1)} USDT。</p>
-                            <p>• <span className="text-zinc-200 font-medium">计算公式：</span><span className="text-emerald-300 font-mono font-bold">(当前最新价 - 4h开盘价) ÷ 4h开盘价 × 100%</span>。</p>
+                            <p>• <span className="text-zinc-200 font-medium">常规涨幅：</span><span className="text-emerald-300 font-mono font-bold">(当前价 - 4h开盘价) ÷ 4h开盘价 × 100%</span>。</p>
+                            <p>• <span className="text-cyan-300 font-medium">高涨幅模式：</span><span className="text-cyan-300 font-mono font-bold">(当前价 - 4h开盘价) ÷ 当前价 × 100%</span>。</p>
                           </div>
                         </div>
 
@@ -1722,24 +2301,62 @@ export default function MonitoringAssistant4h({
                     </div>
                   </div>
                 </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  {collapsedModules.gainers4h && displayGainers.length > 0 && (
+                    <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/20 text-xs font-mono font-bold text-emerald-400">
+                      <span>TOP1: {displayGainers[0].symbol.replace('USDT', '')}</span>
+                      <span>{formatChangeText(getSymbolDisplayData(displayGainers[0]).effectiveChange)}</span>
+                    </span>
+                  )}
+                  <span className="text-[13px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+                  <button
+                    type="button"
+                    className="p-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-400 hover:text-white transition-colors"
+                    title={collapsedModules.gainers4h ? "展开模块" : "向上折叠模块"}
+                  >
+                    {collapsedModules.gainers4h ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
               
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
+              {!collapsedModules.gainers4h && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[850px]">
                     <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.table4hVol}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.tableGain}</th>
+                      <tr className="bg-white/5 text-[14px] text-gray-400 uppercase font-bold tracking-wider">
+                        <th className="px-4 py-3 text-left w-[15%]">{t.tableSymbol}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableLivePrice}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableOpenPrice}</th>
+                        <th className="px-3 py-3 text-right w-[20%]">
+                          <div className="flex items-center justify-end gap-1" title="币对上线以来的开盘价、全历史最高/最低价，并标记后创出的极值方向">
+                            <span>上线开盘 / 历史高低</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-purple-500/20 text-purple-300">
+                              全历史
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
+                        <th className="px-3 py-3 text-right w-[13%]">{t.table4hVol}</th>
+                        <th className="px-4 py-3 text-right w-[14%]">
+                          <div className="flex items-center justify-end gap-1">
+                            <span>{gainMode === 'high' ? t.tableHighGain : t.tableGain}</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-white/10 text-zinc-300">
+                              {gainMode === 'high' ? '现价分母' : '开盘分母'}
+                            </span>
+                            <span className={`text-[10px] font-normal px-1 py-0.5 rounded ${sortScheme === 'fixed' ? 'bg-purple-500/20 text-purple-300' : 'bg-indigo-500/20 text-indigo-300'}`}>
+                              {sortScheme === 'fixed' ? '固定' : '实时排序'}
+                            </span>
+                          </div>
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
                       <AnimatePresence mode="popLayout">
-                        {fourHourBoards.gainers.map((item, idx) => {
+                        {displayGainers.map((item, idx) => {
                           const isHolding = isHoldingPosition(item.symbol);
-                          const shouldHighlight = isAlerting && item.change >= config.gainThreshold;
+                          const data = getSymbolDisplayData(item);
+                          const shouldHighlight = isAlerting && data.effectiveChange >= config.gainThreshold;
                           return (
                             <motion.tr 
                               key={item.symbol} 
@@ -1755,38 +2372,109 @@ export default function MonitoringAssistant4h({
                               title="点击同步交易"
                               onClick={() => handleRowClick(item.symbol)}
                             >
+                              {/* 1. 币种 */}
                               <td className="px-4 py-3 text-left">
                                 <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
+                                  <span className={`font-bold text-[19px] sm:text-[21px] ${
                                     isHolding 
                                       ? 'text-[#d946ef]' 
-                                      : (shouldHighlight ? 'text-emerald-400' : 'text-zinc-200 group-hover:text-emerald-500')
-                                  } transition-colors uppercase`}>
+                                      : (shouldHighlight ? 'text-emerald-400' : 'text-zinc-200 group-hover:text-emerald-400')
+                                  } transition-colors uppercase font-sans`}>
                                     {item.symbol.replace('USDT', '')}
                                   </span>
                                   {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
+                                    <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
                                       持仓中
                                     </span>
                                   )}
                                 </div>
                               </td>
-                              <td className={`px-2 py-3 text-center font-mono text-[18px] font-bold ${shouldHighlight ? 'text-emerald-300' : 'text-emerald-500'}`}>
+
+                              {/* 2. 推送当前价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
+                                {formatPriceVal(data.currentPrice)}
+                              </td>
+
+                              {/* 3. 4H开盘价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[15px] font-medium text-zinc-400">
+                                {formatPriceVal(data.openPrice)}
+                              </td>
+
+                              {/* 4. 上线开盘 / 历史最高/最低价 与 后出极值标记 */}
+                              <td className="px-3 py-2 text-right">
+                                <div className="flex flex-col items-end gap-0.5 font-mono text-[13px] leading-tight">
+                                  <div className="flex items-center gap-1.5 justify-end" title="币对上线首根K线开盘价">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">上线开盘</span>
+                                    <span className="font-semibold text-zinc-300">
+                                      {data.listingOpen > 0 ? formatPriceVal(data.listingOpen) : '--'}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史高</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'high' ? 'text-emerald-400 font-bold' : 'text-zinc-300'}`}>
+                                      {data.historicalHigh > 0 ? formatPriceVal(data.historicalHigh) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'high' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最高价（多头结构）"
+                                      >
+                                        后创高 ▲
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史低</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'low' ? 'text-red-400 font-bold' : 'text-zinc-400'}`}>
+                                      {data.historicalLow > 0 ? formatPriceVal(data.historicalLow) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'low' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-red-500/20 text-red-300 border border-red-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最低价（空头结构）"
+                                      >
+                                        后创低 ▼
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+
+                              {/* 5. 资金费率 (周期) */}
+                              <td className="px-3 py-3 text-center">
+                                <div className="inline-flex items-center gap-1 font-mono text-[14px]">
+                                  <span className={`font-bold ${data.fundingRate > 0 ? 'text-amber-300' : data.fundingRate < 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                                    {data.fundingRate > 0 ? '+' : ''}{data.fundingRate.toFixed(4)}%
+                                  </span>
+                                  <span className="text-zinc-500 text-xs font-normal">
+                                    ({data.settlementCycle})
+                                  </span>
+                                </div>
+                              </td>
+
+                              {/* 6. 4H成交额 */}
+                              <td className={`px-3 py-3 text-right font-mono text-[16px] font-bold ${shouldHighlight ? 'text-emerald-300' : 'text-emerald-500'}`}>
                                 {formatVolume(item.volume15m)}
                               </td>
+
+                              {/* 7. 涨幅 */}
                               <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-emerald-500 font-bold text-[21px] font-sans">
-                                  +{item.change.toFixed(2)}%
-                                  <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-emerald-500" />
+                                <div className="flex items-center justify-end gap-1 text-emerald-400 font-bold text-[19px] sm:text-[21px] font-mono">
+                                  {formatChangeText(data.effectiveChange)}
+                                  <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-emerald-400" />
                                 </div>
                               </td>
                             </motion.tr>
                           );
                         })}
                       </AnimatePresence>
-                      {(!fourHourBoards || fourHourBoards.gainers.length === 0) && (
+                      {(!displayGainers || displayGainers.length === 0) && (
                         <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
+                          <td colSpan={7} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
                             {t.waitingScan}
                           </td>
                         </tr>
@@ -1794,20 +2482,52 @@ export default function MonitoringAssistant4h({
                     </tbody>
                   </table>
                 </div>
-              </div>
+              )}
             </section>
 
-            {/* 4H Losers */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-red-500/10 rounded-lg flex items-center justify-center border border-red-500/20 shadow-md">
+            {/* 2. 4小时跌幅榜 */}
+            <section className="bg-[#141416]/60 rounded-2xl border border-white/10 overflow-hidden shadow-xl transition-all">
+              <div 
+                onClick={() => toggleModuleCollapse('losers4h')}
+                className="px-4 py-3 bg-white/[0.03] hover:bg-white/[0.06] border-b border-white/5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 bg-red-500/10 rounded-lg flex items-center justify-center border border-red-500/20 shadow-md shrink-0">
                     <TrendingDown className="w-5 h-5 text-red-500 animate-pulse" />
                   </div>
-                  <h2 className="text-[24px] font-bold text-red-500 tracking-tight">{t.loser4h}</h2>
+                  <h2 className="text-[20px] sm:text-[22px] font-bold text-red-500 tracking-tight whitespace-nowrap">
+                    {gainMode === 'high' ? '4小时高跌幅榜' : t.loser4h}
+                  </h2>
+
+                  {/* 模式标签 */}
+                  <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${
+                    gainMode === 'high' 
+                      ? 'bg-cyan-500/15 border-cyan-500/30 text-cyan-300' 
+                      : 'bg-red-500/15 border-red-500/30 text-red-400'
+                  }`}>
+                    {gainMode === 'high' ? '高跌幅模式' : '常规模式'}
+                  </span>
+
+                  {/* 排序方案标签 (可点击切换) */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleSortScheme(sortScheme === 'fixed' ? 'dynamic' : 'fixed');
+                    }}
+                    className={`text-[11px] font-bold px-2 py-0.5 rounded-full border shrink-0 flex items-center gap-1 transition-all cursor-pointer ${
+                      sortScheme === 'fixed'
+                        ? 'bg-purple-500/15 border-purple-500/30 text-purple-300 hover:bg-purple-500/25'
+                        : 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/25'
+                    }`}
+                    title="点击切换排序方案：方案1·固定(默认) / 方案2·排序"
+                  >
+                    {sortScheme === 'fixed' ? <Lock className="w-2.5 h-2.5" /> : <ArrowUpDown className="w-2.5 h-2.5" />}
+                    <span>{sortScheme === 'fixed' ? '方案1:固定' : '方案2:排序'}</span>
+                  </button>
 
                   {/* 说明书 */}
-                  <div className="relative group/loss4h-help flex items-center">
+                  <div className="relative group/loss4h-help flex items-center" onClick={e => e.stopPropagation()}>
                     <button
                       type="button"
                       className="p-1 rounded-full text-white hover:text-red-300 hover:bg-white/10 transition-all cursor-help focus:outline-none flex items-center justify-center"
@@ -1844,7 +2564,8 @@ export default function MonitoringAssistant4h({
                           </div>
                           <div className="text-zinc-400 pl-3 space-y-1">
                             <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT 且 4h成交额 ≥ {formatVolume(config.n1)} USDT。</p>
-                            <p>• <span className="text-zinc-200 font-medium">计算公式：</span><span className="text-red-300 font-mono font-bold">(当前最新价 - 4h开盘价) ÷ 4h开盘价 × 100%</span>。</p>
+                            <p>• <span className="text-zinc-200 font-medium">常规跌幅：</span><span className="text-red-300 font-mono font-bold">(当前价 - 4h开盘价) ÷ 4h开盘价 × 100%</span>。</p>
+                            <p>• <span className="text-cyan-300 font-medium">高跌幅模式：</span><span className="text-cyan-300 font-mono font-bold">(当前价 - 4h开盘价) ÷ 当前价 × 100%</span>。</p>
                           </div>
                         </div>
 
@@ -1861,24 +2582,62 @@ export default function MonitoringAssistant4h({
                     </div>
                   </div>
                 </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  {collapsedModules.losers4h && displayLosers.length > 0 && (
+                    <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-red-500/10 border border-red-500/20 text-xs font-mono font-bold text-red-400">
+                      <span>TOP1: {displayLosers[0].symbol.replace('USDT', '')}</span>
+                      <span>{formatChangeText(getSymbolDisplayData(displayLosers[0]).effectiveChange)}</span>
+                    </span>
+                  )}
+                  <span className="text-[13px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+                  <button
+                    type="button"
+                    className="p-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-400 hover:text-white transition-colors"
+                    title={collapsedModules.losers4h ? "展开模块" : "向上折叠模块"}
+                  >
+                    {collapsedModules.losers4h ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
               
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
+              {!collapsedModules.losers4h && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[850px]">
                     <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.table4hVol}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.tableLoss}</th>
+                      <tr className="bg-white/5 text-[14px] text-gray-400 uppercase font-bold tracking-wider">
+                        <th className="px-4 py-3 text-left w-[15%]">{t.tableSymbol}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableLivePrice}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableOpenPrice}</th>
+                        <th className="px-3 py-3 text-right w-[20%]">
+                          <div className="flex items-center justify-end gap-1" title="币对上线以来的开盘价、全历史最高/最低价，并标记后创出的极值方向">
+                            <span>上线开盘 / 历史高低</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-purple-500/20 text-purple-300">
+                              全历史
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
+                        <th className="px-3 py-3 text-right w-[13%]">{t.table4hVol}</th>
+                        <th className="px-4 py-3 text-right w-[14%]">
+                          <div className="flex items-center justify-end gap-1">
+                            <span>{gainMode === 'high' ? t.tableHighLoss : t.tableLoss}</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-white/10 text-zinc-300">
+                              {gainMode === 'high' ? '现价分母' : '开盘分母'}
+                            </span>
+                            <span className={`text-[10px] font-normal px-1 py-0.5 rounded ${sortScheme === 'fixed' ? 'bg-purple-500/20 text-purple-300' : 'bg-indigo-500/20 text-indigo-300'}`}>
+                              {sortScheme === 'fixed' ? '固定' : '实时排序'}
+                            </span>
+                          </div>
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
                       <AnimatePresence mode="popLayout">
-                        {fourHourBoards.losers.map((item, idx) => {
+                        {displayLosers.map((item, idx) => {
                           const isHolding = isHoldingPosition(item.symbol);
-                          const shouldHighlight = isAlerting && Math.abs(item.change) >= config.lossThreshold;
+                          const data = getSymbolDisplayData(item);
+                          const shouldHighlight = isAlerting && Math.abs(data.effectiveChange) >= config.lossThreshold;
                           return (
                             <motion.tr 
                               key={item.symbol} 
@@ -1894,28 +2653,99 @@ export default function MonitoringAssistant4h({
                               title="点击同步交易"
                               onClick={() => handleRowClick(item.symbol)}
                             >
+                              {/* 1. 币种 */}
                               <td className="px-4 py-3 text-left">
                                 <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
+                                  <span className={`font-bold text-[19px] sm:text-[21px] ${
                                     isHolding 
                                       ? 'text-[#d946ef]' 
-                                      : (shouldHighlight ? 'text-red-400' : 'text-zinc-200 group-hover:text-red-500')
-                                  } transition-colors uppercase`}>
+                                      : (shouldHighlight ? 'text-red-400' : 'text-zinc-200 group-hover:text-red-400')
+                                  } transition-colors uppercase font-sans`}>
                                     {item.symbol.replace('USDT', '')}
                                   </span>
                                   {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
+                                    <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
                                       持仓中
                                     </span>
                                   )}
                                 </div>
                               </td>
-                              <td className={`px-2 py-3 text-center font-mono text-[18px] font-bold ${shouldHighlight ? 'text-red-300' : 'text-emerald-500'}`}>
+
+                              {/* 2. 推送当前价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
+                                {formatPriceVal(data.currentPrice)}
+                              </td>
+
+                              {/* 3. 4H开盘价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[15px] font-medium text-zinc-400">
+                                {formatPriceVal(data.openPrice)}
+                              </td>
+
+                              {/* 4. 上线开盘 / 历史最高/最低价 与 后出极值标记 */}
+                              <td className="px-3 py-2 text-right">
+                                <div className="flex flex-col items-end gap-0.5 font-mono text-[13px] leading-tight">
+                                  <div className="flex items-center gap-1.5 justify-end" title="币对上线首根K线开盘价">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">上线开盘</span>
+                                    <span className="font-semibold text-zinc-300">
+                                      {data.listingOpen > 0 ? formatPriceVal(data.listingOpen) : '--'}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史高</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'high' ? 'text-emerald-400 font-bold' : 'text-zinc-300'}`}>
+                                      {data.historicalHigh > 0 ? formatPriceVal(data.historicalHigh) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'high' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最高价（多头结构）"
+                                      >
+                                        后创高 ▲
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史低</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'low' ? 'text-red-400 font-bold' : 'text-zinc-400'}`}>
+                                      {data.historicalLow > 0 ? formatPriceVal(data.historicalLow) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'low' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-red-500/20 text-red-300 border border-red-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最低价（空头结构）"
+                                      >
+                                        后创低 ▼
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+
+                              {/* 5. 资金费率 (周期) */}
+                              <td className="px-3 py-3 text-center">
+                                <div className="inline-flex items-center gap-1 font-mono text-[14px]">
+                                  <span className={`font-bold ${data.fundingRate > 0 ? 'text-amber-300' : data.fundingRate < 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                                    {data.fundingRate > 0 ? '+' : ''}{data.fundingRate.toFixed(4)}%
+                                  </span>
+                                  <span className="text-zinc-500 text-xs font-normal">
+                                    ({data.settlementCycle})
+                                  </span>
+                                </div>
+                              </td>
+
+                              {/* 6. 4H成交额 */}
+                              <td className={`px-3 py-3 text-right font-mono text-[16px] font-bold ${shouldHighlight ? 'text-red-300' : 'text-emerald-500'}`}>
                                 {formatVolume(item.volume15m)}
                               </td>
+
+                              {/* 7. 跌幅 */}
                               <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-red-500 font-bold text-[21px] font-sans">
-                                  {item.change.toFixed(2)}%
+                                <div className="flex items-center justify-end gap-1 text-red-500 font-bold text-[19px] sm:text-[21px] font-mono">
+                                  {formatChangeText(data.effectiveChange)}
                                   <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-red-500" />
                                 </div>
                               </td>
@@ -1923,9 +2753,9 @@ export default function MonitoringAssistant4h({
                           );
                         })}
                       </AnimatePresence>
-                      {(!fourHourBoards || fourHourBoards.losers.length === 0) && (
+                      {(!displayLosers || displayLosers.length === 0) && (
                         <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
+                          <td colSpan={7} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
                             {t.waitingScan}
                           </td>
                         </tr>
@@ -1933,20 +2763,23 @@ export default function MonitoringAssistant4h({
                     </tbody>
                   </table>
                 </div>
-              </div>
+              )}
             </section>
 
-            {/* 4H Amplitude */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-amber-500/10 rounded-lg flex items-center justify-center border border-amber-500/20 shadow-md">
+            {/* 3. 4小时振幅榜 */}
+            <section className="bg-[#141416]/60 rounded-2xl border border-white/10 overflow-hidden shadow-xl transition-all">
+              <div 
+                onClick={() => toggleModuleCollapse('amplitude4h')}
+                className="px-4 py-3 bg-white/[0.03] hover:bg-white/[0.06] border-b border-white/5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 bg-amber-500/10 rounded-lg flex items-center justify-center border border-amber-500/20 shadow-md shrink-0">
                     <Activity className="w-5 h-5 text-amber-500 animate-pulse" />
                   </div>
-                  <h2 className="text-[24px] font-bold text-amber-500 tracking-tight">{t.amplitude4h}</h2>
+                  <h2 className="text-[20px] sm:text-[22px] font-bold text-amber-500 tracking-tight whitespace-nowrap">{t.amplitude4h}</h2>
 
                   {/* 说明书 */}
-                  <div className="relative group/amp4h-help flex items-center">
+                  <div className="relative group/amp4h-help flex items-center" onClick={e => e.stopPropagation()}>
                     <button
                       type="button"
                       className="p-1 rounded-full text-white hover:text-amber-300 hover:bg-white/10 transition-all cursor-help focus:outline-none flex items-center justify-center"
@@ -2000,23 +2833,51 @@ export default function MonitoringAssistant4h({
                     </div>
                   </div>
                 </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  {collapsedModules.amplitude4h && fourHourBoards.amplitude15m?.length > 0 && (
+                    <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-xs font-mono font-bold text-amber-400">
+                      <span>TOP1: {fourHourBoards.amplitude15m[0].symbol.replace('USDT', '')}</span>
+                      <span>{(fourHourBoards.amplitude15m[0].amplitude || 0).toFixed(2)}%</span>
+                    </span>
+                  )}
+                  <span className="text-[13px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+                  <button
+                    type="button"
+                    className="p-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-400 hover:text-white transition-colors"
+                    title={collapsedModules.amplitude4h ? "展开模块" : "向上折叠模块"}
+                  >
+                    {collapsedModules.amplitude4h ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
               
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
+              {!collapsedModules.amplitude4h && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[850px]">
                     <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.table4hVol}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.tableAmplitude}</th>
+                      <tr className="bg-white/5 text-[14px] text-gray-400 uppercase font-bold tracking-wider">
+                        <th className="px-4 py-3 text-left w-[15%]">{t.tableSymbol}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableLivePrice}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableOpenPrice}</th>
+                        <th className="px-3 py-3 text-right w-[20%]">
+                          <div className="flex items-center justify-end gap-1" title="币对上线以来的开盘价、全历史最高/最低价，并标记后创出的极值方向">
+                            <span>上线开盘 / 历史高低</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-purple-500/20 text-purple-300">
+                              全历史
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
+                        <th className="px-3 py-3 text-right w-[13%]">{t.table4hVol}</th>
+                        <th className="px-4 py-3 text-right w-[14%]">{t.tableAmplitude}</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
                       <AnimatePresence mode="popLayout">
                         {fourHourBoards.amplitude15m?.map((item, idx) => {
                           const isHolding = isHoldingPosition(item.symbol);
+                          const data = getSymbolDisplayData(item);
                           const shouldHighlight = isAlerting && (item.amplitude || 0) >= config.amplitudeThreshold;
                           return (
                             <motion.tr 
@@ -2033,27 +2894,98 @@ export default function MonitoringAssistant4h({
                               title="点击同步交易"
                               onClick={() => handleRowClick(item.symbol)}
                             >
+                              {/* 1. 币种 */}
                               <td className="px-4 py-3 text-left">
                                 <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
+                                  <span className={`font-bold text-[19px] sm:text-[21px] ${
                                     isHolding 
                                       ? 'text-[#d946ef]' 
-                                      : (shouldHighlight ? 'text-amber-400' : 'text-zinc-200 group-hover:text-amber-500')
-                                  } transition-colors uppercase`}>
+                                      : (shouldHighlight ? 'text-amber-400' : 'text-zinc-200 group-hover:text-amber-400')
+                                  } transition-colors uppercase font-sans`}>
                                     {item.symbol.replace('USDT', '')}
                                   </span>
                                   {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
+                                    <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
                                       持仓中
                                     </span>
                                   )}
                                 </div>
                               </td>
-                              <td className={`px-2 py-3 text-center font-mono text-[18px] font-bold ${shouldHighlight ? 'text-amber-300' : 'text-emerald-500'}`}>
+
+                              {/* 2. 推送当前价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
+                                {formatPriceVal(data.currentPrice)}
+                              </td>
+
+                              {/* 3. 4H开盘价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[15px] font-medium text-zinc-400">
+                                {formatPriceVal(data.openPrice)}
+                              </td>
+
+                              {/* 4. 上线开盘 / 历史最高/最低价 与 后出极值标记 */}
+                              <td className="px-3 py-2 text-right">
+                                <div className="flex flex-col items-end gap-0.5 font-mono text-[13px] leading-tight">
+                                  <div className="flex items-center gap-1.5 justify-end" title="币对上线首根K线开盘价">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">上线开盘</span>
+                                    <span className="font-semibold text-zinc-300">
+                                      {data.listingOpen > 0 ? formatPriceVal(data.listingOpen) : '--'}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史高</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'high' ? 'text-emerald-400 font-bold' : 'text-zinc-300'}`}>
+                                      {data.historicalHigh > 0 ? formatPriceVal(data.historicalHigh) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'high' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最高价（多头结构）"
+                                      >
+                                        后创高 ▲
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史低</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'low' ? 'text-red-400 font-bold' : 'text-zinc-400'}`}>
+                                      {data.historicalLow > 0 ? formatPriceVal(data.historicalLow) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'low' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-red-500/20 text-red-300 border border-red-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最低价（空头结构）"
+                                      >
+                                        后创低 ▼
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+
+                              {/* 5. 资金费率 (周期) */}
+                              <td className="px-3 py-3 text-center">
+                                <div className="inline-flex items-center gap-1 font-mono text-[14px]">
+                                  <span className={`font-bold ${data.fundingRate > 0 ? 'text-amber-300' : data.fundingRate < 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                                    {data.fundingRate > 0 ? '+' : ''}{data.fundingRate.toFixed(4)}%
+                                  </span>
+                                  <span className="text-zinc-500 text-xs font-normal">
+                                    ({data.settlementCycle})
+                                  </span>
+                                </div>
+                              </td>
+
+                              {/* 6. 4H成交额 */}
+                              <td className={`px-3 py-3 text-right font-mono text-[16px] font-bold ${shouldHighlight ? 'text-amber-300' : 'text-emerald-500'}`}>
                                 {formatVolume(item.volume15m)}
                               </td>
+
+                              {/* 7. 振幅 */}
                               <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-amber-500 font-bold text-[21px] font-sans">
+                                <div className="flex items-center justify-end gap-1 text-amber-500 font-bold text-[19px] sm:text-[21px] font-mono">
                                   {(item.amplitude || 0).toFixed(2)}%
                                   <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-amber-500" />
                                 </div>
@@ -2064,7 +2996,7 @@ export default function MonitoringAssistant4h({
                       </AnimatePresence>
                       {(!fourHourBoards || !fourHourBoards.amplitude15m || fourHourBoards.amplitude15m.length === 0) && (
                         <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
+                          <td colSpan={7} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
                             {t.waitingScan}
                           </td>
                         </tr>
@@ -2072,25 +3004,23 @@ export default function MonitoringAssistant4h({
                     </tbody>
                   </table>
                 </div>
-              </div>
+              )}
             </section>
-
-          </div>
-
-          {/* 1H Volume Spike & 24H Gainers/Losers (Bottom 3) */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-[300px]">
             
-            {/* 1h Volume Spike Board */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-cyan-500/10 rounded-lg flex items-center justify-center border border-cyan-500/20 shadow-md">
+            {/* 4. 1小时放量榜 */}
+            <section className="bg-[#141416]/60 rounded-2xl border border-white/10 overflow-hidden shadow-xl transition-all">
+              <div 
+                onClick={() => toggleModuleCollapse('spike1h')}
+                className="px-4 py-3 bg-white/[0.03] hover:bg-white/[0.06] border-b border-white/5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 bg-cyan-500/10 rounded-lg flex items-center justify-center border border-cyan-500/20 shadow-md shrink-0">
                     <Zap className="w-5 h-5 text-cyan-400 animate-pulse" />
                   </div>
-                  <h2 className="text-[24px] font-bold text-cyan-400 tracking-tight">{t.volumeSpike1h}</h2>
+                  <h2 className="text-[20px] sm:text-[22px] font-bold text-cyan-400 tracking-tight whitespace-nowrap">{t.volumeSpike1h}</h2>
                   
                   {/* 说明书 */}
-                  <div className="relative group/spike-help flex items-center">
+                  <div className="relative group/spike-help flex items-center" onClick={e => e.stopPropagation()}>
                     <button
                       type="button"
                       className="p-1 rounded-full text-white hover:text-cyan-300 hover:bg-white/10 transition-all cursor-help focus:outline-none flex items-center justify-center"
@@ -2134,23 +3064,51 @@ export default function MonitoringAssistant4h({
                     </div>
                   </div>
                 </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  {collapsedModules.spike1h && spikeAnd24hBoards?.volumeSpike && spikeAnd24hBoards.volumeSpike.length > 0 && (
+                    <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-cyan-500/10 border border-cyan-500/20 text-xs font-mono font-bold text-cyan-400">
+                      <span>TOP1: {spikeAnd24hBoards.volumeSpike[0].symbol.replace('USDT', '')}</span>
+                      <span>{spikeAnd24hBoards.volumeSpike[0].ratio.toFixed(2)}倍</span>
+                    </span>
+                  )}
+                  <span className="text-[13px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+                  <button
+                    type="button"
+                    className="p-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-400 hover:text-white transition-colors"
+                    title={collapsedModules.spike1h ? "展开模块" : "向上折叠模块"}
+                  >
+                    {collapsedModules.spike1h ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
               
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
+              {!collapsedModules.spike1h && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[850px]">
                     <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.tableSpikeRatio}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.table1hChange}</th>
+                      <tr className="bg-white/5 text-[14px] text-gray-400 uppercase font-bold tracking-wider">
+                        <th className="px-4 py-3 text-left w-[15%]">{t.tableSymbol}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableLivePrice}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableOpenPrice}</th>
+                        <th className="px-3 py-3 text-right w-[20%]">
+                          <div className="flex items-center justify-end gap-1" title="币对上线以来的开盘价、全历史最高/最低价，并标记后创出的极值方向">
+                            <span>上线开盘 / 历史高低</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-purple-500/20 text-purple-300">
+                              全历史
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
+                        <th className="px-3 py-3 text-center w-[13%]">{t.tableSpikeRatio}</th>
+                        <th className="px-4 py-3 text-right w-[14%]">{t.table1hChange}</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
                       <AnimatePresence mode="popLayout">
                         {spikeAnd24hBoards?.volumeSpike?.map((item, idx) => {
                           const isHolding = isHoldingPosition(item.symbol);
+                          const data = getSpikeDisplayData(item);
                           const isSurge = item.ratio >= (config.volumeSpikeX ?? 5);
                           return (
                             <motion.tr 
@@ -2165,17 +3123,18 @@ export default function MonitoringAssistant4h({
                               title="点击同步交易"
                               onClick={() => handleRowClick(item.symbol)}
                             >
+                              {/* 1. 币种 */}
                               <td className="px-4 py-3 text-left">
                                 <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
+                                  <span className={`font-bold text-[19px] sm:text-[21px] ${
                                     isHolding 
                                       ? 'text-[#d946ef]' 
                                       : 'text-zinc-200 group-hover:text-cyan-400'
-                                  } transition-colors uppercase`}>
+                                  } transition-colors uppercase font-sans`}>
                                     {item.symbol.replace('USDT', '')}
                                   </span>
                                   {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
+                                    <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
                                       持仓中
                                     </span>
                                   )}
@@ -2186,14 +3145,84 @@ export default function MonitoringAssistant4h({
                                   )}
                                 </div>
                               </td>
-                              <td className="px-2 py-3 text-center font-mono text-[19px] font-bold text-cyan-400">
+
+                              {/* 2. 推送当前价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
+                                {formatPriceVal(data.currentPrice)}
+                              </td>
+
+                              {/* 3. 4H开盘价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[15px] font-medium text-zinc-400">
+                                {formatPriceVal(data.openPrice)}
+                              </td>
+
+                              {/* 4. 上线开盘 / 历史最高/最低价 与 后出极值标记 */}
+                              <td className="px-3 py-2 text-right">
+                                <div className="flex flex-col items-end gap-0.5 font-mono text-[13px] leading-tight">
+                                  <div className="flex items-center gap-1.5 justify-end" title="币对上线首根K线开盘价">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">上线开盘</span>
+                                    <span className="font-semibold text-zinc-300">
+                                      {data.listingOpen > 0 ? formatPriceVal(data.listingOpen) : '--'}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史高</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'high' ? 'text-emerald-400 font-bold' : 'text-zinc-300'}`}>
+                                      {data.historicalHigh > 0 ? formatPriceVal(data.historicalHigh) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'high' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最高价（多头结构）"
+                                      >
+                                        后创高 ▲
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史低</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'low' ? 'text-red-400 font-bold' : 'text-zinc-400'}`}>
+                                      {data.historicalLow > 0 ? formatPriceVal(data.historicalLow) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'low' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-red-500/20 text-red-300 border border-red-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最低价（空头结构）"
+                                      >
+                                        后创低 ▼
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+
+                              {/* 5. 资金费率 (周期) */}
+                              <td className="px-3 py-3 text-center">
+                                <div className="inline-flex items-center gap-1 font-mono text-[14px]">
+                                  <span className={`font-bold ${data.fundingRate > 0 ? 'text-amber-300' : data.fundingRate < 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                                    {data.fundingRate > 0 ? '+' : ''}{data.fundingRate.toFixed(4)}%
+                                  </span>
+                                  <span className="text-zinc-500 text-xs font-normal">
+                                    ({data.settlementCycle})
+                                  </span>
+                                </div>
+                              </td>
+
+                              {/* 6. 放量倍数 */}
+                              <td className="px-3 py-3 text-center font-mono text-[18px] font-bold text-cyan-400">
                                 {item.ratio.toFixed(2)}倍
                               </td>
+
+                              {/* 7. 1H涨跌 */}
                               <td className="px-4 py-3 text-right">
-                                <div className={`flex items-center justify-end gap-1 font-bold text-[21px] font-sans ${
-                                  item.change >= 0 ? 'text-emerald-500' : 'text-red-500'
+                                <div className={`flex items-center justify-end gap-1 font-bold text-[19px] sm:text-[21px] font-mono ${
+                                  item.change >= 0 ? 'text-emerald-400' : 'text-red-400'
                                 }`}>
-                                  {item.change >= 0 ? '+' : ''}{item.change.toFixed(2)}%
+                                  {formatChangeText(item.change)}
                                   <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-cyan-400" />
                                 </div>
                               </td>
@@ -2203,7 +3232,7 @@ export default function MonitoringAssistant4h({
                       </AnimatePresence>
                       {(!spikeAnd24hBoards?.volumeSpike || spikeAnd24hBoards.volumeSpike.length === 0) && (
                         <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
+                          <td colSpan={7} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
                             {t.waitingScan}
                           </td>
                         </tr>
@@ -2211,35 +3240,66 @@ export default function MonitoringAssistant4h({
                     </tbody>
                   </table>
                 </div>
-              </div>
+              )}
             </section>
 
-            {/* 24h Gainers List */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center border border-emerald-500/20 shadow-md">
+            {/* 5. 24小时涨幅榜 */}
+            <section className="bg-[#141416]/60 rounded-2xl border border-white/10 overflow-hidden shadow-xl transition-all">
+              <div 
+                onClick={() => toggleModuleCollapse('gainers24h')}
+                className="px-4 py-3 bg-white/[0.03] hover:bg-white/[0.06] border-b border-white/5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center border border-emerald-500/20 shadow-md shrink-0">
                     <TrendingUp className="w-5 h-5 text-emerald-500 animate-pulse" />
                   </div>
-                  <h2 className="text-[24px] font-bold text-emerald-500 tracking-tight">{t.gainer24h}</h2>
+                  <h2 className="text-[20px] sm:text-[22px] font-bold text-emerald-500 tracking-tight whitespace-nowrap">{t.gainer24h}</h2>
                 </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  {collapsedModules.gainers24h && spikeAnd24hBoards?.gainers24h && spikeAnd24hBoards.gainers24h.length > 0 && (
+                    <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/20 text-xs font-mono font-bold text-emerald-400">
+                      <span>TOP1: {spikeAnd24hBoards.gainers24h[0].symbol.replace('USDT', '')}</span>
+                      <span>+{spikeAnd24hBoards.gainers24h[0].change24h.toFixed(2)}%</span>
+                    </span>
+                  )}
+                  <span className="text-[13px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+                  <button
+                    type="button"
+                    className="p-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-400 hover:text-white transition-colors"
+                    title={collapsedModules.gainers24h ? "展开模块" : "向上折叠模块"}
+                  >
+                    {collapsedModules.gainers24h ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
               
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
+              {!collapsedModules.gainers24h && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[850px]">
                     <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.table24hVol}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.tableGain}</th>
+                      <tr className="bg-white/5 text-[14px] text-gray-400 uppercase font-bold tracking-wider">
+                        <th className="px-4 py-3 text-left w-[15%]">{t.tableSymbol}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableLivePrice}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableOpenPrice}</th>
+                        <th className="px-3 py-3 text-right w-[20%]">
+                          <div className="flex items-center justify-end gap-1" title="币对上线以来的开盘价、全历史最高/最低价，并标记后创出的极值方向">
+                            <span>上线开盘 / 历史高低</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-purple-500/20 text-purple-300">
+                              全历史
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
+                        <th className="px-3 py-3 text-right w-[13%]">{t.table24hVol}</th>
+                        <th className="px-4 py-3 text-right w-[14%]">{t.tableGain}</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
                       <AnimatePresence mode="popLayout">
                         {spikeAnd24hBoards?.gainers24h?.map((item, idx) => {
                           const isHolding = isHoldingPosition(item.symbol);
+                          const data = getSymbolDisplayData(item);
                           return (
                             <motion.tr 
                               key={item.symbol + '_24h'}
@@ -2251,27 +3311,98 @@ export default function MonitoringAssistant4h({
                               title="点击同步交易"
                               onClick={() => handleRowClick(item.symbol)}
                             >
+                              {/* 1. 币种 */}
                               <td className="px-4 py-3 text-left">
                                 <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
+                                  <span className={`font-bold text-[19px] sm:text-[21px] ${
                                     isHolding 
                                       ? 'text-[#d946ef]' 
                                       : 'text-zinc-200 group-hover:text-emerald-500'
-                                  } transition-colors uppercase`}>
+                                  } transition-colors uppercase font-sans`}>
                                     {item.symbol.replace('USDT', '')}
                                   </span>
                                   {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
+                                    <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
                                       持仓中
                                     </span>
                                   )}
                                 </div>
                               </td>
-                              <td className="px-2 py-3 text-center font-mono text-[18px] font-bold text-emerald-500">
+
+                              {/* 2. 推送当前价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
+                                {formatPriceVal(data.currentPrice)}
+                              </td>
+
+                              {/* 3. 4H开盘价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[15px] font-medium text-zinc-400">
+                                {formatPriceVal(data.openPrice)}
+                              </td>
+
+                              {/* 4. 上线开盘 / 历史最高/最低价 与 后出极值标记 */}
+                              <td className="px-3 py-2 text-right">
+                                <div className="flex flex-col items-end gap-0.5 font-mono text-[13px] leading-tight">
+                                  <div className="flex items-center gap-1.5 justify-end" title="币对上线首根K线开盘价">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">上线开盘</span>
+                                    <span className="font-semibold text-zinc-300">
+                                      {data.listingOpen > 0 ? formatPriceVal(data.listingOpen) : '--'}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史高</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'high' ? 'text-emerald-400 font-bold' : 'text-zinc-300'}`}>
+                                      {data.historicalHigh > 0 ? formatPriceVal(data.historicalHigh) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'high' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最高价（多头结构）"
+                                      >
+                                        后创高 ▲
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史低</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'low' ? 'text-red-400 font-bold' : 'text-zinc-400'}`}>
+                                      {data.historicalLow > 0 ? formatPriceVal(data.historicalLow) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'low' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-red-500/20 text-red-300 border border-red-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最低价（空头结构）"
+                                      >
+                                        后创低 ▼
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+
+                              {/* 5. 资金费率 (周期) */}
+                              <td className="px-3 py-3 text-center">
+                                <div className="inline-flex items-center gap-1 font-mono text-[14px]">
+                                  <span className={`font-bold ${data.fundingRate > 0 ? 'text-amber-300' : data.fundingRate < 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                                    {data.fundingRate > 0 ? '+' : ''}{data.fundingRate.toFixed(4)}%
+                                  </span>
+                                  <span className="text-zinc-500 text-xs font-normal">
+                                    ({data.settlementCycle})
+                                  </span>
+                                </div>
+                              </td>
+
+                              {/* 6. 24H成交额 */}
+                              <td className="px-3 py-3 text-right font-mono text-[16px] font-bold text-emerald-500">
                                 {formatVolume(item.volume24h)}
                               </td>
+
+                              {/* 7. 24H涨幅 */}
                               <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-emerald-500 font-bold text-[21px] font-sans">
+                                <div className="flex items-center justify-end gap-1 text-emerald-500 font-bold text-[19px] sm:text-[21px] font-mono">
                                   +{item.change24h.toFixed(2)}%
                                   <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-emerald-500" />
                                 </div>
@@ -2282,7 +3413,7 @@ export default function MonitoringAssistant4h({
                       </AnimatePresence>
                       {(!spikeAnd24hBoards || spikeAnd24hBoards.gainers24h.length === 0) && (
                         <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
+                          <td colSpan={7} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
                             {t.waitingScan}
                           </td>
                         </tr>
@@ -2290,35 +3421,66 @@ export default function MonitoringAssistant4h({
                     </tbody>
                   </table>
                 </div>
-              </div>
+              )}
             </section>
 
-            {/* 24h Losers List */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-red-500/10 rounded-lg flex items-center justify-center border border-red-500/20 shadow-md">
+            {/* 6. 24小时跌幅榜 */}
+            <section className="bg-[#141416]/60 rounded-2xl border border-white/10 overflow-hidden shadow-xl transition-all">
+              <div 
+                onClick={() => toggleModuleCollapse('losers24h')}
+                className="px-4 py-3 bg-white/[0.03] hover:bg-white/[0.06] border-b border-white/5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 bg-red-500/10 rounded-lg flex items-center justify-center border border-red-500/20 shadow-md shrink-0">
                     <TrendingDown className="w-5 h-5 text-red-500 animate-pulse" />
                   </div>
-                  <h2 className="text-[24px] font-bold text-red-500 tracking-tight">{t.loser24h}</h2>
+                  <h2 className="text-[20px] sm:text-[22px] font-bold text-red-500 tracking-tight whitespace-nowrap">{t.loser24h}</h2>
                 </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  {collapsedModules.losers24h && spikeAnd24hBoards?.losers24h && spikeAnd24hBoards.losers24h.length > 0 && (
+                    <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-red-500/10 border border-red-500/20 text-xs font-mono font-bold text-red-400">
+                      <span>TOP1: {spikeAnd24hBoards.losers24h[0].symbol.replace('USDT', '')}</span>
+                      <span>{spikeAnd24hBoards.losers24h[0].change24h.toFixed(2)}%</span>
+                    </span>
+                  )}
+                  <span className="text-[13px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
+                  <button
+                    type="button"
+                    className="p-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-400 hover:text-white transition-colors"
+                    title={collapsedModules.losers24h ? "展开模块" : "向上折叠模块"}
+                  >
+                    {collapsedModules.losers24h ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
               
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
+              {!collapsedModules.losers24h && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[850px]">
                     <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.table24hVol}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.tableLoss}</th>
+                      <tr className="bg-white/5 text-[14px] text-gray-400 uppercase font-bold tracking-wider">
+                        <th className="px-4 py-3 text-left w-[15%]">{t.tableSymbol}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableLivePrice}</th>
+                        <th className="px-3 py-3 text-right w-[12%]">{t.tableOpenPrice}</th>
+                        <th className="px-3 py-3 text-right w-[20%]">
+                          <div className="flex items-center justify-end gap-1" title="币对上线以来的开盘价、全历史最高/最低价，并标记后创出的极值方向">
+                            <span>上线开盘 / 历史高低</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-purple-500/20 text-purple-300">
+                              全历史
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
+                        <th className="px-3 py-3 text-right w-[13%]">{t.table24hVol}</th>
+                        <th className="px-4 py-3 text-right w-[14%]">{t.tableLoss}</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
                       <AnimatePresence mode="popLayout">
                         {spikeAnd24hBoards?.losers24h?.map((item, idx) => {
                           const isHolding = isHoldingPosition(item.symbol);
+                          const data = getSymbolDisplayData(item);
                           return (
                             <motion.tr 
                               key={item.symbol + '_24h_loser'}
@@ -2330,27 +3492,98 @@ export default function MonitoringAssistant4h({
                               title="点击同步交易"
                               onClick={() => handleRowClick(item.symbol)}
                             >
+                              {/* 1. 币种 */}
                               <td className="px-4 py-3 text-left">
                                 <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
+                                  <span className={`font-bold text-[19px] sm:text-[21px] ${
                                     isHolding 
                                       ? 'text-[#d946ef]' 
                                       : 'text-zinc-200 group-hover:text-red-500'
-                                  } transition-colors uppercase`}>
+                                  } transition-colors uppercase font-sans`}>
                                     {item.symbol.replace('USDT', '')}
                                   </span>
                                   {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
+                                    <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
                                       持仓中
                                     </span>
                                   )}
                                 </div>
                               </td>
-                              <td className="px-2 py-3 text-center font-mono text-[18px] font-bold text-emerald-500">
+
+                              {/* 2. 推送当前价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
+                                {formatPriceVal(data.currentPrice)}
+                              </td>
+
+                              {/* 3. 4H开盘价 */}
+                              <td className="px-3 py-3 text-right font-mono text-[15px] font-medium text-zinc-400">
+                                {formatPriceVal(data.openPrice)}
+                              </td>
+
+                              {/* 4. 上线开盘 / 历史最高/最低价 与 后出极值标记 */}
+                              <td className="px-3 py-2 text-right">
+                                <div className="flex flex-col items-end gap-0.5 font-mono text-[13px] leading-tight">
+                                  <div className="flex items-center gap-1.5 justify-end" title="币对上线首根K线开盘价">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">上线开盘</span>
+                                    <span className="font-semibold text-zinc-300">
+                                      {data.listingOpen > 0 ? formatPriceVal(data.listingOpen) : '--'}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史高</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'high' ? 'text-emerald-400 font-bold' : 'text-zinc-300'}`}>
+                                      {data.historicalHigh > 0 ? formatPriceVal(data.historicalHigh) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'high' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最高价（多头结构）"
+                                      >
+                                        后创高 ▲
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 justify-end">
+                                    <span className="text-[10px] text-zinc-500 font-sans font-medium">历史低</span>
+                                    <span className={`font-semibold ${data.laterExtreme === 'low' ? 'text-red-400 font-bold' : 'text-zinc-400'}`}>
+                                      {data.historicalLow > 0 ? formatPriceVal(data.historicalLow) : '--'}
+                                    </span>
+                                    {data.laterExtreme === 'low' ? (
+                                      <span 
+                                        className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-red-500/20 text-red-300 border border-red-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                        title="上线以来后创出历史最低价（空头结构）"
+                                      >
+                                        后创低 ▼
+                                      </span>
+                                    ) : (
+                                      <span className="w-1" />
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+
+                              {/* 5. 资金费率 (周期) */}
+                              <td className="px-3 py-3 text-center">
+                                <div className="inline-flex items-center gap-1 font-mono text-[14px]">
+                                  <span className={`font-bold ${data.fundingRate > 0 ? 'text-amber-300' : data.fundingRate < 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                                    {data.fundingRate > 0 ? '+' : ''}{data.fundingRate.toFixed(4)}%
+                                  </span>
+                                  <span className="text-zinc-500 text-xs font-normal">
+                                    ({data.settlementCycle})
+                                  </span>
+                                </div>
+                              </td>
+
+                              {/* 6. 24H成交额 */}
+                              <td className="px-2 py-3 text-right font-mono text-[16px] font-bold text-emerald-500">
                                 {formatVolume(item.volume24h)}
                               </td>
+
+                              {/* 7. 24H跌幅 */}
                               <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-red-500 font-bold text-[21px] font-sans">
+                                <div className="flex items-center justify-end gap-1 text-red-500 font-bold text-[19px] sm:text-[21px] font-mono">
                                   {item.change24h.toFixed(2)}%
                                   <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-red-500" />
                                 </div>
@@ -2361,7 +3594,7 @@ export default function MonitoringAssistant4h({
                       </AnimatePresence>
                       {(!spikeAnd24hBoards || spikeAnd24hBoards.losers24h.length === 0) && (
                         <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
+                          <td colSpan={7} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
                             {t.waitingScan}
                           </td>
                         </tr>
@@ -2369,7 +3602,7 @@ export default function MonitoringAssistant4h({
                     </tbody>
                   </table>
                 </div>
-              </div>
+              )}
             </section>
 
           </div>

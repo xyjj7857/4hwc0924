@@ -34,6 +34,16 @@ export interface HistorySyncProgress {
   statusText: string;
 }
 
+export interface SymbolAllTimeStats {
+  listingOpen: number; // 上线首根K线开盘价
+  listingTime: number; // 上线时间
+  historicalHigh: number; // 上线以来历史最高价
+  historicalLow: number; // 上线以来历史最低价
+  highTime: number; // 最高价发生时间
+  lowTime: number; // 最低价发生时间
+  laterExtreme: 'high' | 'low' | 'same'; // 'high': 后创高, 'low': 后创低
+}
+
 export class MarketDataManager {
   private symbolsMap: Map<string, SymbolMarketData> = new Map();
   private contractUniverse: Set<string> = new Set();
@@ -47,6 +57,8 @@ export class MarketDataManager {
   private isShuttingDown: boolean = false;
   private pipelineStarted: boolean = false;
   private fundingInfoMap: Map<string, number> = new Map(); // symbol -> intervalHours
+  private allTimeStatsMap: Map<string, SymbolAllTimeStats> = new Map();
+  private allTimeFetchingPromises: Map<string, Promise<SymbolAllTimeStats | null>> = new Map();
 
   public historySyncProgress: HistorySyncProgress = {
     total: 0,
@@ -108,7 +120,7 @@ export class MarketDataManager {
    * 启动初始化全流程：
    * 1. 获取全市场 24H 快照确定 USDT 永续合约 Universe（官方真实数据）
    * 2. 建立 WebSocket 连接（15m Kline + Mark Price + MiniTicker 全市场价格流）
-   * 3. 异步平滑分批回填每个币最近 96 根 15m 官方真实 K线
+   * 3. 异步平滑分批回填每个币最近 200 根 15m 官方真实 K线
    */
   public async startPipeline(): Promise<void> {
     if (this.pipelineStarted) return;
@@ -128,8 +140,11 @@ export class MarketDataManager {
       this.initMarkPriceStream();
       this.initKlineStreams();
 
-      // 第四步：异步平滑补齐全市场 96 根 15m 历史 K 线
+      // 第四步：异步平滑补齐全市场 200 根 15m 历史 K 线
       this.startHistoryBackfill();
+
+      // 第五步：异步获取全市场币对自上线以来的开盘价与全历史极值（ATH/ATL及出现先后顺序）
+      this.startAllTimeStatsSync();
     } catch (err: any) {
       this.addLog(`[行情数据源] 启动失败: ${err.message || err}`, 'ERROR');
       this.ensureFallbackUniverse();
@@ -553,7 +568,7 @@ export class MarketDataManager {
   }
 
   /**
-   * 处理实时收到的 15m K 线数据，更新本地 96 根滑动窗口
+   * 处理实时收到的 15m K 线数据，更新本地 200 根滑动窗口
    */
   private handleLiveKlineMessage(symbol: string, k: any): void {
     const candle: KlineCandle & { isLiveWs?: boolean } = {
@@ -599,10 +614,10 @@ export class MarketDataManager {
         // 更新当前未完结的一根 K 线
         candles[candles.length - 1] = candle;
       } else if (candle.openTime > last.openTime) {
-        // 新一根 15m K 线产生，推入数组并限制最多保留 96 根
+        // 新一根 15m K 线产生，推入数组并限制最多保留 200 根
         candles.push(candle);
-        if (candles.length > 96) {
-          record.candles15m = candles.slice(-96);
+        if (candles.length > 200) {
+          record.candles15m = candles.slice(-200);
         }
       }
     }
@@ -623,12 +638,12 @@ export class MarketDataManager {
         id: Date.now()
       }));
     }
-    // 异步补齐新币的历史 96 根 K 线
+    // 异步补齐新币的历史 200 根 K 线
     this.backfillSymbols(symbols);
   }
 
   /**
-   * 异步平滑分批获取全市场 96 根 15m 历史 K 线
+   * 异步平滑分批获取全市场 200 根 15m 历史 K 线
    * 优先回填 24H 成交额最高的流动性币对，确保开机 1 秒内头部币种全部就绪
    */
   private async startHistoryBackfill(): Promise<void> {
@@ -646,7 +661,7 @@ export class MarketDataManager {
       statusText: '异步历史回填中...'
     };
 
-    this.addLog(`[行情数据源] 开始后台平滑补齐全市场 96 根 15m 权威历史数据（共 ${total} 个币对，按流动性优先对齐）...`, 'INFO');
+    this.addLog(`[行情数据源] 开始后台平滑补齐全市场 200 根 15m 权威历史数据（共 ${total} 个币对，按流动性优先对齐）...`, 'INFO');
     await this.backfillSymbols(allSymbols);
   }
 
@@ -666,7 +681,7 @@ export class MarketDataManager {
           const rawKlines = await this.fetchBinanceBackend('/fapi/v1/klines', {
             symbol,
             interval: '15m',
-            limit: '96'
+            limit: '200'
           });
 
           if (Array.isArray(rawKlines) && rawKlines.length > 0) {
@@ -705,9 +720,9 @@ export class MarketDataManager {
               if (lastCandle && (lastCandle as any).isLiveWs) {
                 const merged = historicalCandles.filter(c => c.openTime < lastCandle.openTime);
                 merged.push(lastCandle);
-                record.candles15m = merged.slice(-96);
+                record.candles15m = merged.slice(-200);
               } else {
-                record.candles15m = historicalCandles.slice(-96);
+                record.candles15m = historicalCandles.slice(-200);
               }
             }
           }
@@ -729,8 +744,145 @@ export class MarketDataManager {
 
     this.historySyncProgress.isComplete = true;
     this.historySyncProgress.statusText = '已完成 (100%)';
-    this.addLog(`[行情数据源] 全市场 96 根 15m 历史 K 线数据已全部补齐完毕（共 ${symbols.length} 个币对），标记“数据完整”，正式由 WebSocket 实时流接管！`, 'SUCCESS');
-    this.addLog4h(`[行情数据源4h] 4H K线聚合所需的 15m 官方真实历史底座已完全就绪，本地聚合计算引擎启动！`, 'SUCCESS');
+    this.addLog(`[行情数据源] 全市场 200 根 15m 历史 K 线数据已全部补齐完毕（共 ${symbols.length} 个币对），标记“数据完整”，正式由 WebSocket 实时流接管！`, 'SUCCESS');
+    this.addLog4h(`[行情数据源4h] 4H K线聚合所需的 15m 官方真实历史底座已完全就绪（200根深度），本地聚合计算引擎启动！`, 'SUCCESS');
+  }
+
+  /**
+   * 异步平滑分批获取全市场所有币对自上线以来的全历史开盘价与最高/最低极值
+   * 采用 1M（月线，最多 500 根，完全覆盖自上线至今的历史数据）批量拉取
+   */
+  private async startAllTimeStatsSync(): Promise<void> {
+    const allSymbols = Array.from(this.contractUniverse).sort((a, b) => {
+      const volA = this.getSymbol24hVolume(a);
+      const volB = this.getSymbol24hVolume(b);
+      return volB - volA;
+    });
+
+    this.addLog(`[行情数据源] 开始异步同步全市场 ${allSymbols.length} 个币对自上线以来的开盘价与全历史极值...`, 'INFO');
+
+    const BATCH_SIZE = 12;
+    for (let i = 0; i < allSymbols.length; i += BATCH_SIZE) {
+      if (this.isShuttingDown) break;
+      while (this.isCircuitBroken()) {
+        await new Promise(r => setTimeout(r, 2000));
+      }
+      const batch = allSymbols.slice(i, i + BATCH_SIZE);
+      await Promise.all(batch.map(sym => this.fetchSymbolAllTimeStats(sym)));
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    this.addLog(`[行情数据源] 全市场币对上线开盘价与全历史极值同步完成！已缓存 ${this.allTimeStatsMap.size} 个币对。`, 'SUCCESS');
+  }
+
+  /**
+   * 获取单个币对自上线以来的全历史开盘价与最高/最低极值（带去重保护）
+   */
+  public async fetchSymbolAllTimeStats(symbol: string): Promise<SymbolAllTimeStats | null> {
+    if (this.allTimeStatsMap.has(symbol)) {
+      return this.allTimeStatsMap.get(symbol)!;
+    }
+    if (this.allTimeFetchingPromises.has(symbol)) {
+      return this.allTimeFetchingPromises.get(symbol)!;
+    }
+
+    const promise = (async () => {
+      try {
+        const raw = await this.fetchBinanceBackend('/fapi/v1/klines', {
+          symbol,
+          interval: '1M',
+          limit: '500'
+        });
+
+        if (!Array.isArray(raw) || raw.length === 0) {
+          return null;
+        }
+
+        const listingOpen = parseFloat(raw[0][1]) || 0;
+        const listingTime = Number(raw[0][0]) || 0;
+
+        let ath = -Infinity;
+        let athTime = 0;
+        let atl = Infinity;
+        let atlTime = 0;
+
+        for (const k of raw) {
+          const h = parseFloat(k[2]) || 0;
+          const l = parseFloat(k[3]) || 0;
+          const t = Number(k[0]);
+          if (h >= ath && h > 0) {
+            ath = h;
+            athTime = t;
+          }
+          if (l > 0 && l <= atl) {
+            atl = l;
+            atlTime = t;
+          }
+        }
+
+        let laterExtreme: 'high' | 'low' | 'same' = 'same';
+        if (athTime > atlTime) {
+          laterExtreme = 'high';
+        } else if (atlTime > athTime) {
+          laterExtreme = 'low';
+        } else if (athTime > 0) {
+          // 同一月份出现最高和最低（如新上线币），拉取当月日线进一步精确区分先后
+          try {
+            const nextMonth = athTime + 32 * 86400000;
+            const daily = await this.fetchBinanceBackend('/fapi/v1/klines', {
+              symbol,
+              interval: '1d',
+              startTime: String(athTime),
+              endTime: String(nextMonth),
+              limit: '35'
+            });
+            if (Array.isArray(daily) && daily.length > 0) {
+              let dayAth = -Infinity;
+              let dayAthTime = 0;
+              let dayAtl = Infinity;
+              let dayAtlTime = 0;
+              for (const d of daily) {
+                const dh = parseFloat(d[2]) || 0;
+                const dl = parseFloat(d[3]) || 0;
+                const dt = Number(d[0]);
+                if (dh >= dayAth && dh > 0) {
+                  dayAth = dh;
+                  dayAthTime = dt;
+                }
+                if (dl > 0 && dl <= dayAtl) {
+                  dayAtl = dl;
+                  dayAtlTime = dt;
+                }
+              }
+              if (dayAthTime > dayAtlTime) laterExtreme = 'high';
+              else if (dayAtlTime > dayAthTime) laterExtreme = 'low';
+            }
+          } catch (e) {
+            // 保持 same
+          }
+        }
+
+        const stats: SymbolAllTimeStats = {
+          listingOpen,
+          listingTime,
+          historicalHigh: ath > 0 && ath !== -Infinity ? ath : listingOpen,
+          historicalLow: atl > 0 && atl !== Infinity ? atl : listingOpen,
+          highTime: athTime,
+          lowTime: atlTime,
+          laterExtreme
+        };
+
+        this.allTimeStatsMap.set(symbol, stats);
+        return stats;
+      } catch (err) {
+        return null;
+      } finally {
+        this.allTimeFetchingPromises.delete(symbol);
+      }
+    })();
+
+    this.allTimeFetchingPromises.set(symbol, promise);
+    return promise;
   }
 
   // ================= 业务查询与聚合 API =================
@@ -782,9 +934,15 @@ export class MarketDataManager {
   }
 
   /**
-   * 本地利用 15m 真实官方 K 线聚合生成当前 4H K 线
-   * 4H 周期对齐 UTC 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
-   * 严禁任何伪造价格或兜底假蜡烛参与运算
+   * 本地完全基于已订阅的 15m 真实 K 线数据流聚合生成当前未完结 4H K 线数据
+   * 严禁订阅 4 小时数据流，4H 周期对齐 UTC 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
+   * 聚合要素：
+   *  - 未完结4H开盘价: 当前4H窗口内首根 15m K线的开盘价
+   *  - 未完结4H最高价: 当前4H窗口内所有 15m K线最高价与最新现价的极大值
+   *  - 未完结4H最低价: 当前4H窗口内所有 15m K线最低价与最新现价的极小值
+   *  - 未完结4H最新价: 当前最新推送价 (或末尾 15m 蜡烛的收盘价)
+   *  - 未完结4H成交额: 当前4H窗口内所有 15m K线的成交额累加和
+   *  - 4H涨跌幅 / 高涨幅 / 振幅: 纯基于上述 15m 聚合数据实时计算
    */
   public getSymbol4hKline(symbol: string): {
     open: number;
@@ -793,7 +951,10 @@ export class MarketDataManager {
     close: number;
     volume: number; // quoteVolume (USDT)
     change: number;
+    highChange: number;
     amplitude: number;
+    periodStartTime: number;
+    candlesCount: number;
   } | null {
     const record = this.symbolsMap.get(symbol);
     if (!record || record.candles15m.length === 0) return null;
@@ -802,30 +963,175 @@ export class MarketDataManager {
     const now = Date.now();
     const current4hStart = Math.floor(now / FOUR_HOURS_MS) * FOUR_HOURS_MS;
 
-    // 筛选所有属于当前 4H 区间的真实 15m K 线（必须价格大于 0 且有效）
-    const in4hCandles = record.candles15m.filter(c => c.openTime >= current4hStart && c.open > 0 && c.close > 0);
-    if (in4hCandles.length === 0) {
-      // 若当前 4H 周期暂无真实 15m K线，严禁胡乱兜底，返回 null 保证榜单纯净
-      return null;
+    // 按时间顺序对 15m K 线排序（防御性保证）
+    const sorted15m = [...record.candles15m].sort((a, b) => a.openTime - b.openTime);
+
+    // 筛选当前 4H 窗口区间内的所有有效 15m 蜡烛
+    const in4hCandles = sorted15m.filter(c => c.openTime >= current4hStart && c.open > 0 && c.close > 0);
+
+    // 优先寻找时间戳严格对齐 4H 开盘起始点 (如 00:00, 04:00, 08:00, 12:00, 16:00, 20:00) 的 15m 蜡烛
+    const exactStartCandle = sorted15m.find(c => c.openTime === current4hStart && c.open > 0);
+
+    let open = 0;
+    let high = 0;
+    let low = Infinity;
+    let volume = 0;
+
+    if (exactStartCandle) {
+      open = exactStartCandle.open;
+    } else if (in4hCandles.length > 0) {
+      open = in4hCandles[0].open;
+    } else {
+      // 容错：若刚跨入新 4H 周期首秒，第一根 15m 尚未收到首个 tick，则取上一根 15m 的收盘价作为新 4H 开盘价
+      const lastCandle = sorted15m[sorted15m.length - 1];
+      if (lastCandle && lastCandle.closeTime >= current4hStart - 60000) {
+        open = lastCandle.close;
+      } else {
+        return null;
+      }
     }
 
-    const open = in4hCandles[0].open;
-    const high = Math.max(...in4hCandles.map(c => c.high));
-    const low = Math.min(...in4hCandles.map(c => c.low));
-    const close = in4hCandles[in4hCandles.length - 1].close;
-    const volume = in4hCandles.reduce((sum, c) => sum + c.quoteVolume, 0);
+    if (in4hCandles.length > 0) {
+      high = Math.max(...in4hCandles.map(c => c.high));
+      low = Math.min(...in4hCandles.map(c => c.low));
+      volume = in4hCandles.reduce((sum, c) => sum + (c.quoteVolume || 0), 0);
+    } else {
+      high = open;
+      low = open;
+      volume = 0;
+    }
+
+    const livePrice = record.lastPrice > 0 ? record.lastPrice : (in4hCandles.length > 0 ? in4hCandles[in4hCandles.length - 1].close : open);
+    const close = livePrice > 0 ? livePrice : open;
+
+    if (close > 0) {
+      high = Math.max(high, close);
+      low = Math.min(low, close);
+    }
 
     const change = open > 0 ? ((close - open) / open) * 100 : 0;
-    const amplitude = low > 0 ? ((high - low) / low) * 100 : 0;
+    const highChange = close > 0 && open > 0 ? ((close - open) / close) * 100 : change;
+    const amplitude = (low > 0 && high >= low) ? ((high - low) / low) * 100 : 0;
 
     return {
       open,
       high,
-      low,
+      low: isFinite(low) ? low : open,
       close,
       volume,
       change,
-      amplitude
+      highChange,
+      amplitude,
+      periodStartTime: current4hStart,
+      candlesCount: in4hCandles.length
+    };
+  }
+
+  /**
+   * 获取指定币对自上线以来的全历史开盘价、最高价与最低价，
+   * 并判断最高价与最低价哪个后出现（'high': 后出现历史最高，'low': 后出现历史最低，'same': 同时/同根）
+   */
+  public getSymbolHistoricalExtremes(symbol: string): {
+    listingOpen: number;
+    listingTime: number;
+    historicalHigh: number;
+    historicalLow: number;
+    highTime: number;
+    lowTime: number;
+    laterExtreme: 'high' | 'low' | 'same';
+    candlesCount: number;
+  } {
+    const record = this.symbolsMap.get(symbol);
+    const livePrice = record && record.lastPrice > 0 ? record.lastPrice : 0;
+    const candles = record?.candles15m || [];
+
+    const stats = this.allTimeStatsMap.get(symbol);
+    if (stats) {
+      let ath = stats.historicalHigh;
+      let atl = stats.historicalLow;
+      let athTime = stats.highTime;
+      let atlTime = stats.lowTime;
+      let laterExtreme = stats.laterExtreme;
+
+      // 结合当前最新实时价格，若破上线以来的全历史最高或最低，动态更新并修正后创方向
+      const now = Date.now();
+      if (livePrice > 0) {
+        if (livePrice > ath) {
+          ath = livePrice;
+          athTime = now;
+          laterExtreme = 'high';
+        }
+        if (livePrice < atl && atl > 0) {
+          atl = livePrice;
+          atlTime = now;
+          laterExtreme = 'low';
+        }
+      }
+
+      return {
+        listingOpen: stats.listingOpen,
+        listingTime: stats.listingTime,
+        historicalHigh: ath,
+        historicalLow: atl,
+        highTime: athTime,
+        lowTime: atlTime,
+        laterExtreme,
+        candlesCount: candles.length
+      };
+    }
+
+    // 若全历史极值尚未拉取完成，触发单个币对异步拉取，同时用当前本地 200 根 K 线安全兜底
+    if (!this.allTimeFetchingPromises.has(symbol)) {
+      this.fetchSymbolAllTimeStats(symbol).catch(() => {});
+    }
+
+    // 兜底逻辑：用已有的 15m K线
+    let maxHigh = -Infinity;
+    let maxHighTime = 0;
+    let minLow = Infinity;
+    let minLowTime = 0;
+    let fallbackListingOpen = candles.length > 0 ? candles[0].open : livePrice;
+    let fallbackListingTime = candles.length > 0 ? candles[0].openTime : Date.now();
+
+    for (const c of candles) {
+      if (c.high >= maxHigh && c.high > 0) {
+        maxHigh = c.high;
+        maxHighTime = c.openTime;
+      }
+      if (c.low > 0 && c.low <= minLow) {
+        minLow = c.low;
+        minLowTime = c.openTime;
+      }
+    }
+
+    const now = Date.now();
+    if (livePrice > 0) {
+      if (livePrice >= maxHigh) {
+        maxHigh = livePrice;
+        maxHighTime = now;
+      }
+      if (livePrice <= minLow) {
+        minLow = livePrice;
+        minLowTime = now;
+      }
+    }
+
+    let laterExtreme: 'high' | 'low' | 'same' = 'same';
+    if (maxHighTime > minLowTime) {
+      laterExtreme = 'high';
+    } else if (minLowTime > maxHighTime) {
+      laterExtreme = 'low';
+    }
+
+    return {
+      listingOpen: fallbackListingOpen,
+      listingTime: fallbackListingTime,
+      historicalHigh: maxHigh > 0 && maxHigh !== -Infinity ? maxHigh : livePrice,
+      historicalLow: minLow > 0 && minLow !== Infinity ? minLow : livePrice,
+      highTime: maxHighTime,
+      lowTime: minLowTime,
+      laterExtreme,
+      candlesCount: candles.length
     };
   }
 
@@ -865,6 +1171,26 @@ export class MarketDataManager {
   public getSymbolMarkPrice(symbol: string): number {
     const record = this.symbolsMap.get(symbol);
     return record?.markPrice || record?.lastPrice || 0;
+  }
+
+  /**
+   * 获取指定币对的资金费率与结算周期信息
+   */
+  public getSymbolFundingInfo(symbol: string): { fundingRate: number; fundingIntervalHours: number; settlementCycle: string; nextFundingTime: number } {
+    const record = this.symbolsMap.get(symbol);
+    const intervalHours = record?.fundingIntervalHours || this.fundingInfoMap.get(symbol) || 8;
+    const ratePercent = (record?.fundingRate || 0) * 100;
+    let nextFunding = record?.nextFundingTime || 0;
+    if (!nextFunding || nextFunding <= Date.now()) {
+      const cycleMs = intervalHours * 3600 * 1000;
+      nextFunding = Math.floor(Date.now() / cycleMs) * cycleMs + cycleMs;
+    }
+    return {
+      fundingRate: ratePercent,
+      fundingIntervalHours: intervalHours,
+      settlementCycle: `${intervalHours}h`,
+      nextFundingTime: nextFunding
+    };
   }
 
   /**

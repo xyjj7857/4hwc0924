@@ -35,13 +35,15 @@ import {
   Trash2,
   LogOut,
   Check,
-  GripVertical
+  GripVertical,
+  BarChart2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ApiConfig, OrderForm, Position, TradeLog, TradeLogCategory, AccountBalance, OpenOrder, PositionHistory, AlarmItem, AlarmSettings } from './types';
 import { LogsModule, detectTradeLogInfo } from './components/LogsModule';
 import MonitoringAssistant from './components/MonitoringAssistant';
 import MonitoringAssistant4h from './components/MonitoringAssistant4h';
+import WeightStatsModule from './components/WeightStatsModule';
 import { AlarmNavButton } from './components/AlarmNavButton';
 import { AlarmModal, AlarmRingingBanner } from './components/AlarmModal';
 import { KellyModal } from './components/KellyModal';
@@ -180,7 +182,7 @@ const CustomTrendTooltip = ({ active, payload, opacity }: any) => {
 
 export default function App() {
   // State
-  const [activeMainTab, setActiveMainTab] = useState<'TRADE' | 'MONITOR' | 'MONITOR_4H' | 'REPORT'>('TRADE');
+  const [activeMainTab, setActiveMainTab] = useState<'TRADE' | 'MONITOR' | 'MONITOR_4H' | 'REPORT' | 'WEIGHT_STATS'>('TRADE');
   const [activeContractTab, setActiveContractTab] = useState<'positions' | 'orders'>('positions');
   const [positionHistory, setPositionHistory] = useState<PositionHistory[]>([]);
   const [isFetchingHistory, setIsFetchingHistory] = useState(false);
@@ -359,7 +361,22 @@ export default function App() {
   const [positionMode, setPositionMode] = useState<'ONE_WAY' | 'HEDGE'>('ONE_WAY');
   const [isApiVisible, setIsApiVisible] = useState(false);
   const [isTradeRiskVisible, setIsTradeRiskVisible] = useState(false);
-  const [leverage, setLeverage] = useState<number>(5);
+  const [leverage, setLeverage] = useState<number>(() => {
+    const saved = localStorage.getItem('app_user_leverage');
+    return saved ? Number(saved) : 5;
+  });
+  const [orderRatioPercent, setOrderRatioPercent] = useState<number | null>(() => {
+    const saved = localStorage.getItem('app_order_ratio_percent');
+    return saved ? Number(saved) : 5;
+  });
+  const [isCustomRatio, setIsCustomRatio] = useState<boolean>(() => {
+    const saved = localStorage.getItem('app_is_custom_ratio');
+    return saved === 'true';
+  });
+  const [customRatioInput, setCustomRatioInput] = useState<string>(() => {
+    const saved = localStorage.getItem('app_custom_ratio_value');
+    return saved || '';
+  });
   const [futuresRatio, setFuturesRatio] = useState<number>(50);
   const [turnoverCoef, setTurnoverCoef] = useState<number>(3000);
   const [isCalculatingVolume, setIsCalculatingVolume] = useState<boolean>(false);
@@ -2322,7 +2339,7 @@ export default function App() {
               addLog('[智能降级架构] 币安 WebSocket 实时推流已就续，自动切换为 0 权重实时推流模式 (REST 兜底调至 30 秒低频运行)', 'SUCCESS');
               fetchSnapshot();
             } else if (nextStatus === 'DISCONNECTED' || nextStatus === 'RECONNECTING') {
-              addLog('[智能降级架构] WebSocket 推送断开/重连中，已智能激活 3 秒 REST 极速轮询应急接管...', 'WARNING');
+              addLog('[智能降级架构] WebSocket 推送断开/重连中，已智能激活 3 秒 REST 极速轮询应急接管...', 'WARN');
             }
           } else if (payload.type === 'ACCOUNT_UPDATE' && payload.data) {
             handleAccountDeltaUpdate(payload.data);
@@ -2386,6 +2403,68 @@ export default function App() {
     }
   };
 
+  // 1号区域: 杠杆倍数选择处理器 (1X, 2X, 3X, 5X, 10X)
+  const handleSelectLeverage = (lev: number) => {
+    setLeverage(lev);
+    localStorage.setItem('app_user_leverage', lev.toString());
+    addLog(`合约开单杠杆倍数已设置为: ${lev}X (后期下单将统一使用该杠杆倍数)`, 'INFO');
+  };
+
+  // 2号区域: 合约比例选择处理器 (3%, 5%, 10%, 20%)
+  const handleSelectRatioPercent = (pct: number) => {
+    setIsCustomRatio(false);
+    setOrderRatioPercent(pct);
+    setFuturesRatio(pct);
+    localStorage.setItem('app_order_ratio_percent', pct.toString());
+    localStorage.setItem('app_is_custom_ratio', 'false');
+
+    const fb = balance.futuresBalance || 0;
+    const calcAmount = parseFloat((fb * (pct / 100)).toFixed(2));
+    setOrderForm(prev => ({ ...prev, amount: calcAmount }));
+    addLog(`合约开单比例已选择: ${pct}% (计算方式: 合约余额 ${fb.toFixed(2)} USDT × ${pct}% = ${calcAmount} USDT，后续下单将统一按此比例计算)`, 'INFO');
+  };
+
+  // 2号区域: 自定义比例应用处理器 (<= 100)
+  const handleApplyCustomRatio = (rawVal: string) => {
+    setIsCustomRatio(true);
+    localStorage.setItem('app_is_custom_ratio', 'true');
+
+    if (rawVal === '') {
+      setCustomRatioInput('');
+      return;
+    }
+
+    let val = parseFloat(rawVal);
+    if (isNaN(val)) return;
+    if (val > 100) val = 100; // 自定义不能大于 100，100 代表 100%
+    if (val < 0) val = 0;
+
+    const valStr = val.toString();
+    setCustomRatioInput(valStr);
+    setOrderRatioPercent(val);
+    setFuturesRatio(val);
+    localStorage.setItem('app_custom_ratio_value', valStr);
+    localStorage.setItem('app_order_ratio_percent', val.toString());
+
+    const fb = balance.futuresBalance || 0;
+    const calcAmount = parseFloat((fb * (val / 100)).toFixed(2));
+    setOrderForm(prev => ({ ...prev, amount: calcAmount }));
+    addLog(`合约开单自定义比例已设置为: ${val}% (计算方式: 合约余额 ${fb.toFixed(2)} USDT × ${val}% = ${calcAmount} USDT，后续下单将统一按此比例计算)`, 'INFO');
+  };
+
+  // 当合约账户余额发生变化时，如果已选择比例，保持下单数量动态刷新
+  useEffect(() => {
+    if (orderRatioPercent !== null && balance.futuresBalance && balance.futuresBalance > 0) {
+      const calcAmount = parseFloat((balance.futuresBalance * (orderRatioPercent / 100)).toFixed(2));
+      setOrderForm(prev => {
+        if (Math.abs(prev.amount - calcAmount) > 0.001) {
+          return { ...prev, amount: calcAmount };
+        }
+        return prev;
+      });
+    }
+  }, [balance.futuresBalance, orderRatioPercent]);
+
   const handleCalculateContractVolume = useCallback(async () => {
     const normalizedSymbol = orderForm.symbol.trim().toUpperCase();
     if (!normalizedSymbol) {
@@ -2399,9 +2478,10 @@ export default function App() {
 
     try {
       const futuresBalance = balance.futuresBalance || 0;
-      // 基础合约量1 = 合约余额 * 杠杆 * (合约比例 / 100)
-      const baseQty1 = futuresBalance * leverage * (futuresRatio / 100);
-      addLog(`[合约量计算] 基础合约量1 = 合约余额 (${futuresBalance.toFixed(2)} USDT) * 杠杆 (${leverage}x) * 合约比例 (${futuresRatio}%) = ${baseQty1.toFixed(2)} USDT`, 'INFO');
+      // 基础合约量1 = 合约余额 * 选择的百分比（或者自定义的百分比）
+      const activeRatio = orderRatioPercent !== null ? orderRatioPercent : futuresRatio;
+      const baseQty1 = futuresBalance * (activeRatio / 100);
+      addLog(`[合约量计算] 基础合约量1 = 合约余额 (${futuresBalance.toFixed(2)} USDT) * 选择比例 (${activeRatio}%) = ${baseQty1.toFixed(2)} USDT`, 'INFO');
 
       addLog(`[合约量计算] 正在向币安接口获取 ${normalizedSymbol} 的最近 15m K线...`, 'INFO');
 
@@ -2535,11 +2615,23 @@ export default function App() {
       return;
     }
 
-    const calculatedQty = orderForm.amount / currentPrice;
+    // 统一按选定的百分比或金额开单：“一旦选择了，后期下单都统一成这个百分比，除非重新选择这个比例”
+    let targetAmount = orderForm.amount;
+    if (orderRatioPercent !== null && balance.futuresBalance && balance.futuresBalance > 0) {
+      const calculatedFromRatio = parseFloat((balance.futuresBalance * (orderRatioPercent / 100)).toFixed(2));
+      if (calculatedFromRatio > 0) {
+        targetAmount = calculatedFromRatio;
+        if (orderForm.amount !== targetAmount) {
+          setOrderForm(prev => ({ ...prev, amount: targetAmount }));
+        }
+      }
+    }
+
+    const calculatedQty = targetAmount / currentPrice;
     const formattedQty = formatQty(normalizedSymbol, calculatedQty);
 
     if (parseFloat(formattedQty) <= 0) {
-      addLog(`下单数量太小: ${orderForm.amount} USDT 不足以购买最小单位 of ${normalizedSymbol}`, 'ERROR');
+      addLog(`下单数量太小: ${targetAmount} USDT 不足以购买最小单位 of ${normalizedSymbol}`, 'ERROR');
       setIsTrading(false);
       return;
     }
@@ -2571,13 +2663,13 @@ export default function App() {
       if (levResponse.ok) {
         addLog(`成功同步合约杠杆为: ${leverage}x`, 'SUCCESS');
       } else {
-        addLog(`同步杠杆失败: ${levData.msg || '无法更改，实盘可能已达该币种杠杆上限或有未平仓位阻碍'}`, 'WARNING');
+        addLog(`同步杠杆失败: ${levData.msg || '无法更改，实盘可能已达该币种杠杆上限或有未平仓位阻碍'}`, 'WARN');
       }
     } catch (err: any) {
       console.warn('Failed to sync leverage with Binance:', err);
     }
 
-    addLog(`正在发送 ${orderSide} 订单: ${orderForm.amount} USDT ≈ ${formattedQty} ${normalizedSymbol} (价格: ${currentPrice})...`, 'TRADE');
+    addLog(`正在发送 ${orderSide} 订单: ${targetAmount} USDT ≈ ${formattedQty} ${normalizedSymbol} (价格: ${currentPrice}, 杠杆: ${leverage}x, 比例: ${orderRatioPercent !== null ? orderRatioPercent + '%' : '固定'})...`, 'TRADE');
 
     try {
       const response = await fetch('/api/binance-proxy', {
@@ -4450,6 +4542,35 @@ export default function App() {
             </div>
           </button>
 
+          {/* Card 4: 权重统计 */}
+          <button
+            onClick={() => {
+              setActiveMainTab('WEIGHT_STATS');
+            }}
+            id="btn-active-tab-weight-stats"
+            className={`flex items-center justify-center gap-2 px-3 rounded-xl border transition-all text-center relative overflow-hidden h-[50px] w-[205px] group cursor-pointer ${
+              activeMainTab === 'WEIGHT_STATS'
+              ? 'bg-[#00acc1] border-[#00acc1] shadow-lg shadow-[#00acc1]/20 ring-1 ring-[#00acc1]/30'
+              : 'bg-[#00acc1]/15 border-[#00acc1]/25 hover:border-[#00acc1]/45 hover:bg-[#00acc1]/25'
+            }`}
+          >
+            {activeMainTab === 'WEIGHT_STATS' && (
+              <div className="absolute top-0 left-0 w-1 h-full bg-white opacity-40 animate-pulse" />
+            )}
+            <div className={`p-1.5 rounded-lg transition-colors shrink-0 ${
+              activeMainTab === 'WEIGHT_STATS' ? 'bg-white/20 text-white' : 'bg-[#00acc1]/15 text-[#00acc1]/80 group-hover:text-[#00acc1]'
+            }`}>
+              <BarChart2 size={16} className={activeMainTab === 'WEIGHT_STATS' ? 'fill-white/10' : 'fill-[#00acc1]/10'} />
+            </div>
+            <div className="min-w-0">
+              <h3 className={`font-bold text-[18px] leading-none transition-colors ${
+                activeMainTab === 'WEIGHT_STATS' ? 'text-white' : 'text-[#00acc1]/90 group-hover:text-[#00acc1]'
+              }`}>
+                权重统计
+              </h3>
+            </div>
+          </button>
+
           {/* 闹钟组件 (位于报表统计与恢复之间) */}
           <AlarmNavButton 
             settings={alarmSettings}
@@ -4711,7 +4832,7 @@ export default function App() {
                       className="w-full bg-[#182C25] border border-emerald-500/40 text-[#5EF2C1] font-mono text-xl p-2 rounded focus:outline-none focus:border-[#4ADE80] font-bold transition-all placeholder-emerald-800 text-center" 
                       value={activeRisk.tp}
                       onChange={e => {
-                        const val = e.target.value;
+                        const val = e.target.value === '' ? 0 : Number(e.target.value);
                         setActiveRisk(prev => ({...prev, tp: val}));
                       }}
                     />
@@ -4724,7 +4845,7 @@ export default function App() {
                       className="w-full bg-[#2F191B] border border-rose-500/40 text-[#FCA5A5] font-mono text-xl p-2 rounded focus:outline-none focus:border-[#F87171] font-bold transition-all placeholder-rose-800 text-center" 
                       value={activeRisk.sl}
                       onChange={e => {
-                        const val = e.target.value;
+                        const val = e.target.value === '' ? 0 : Number(e.target.value);
                         setActiveRisk(prev => ({...prev, sl: val}));
                       }}
                     />
@@ -4833,7 +4954,7 @@ export default function App() {
                             className="financial-input w-full pr-8 text-center font-mono font-bold text-emerald-400" 
                             value={(activeRisk as any).tpCoef !== undefined ? (activeRisk as any).tpCoef : 45}
                             onChange={e => {
-                              const val = e.target.value === '' ? '' : Number(e.target.value);
+                              const val = e.target.value === '' ? 0 : Number(e.target.value);
                               setActiveRisk(prev => ({...prev, tpCoef: val}));
                             }}
                           />
@@ -4849,7 +4970,7 @@ export default function App() {
                             className="financial-input w-full pr-8 text-center font-mono font-bold text-rose-400" 
                             value={(activeRisk as any).slCoef !== undefined ? (activeRisk as any).slCoef : 100}
                             onChange={e => {
-                              const val = e.target.value === '' ? '' : Number(e.target.value);
+                              const val = e.target.value === '' ? 0 : Number(e.target.value);
                               setActiveRisk(prev => ({...prev, slCoef: val}));
                             }}
                           />
@@ -5171,7 +5292,12 @@ export default function App() {
                   </div>
                 </div>
                 <div>
-                  <label className="financial-label">下单数量 (USDT)</label>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="financial-label mb-0">下单数量 (USDT)</label>
+                    <span className="text-[11px] text-zinc-400 font-mono">
+                      杠杆: <strong className="text-emerald-400 font-bold">{leverage}X</strong>
+                    </span>
+                  </div>
                   <input 
                     type="number" 
                     step="any"
@@ -5182,6 +5308,24 @@ export default function App() {
                       setOrderForm(prev => ({...prev, amount: val === '' ? 0 : Number(val)}));
                     }}
                   />
+                  {/* 1号区域: 杠杆倍数快捷选择 (1X, 2X, 3X, 5X, 10X) */}
+                  <div className="grid grid-cols-5 gap-1.5 mt-2">
+                    {[1, 2, 3, 5, 10].map(lev => (
+                      <button
+                        key={lev}
+                        type="button"
+                        onClick={() => handleSelectLeverage(lev)}
+                        className={`py-1 px-0.5 rounded text-xs font-mono font-bold transition-all border text-center cursor-pointer select-none active:scale-95 ${
+                          leverage === lev
+                            ? 'bg-emerald-500 text-black border-emerald-400 shadow-md shadow-emerald-500/25 ring-1 ring-emerald-400 font-black'
+                            : 'bg-[#141416] hover:bg-zinc-800 text-zinc-300 border-zinc-700/60 hover:border-zinc-500'
+                        }`}
+                        title={`选择开单杠杆倍数: ${lev}X (后续下单将统一使用该杠杆)`}
+                      >
+                        {lev}X
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -5213,6 +5357,63 @@ export default function App() {
                     )}
                     <span>合约量计算</span>
                   </button>
+
+                  {/* 2号区域: 合约比例与计算选择 (3%, 5%, 10%, 20%, 自定义) */}
+                  <div className="grid grid-cols-5 gap-1.5 mt-2">
+                    {[3, 5, 10, 20].map(pct => (
+                      <button
+                        key={pct}
+                        type="button"
+                        onClick={() => handleSelectRatioPercent(pct)}
+                        className={`py-1 px-0.5 rounded text-xs font-mono font-bold transition-all border text-center cursor-pointer select-none active:scale-95 ${
+                          orderRatioPercent === pct && !isCustomRatio
+                            ? 'bg-sky-500 text-black border-sky-400 shadow-md shadow-sky-500/25 ring-1 ring-sky-400 font-black'
+                            : 'bg-[#141416] hover:bg-zinc-800 text-zinc-300 border-zinc-700/60 hover:border-zinc-500'
+                        }`}
+                        title={`按合约余额的 ${pct}% 计算下单金额`}
+                      >
+                        {pct}%
+                      </button>
+                    ))}
+
+                    {/* 自定义数值选项 (不能大于 100) */}
+                    <div className="relative">
+                      {isCustomRatio ? (
+                        <div className="relative w-full h-full">
+                          <input
+                            type="number"
+                            min="0.1"
+                            max="100"
+                            step="any"
+                            autoFocus
+                            placeholder="1~100"
+                            value={customRatioInput}
+                            onChange={(e) => handleApplyCustomRatio(e.target.value)}
+                            className="w-full h-full py-1 px-0.5 pr-3 text-xs font-mono font-bold bg-sky-500 text-black border border-sky-400 rounded text-center focus:outline-none ring-1 ring-sky-400 placeholder-black/50"
+                          />
+                          <span className="absolute right-0.5 top-1/2 -translate-y-1/2 text-[9px] font-bold text-black pointer-events-none">%</span>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsCustomRatio(true);
+                            if (customRatioInput) {
+                              handleApplyCustomRatio(customRatioInput);
+                            }
+                          }}
+                          className={`w-full h-full py-1 px-0.5 rounded text-xs font-mono font-bold transition-all border text-center cursor-pointer select-none active:scale-95 truncate ${
+                            isCustomRatio
+                              ? 'bg-sky-500 text-black border-sky-400 shadow-md shadow-sky-500/25 ring-1 ring-sky-400 font-black'
+                              : 'bg-[#141416] hover:bg-zinc-800 text-zinc-300 border-zinc-700/60 hover:border-zinc-500'
+                          }`}
+                          title="输入自定义比例 (1~100，如 35 代表 35%)"
+                        >
+                          {customRatioInput ? `${customRatioInput}%` : '自定义'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -5563,6 +5764,10 @@ export default function App() {
 
       <div className={activeMainTab === 'REPORT' ? 'block' : 'hidden'}>
         {renderReportView()}
+      </div>
+
+      <div className={activeMainTab === 'WEIGHT_STATS' ? 'block' : 'hidden'}>
+        <WeightStatsModule />
       </div>
 
       {/* 划转面板 (Account Transfer Modal) */}

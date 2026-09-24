@@ -7,6 +7,7 @@ import CryptoJS from "crypto-js";
 import Database from "better-sqlite3";
 import { userDataStreamManager } from "./server/userDataStream";
 import { MarketDataManager } from "./server/marketDataManager";
+import { weightStatsManager } from "./server/weightStatsManager";
 
 // Initialize SQLite database
 const dbPath = process.env.DATABASE_PATH || "trading.db";
@@ -312,6 +313,7 @@ const fetchBinanceBackend = async (endpoint: string, params: Record<string, any>
 
   let lastError: any = null;
   for (const base of candidates) {
+    const reqStart = Date.now();
     try {
       const url = `${base}${safeEndpoint}${queryString ? '?' + queryString : ''}`;
       const controller = new AbortController();
@@ -326,6 +328,17 @@ const fetchBinanceBackend = async (endpoint: string, params: Record<string, any>
         signal: controller.signal
       });
       clearTimeout(timeoutId);
+
+      // 记录 API 调用权重流水
+      weightStatsManager.recordApiCall({
+        endpoint: safeEndpoint,
+        method: "GET",
+        queryParams: params,
+        status: response.status,
+        durationMs: Date.now() - reqStart,
+        source: "行情数据引擎(4H/15m)",
+        headers: response.headers
+      });
 
       // 【核心规约】：如果收到的状态码是 429（超频）或 418（封禁），严禁重试任何其他镜像节点！
       if (response.status === 429 || response.status === 418) {
@@ -355,6 +368,15 @@ const fetchBinanceBackend = async (endpoint: string, params: Record<string, any>
       return JSON.parse(text);
     } catch (err: any) {
       lastError = err;
+      weightStatsManager.recordApiCall({
+        endpoint: safeEndpoint,
+        method: "GET",
+        queryParams: params,
+        status: err?.status || 500,
+        durationMs: Date.now() - reqStart,
+        source: "行情数据引擎(4H/15m)",
+        error: err.message || String(err)
+      });
       // 如果属于 429 或 418，绝对不进行重试，立即退出循环并向上抛出
       if (err.message && (err.message.includes('429') || err.message.includes('418'))) {
         throw err;
@@ -833,6 +855,7 @@ const getLiveEnrichedScanResults15m = () => {
     const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
     const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
     const price = marketDataManager.getSymbolPrice(item.symbol);
+    const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
@@ -841,7 +864,15 @@ const getLiveEnrichedScanResults15m = () => {
       lastPrice: price > 0 ? price : (kline ? kline.close : item.lastPrice),
       change: kline ? kline.change : item.change,
       change24h: chg24h !== 0 ? chg24h : item.change24h,
-      amplitude: kline ? kline.amplitude : item.amplitude
+      amplitude: kline ? kline.amplitude : item.amplitude,
+      listingOpen: extremes.listingOpen,
+      listingTime: extremes.listingTime,
+      historicalHigh: extremes.historicalHigh,
+      historicalLow: extremes.historicalLow,
+      highTime: extremes.highTime,
+      lowTime: extremes.lowTime,
+      laterExtreme: extremes.laterExtreme,
+      candlesCount: extremes.candlesCount
     };
   };
 
@@ -849,11 +880,20 @@ const getLiveEnrichedScanResults15m = () => {
     const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
     const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
     const price = marketDataManager.getSymbolPrice(item.symbol);
+    const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
       lastPrice: price > 0 ? price : item.lastPrice,
-      change24h: chg24h !== 0 ? chg24h : item.change24h
+      change24h: chg24h !== 0 ? chg24h : item.change24h,
+      listingOpen: extremes.listingOpen,
+      listingTime: extremes.listingTime,
+      historicalHigh: extremes.historicalHigh,
+      historicalLow: extremes.historicalLow,
+      highTime: extremes.highTime,
+      lowTime: extremes.lowTime,
+      laterExtreme: extremes.laterExtreme,
+      candlesCount: extremes.candlesCount
     };
   };
 
@@ -884,6 +924,8 @@ const getFullResults4h = () => {
 
         const kline = marketDataManager.getSymbol4hKline(symbol);
         if (kline && kline.volume > min4h) {
+          const highChange = kline.close > 0 && kline.open > 0 ? ((kline.close - kline.open) / kline.close) * 100 : kline.change;
+          const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
           finalResults.push({
             symbol,
             volume24h: vol24h,
@@ -891,8 +933,13 @@ const getFullResults4h = () => {
             openPrice: kline.open,
             lastPrice: kline.close,
             change: kline.change,
+            highChange,
             change24h: marketDataManager.getSymbol24hChange(symbol),
-            amplitude: kline.amplitude
+            amplitude: kline.amplitude,
+            fundingRate: fundingInfo.fundingRate,
+            fundingIntervalHours: fundingInfo.fundingIntervalHours,
+            settlementCycle: fundingInfo.settlementCycle,
+            nextFundingTime: fundingInfo.nextFundingTime
           });
         }
       }
@@ -921,12 +968,24 @@ const getFullResults4h = () => {
       for (const symbol of qualifiedSymbols) {
         const spike = marketDataManager.getSymbol1hSpike(symbol);
         if (spike) {
+          const kline = marketDataManager.getSymbol4hKline(symbol);
+          const price = marketDataManager.getSymbolPrice(symbol) || 0;
+          const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
+          const openPrice = kline ? kline.open : 0;
+          const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : spike.change1h;
           spikeResults.push({
             symbol,
             ratio: spike.ratio,
             currVolume: spike.currVolume,
             prevVolume: spike.prevVolume,
-            change: spike.change1h
+            change: spike.change1h,
+            highChange,
+            openPrice,
+            lastPrice: price,
+            fundingRate: fundingInfo.fundingRate,
+            fundingIntervalHours: fundingInfo.fundingIntervalHours,
+            settlementCycle: fundingInfo.settlementCycle,
+            nextFundingTime: fundingInfo.nextFundingTime
           });
         }
       }
@@ -936,15 +995,28 @@ const getFullResults4h = () => {
       const min24h = config4h.minVolume24h || config4h.m1 || 10000000;
       const allQualified24h = allSymbols
         .filter((s: string) => marketDataManager.getSymbol24hVolume(s) > min24h)
-        .map((s: string) => ({
-          symbol: s,
-          volume24h: marketDataManager.getSymbol24hVolume(s),
-          volume15m: 0,
-          openPrice: 0,
-          lastPrice: marketDataManager.getSymbolPrice(s),
-          change: 0,
-          change24h: marketDataManager.getSymbol24hChange(s)
-        }));
+        .map((s: string) => {
+          const kline = marketDataManager.getSymbol4hKline(s);
+          const price = marketDataManager.getSymbolPrice(s);
+          const fundingInfo = marketDataManager.getSymbolFundingInfo(s);
+          const openPrice = kline ? kline.open : 0;
+          const chg24h = marketDataManager.getSymbol24hChange(s);
+          const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : chg24h;
+          return {
+            symbol: s,
+            volume24h: marketDataManager.getSymbol24hVolume(s),
+            volume15m: 0,
+            openPrice,
+            lastPrice: price,
+            change: 0,
+            highChange,
+            change24h: chg24h,
+            fundingRate: fundingInfo.fundingRate,
+            fundingIntervalHours: fundingInfo.fundingIntervalHours,
+            settlementCycle: fundingInfo.settlementCycle,
+            nextFundingTime: fundingInfo.nextFundingTime
+          };
+        });
 
       const gainers24h = [...allQualified24h].sort((a, b) => b.change24h - a.change24h).slice(0, 5);
       const losers24h = [...allQualified24h].sort((a, b) => a.change24h - b.change24h).slice(0, 5);
@@ -964,6 +1036,7 @@ const getFullResults4h = () => {
     const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
     const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
     const price = marketDataManager.getSymbolPrice(item.symbol) || (kline ? kline.close : item.lastPrice);
+    const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
 
     let change = kline ? kline.change : item.change;
     let amplitude = kline ? kline.amplitude : item.amplitude;
@@ -979,6 +1052,9 @@ const getFullResults4h = () => {
       }
     }
 
+    const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : change;
+    const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
+
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
@@ -986,31 +1062,84 @@ const getFullResults4h = () => {
       openPrice: openPrice,
       lastPrice: price,
       change: change,
+      highChange: highChange,
       change24h: chg24h !== 0 ? chg24h : item.change24h,
-      amplitude: amplitude
+      amplitude: amplitude,
+      fundingRate: fundingInfo.fundingRate,
+      fundingIntervalHours: fundingInfo.fundingIntervalHours,
+      settlementCycle: fundingInfo.settlementCycle,
+      nextFundingTime: fundingInfo.nextFundingTime,
+      listingOpen: extremes.listingOpen,
+      listingTime: extremes.listingTime,
+      historicalHigh: extremes.historicalHigh,
+      historicalLow: extremes.historicalLow,
+      highTime: extremes.highTime,
+      lowTime: extremes.lowTime,
+      laterExtreme: extremes.laterExtreme,
+      candlesCount: extremes.candlesCount
     };
   };
 
   const enrichItemSpike = (item: any) => {
     const spike = marketDataManager.getSymbol1hSpike(item.symbol);
+    const kline = marketDataManager.getSymbol4hKline(item.symbol);
+    const price = marketDataManager.getSymbolPrice(item.symbol) || item.lastPrice || 0;
+    const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
+    const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
+    const openPrice = kline ? kline.open : (item.openPrice || 0);
+    const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : (spike ? spike.change1h : item.change);
     return {
       ...item,
       ratio: spike ? spike.ratio : item.ratio,
       currVolume: spike ? spike.currVolume : item.currVolume,
       prevVolume: spike ? spike.prevVolume : item.prevVolume,
-      change: spike ? spike.change1h : item.change
+      change: spike ? spike.change1h : item.change,
+      highChange,
+      openPrice,
+      lastPrice: price,
+      fundingRate: fundingInfo.fundingRate,
+      fundingIntervalHours: fundingInfo.fundingIntervalHours,
+      settlementCycle: fundingInfo.settlementCycle,
+      nextFundingTime: fundingInfo.nextFundingTime,
+      listingOpen: extremes.listingOpen,
+      listingTime: extremes.listingTime,
+      historicalHigh: extremes.historicalHigh,
+      historicalLow: extremes.historicalLow,
+      highTime: extremes.highTime,
+      lowTime: extremes.lowTime,
+      laterExtreme: extremes.laterExtreme,
+      candlesCount: extremes.candlesCount
     };
   };
 
   const enrichItem24h = (item: any) => {
     const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
     const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
-    const price = marketDataManager.getSymbolPrice(item.symbol);
+    const price = marketDataManager.getSymbolPrice(item.symbol) || item.lastPrice || 0;
+    const kline = marketDataManager.getSymbol4hKline(item.symbol);
+    const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
+    const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
+    const openPrice = kline ? kline.open : (item.openPrice || 0);
+    const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : chg24h;
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
+      openPrice,
       lastPrice: price > 0 ? price : item.lastPrice,
-      change24h: chg24h !== 0 ? chg24h : item.change24h
+      change24h: chg24h !== 0 ? chg24h : item.change24h,
+      highChange,
+      fundingRate: fundingInfo.fundingRate,
+      fundingIntervalHours: fundingInfo.fundingIntervalHours,
+      settlementCycle: fundingInfo.settlementCycle,
+      nextFundingTime: fundingInfo.nextFundingTime,
+      listingOpen: extremes.listingOpen,
+      listingTime: extremes.listingTime,
+      historicalHigh: extremes.historicalHigh,
+      historicalLow: extremes.historicalLow,
+      highTime: extremes.highTime,
+      lowTime: extremes.lowTime,
+      laterExtreme: extremes.laterExtreme,
+      candlesCount: extremes.candlesCount
     };
   };
 
@@ -1104,6 +1233,8 @@ const runCycleScan4h = async () => {
       const kline = marketDataManager.getSymbol4hKline(symbol);
       if (kline && kline.volume > min4h) {
         passedCount++;
+        const highChange = kline.close > 0 && kline.open > 0 ? ((kline.close - kline.open) / kline.close) * 100 : kline.change;
+        const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
         finalResults.push({
           symbol,
           volume24h: vol24h,
@@ -1111,8 +1242,13 @@ const runCycleScan4h = async () => {
           openPrice: kline.open,
           lastPrice: kline.close,
           change: kline.change,
+          highChange,
           change24h: marketDataManager.getSymbol24hChange(symbol),
-          amplitude: kline.amplitude
+          amplitude: kline.amplitude,
+          fundingRate: fundingInfo.fundingRate,
+          fundingIntervalHours: fundingInfo.fundingIntervalHours,
+          settlementCycle: fundingInfo.settlementCycle,
+          nextFundingTime: fundingInfo.nextFundingTime
         });
       }
     }
@@ -2349,6 +2485,38 @@ async function startServer() {
     }
   });
 
+  // 币安 API 权重与调用频次监控管理接口
+  app.get("/api/weight-stats/status", (req, res) => {
+    try {
+      res.json(weightStatsManager.getStatus());
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/weight-stats/toggle", (req, res) => {
+    try {
+      const { isRunning } = req.body;
+      if (isRunning) {
+        weightStatsManager.start();
+      } else {
+        weightStatsManager.stop();
+      }
+      res.json({ success: true, isRunning: weightStatsManager.getIsRunning() });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/weight-stats/clear", (req, res) => {
+    try {
+      weightStatsManager.clear();
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Simple in-memory cache for public endpoints to avoid Binance IP bans and rate-limits
   interface CacheEntry {
     data: any;
@@ -2410,6 +2578,7 @@ async function startServer() {
       let success = false;
 
       for (const base of candidates) {
+        const reqStart = Date.now();
         try {
           const url = `${base}${safeEndpoint}${queryString ? '?' + queryString : ''}`;
           
@@ -2424,6 +2593,17 @@ async function startServer() {
             signal: controller.signal
           });
           clearTimeout(timeoutId);
+
+          // 记录 API 权重流水
+          weightStatsManager.recordApiCall({
+            endpoint: safeEndpoint,
+            method: "GET",
+            queryParams: params,
+            status: response.status,
+            durationMs: Date.now() - reqStart,
+            source: "公共行情代理",
+            headers: response.headers
+          });
           
           responseStatus = response.status;
           const responseText = await response.text();
@@ -2437,6 +2617,15 @@ async function startServer() {
             lastError = new Error(`Non-JSON response (status ${response.status})`);
           }
         } catch (fetchErr: any) {
+          weightStatsManager.recordApiCall({
+            endpoint: safeEndpoint,
+            method: "GET",
+            queryParams: params,
+            status: 500,
+            durationMs: Date.now() - reqStart,
+            source: "公共行情代理",
+            error: fetchErr.message || String(fetchErr)
+          });
           console.warn(`Failed to connect/fetch public endpoint from ${base}: ${fetchErr.message || fetchErr}`);
           lastError = fetchErr;
         }
@@ -2512,6 +2701,7 @@ async function startServer() {
       let finalUrl = '';
 
       for (const currentBase of uniqueCandidates) {
+        const reqStart = Date.now();
         try {
           let currentUrl = `${currentBase}${safeEndpoint}`;
           let options: RequestInit = {
@@ -2545,6 +2735,17 @@ async function startServer() {
           const resObj = await fetch(currentUrl, options);
           clearTimeout(timeoutId);
 
+          // 记录 API 权重流水
+          weightStatsManager.recordApiCall({
+            endpoint: safeEndpoint,
+            method: options.method || "GET",
+            queryParams: baseParams,
+            status: resObj.status,
+            durationMs: Date.now() - reqStart,
+            source: "交易/账户代理",
+            headers: resObj.headers
+          });
+
           responseText = await resObj.text();
           response = resObj;
 
@@ -2557,6 +2758,15 @@ async function startServer() {
             lastError = new Error(`Non-JSON response (status ${resObj.status})`);
           }
         } catch (fetchErr: any) {
+          weightStatsManager.recordApiCall({
+            endpoint: safeEndpoint,
+            method: method || "GET",
+            queryParams: baseParams,
+            status: 500,
+            durationMs: Date.now() - reqStart,
+            source: "交易/账户代理",
+            error: fetchErr.message || String(fetchErr)
+          });
           console.warn(`Failed to connect/fetch from ${currentBase}: ${fetchErr.message || fetchErr}`);
           lastError = fetchErr;
         }

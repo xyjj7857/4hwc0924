@@ -58,6 +58,14 @@ interface SymbolData {
   change: number;
   change24h: number;
   amplitude?: number;
+  listingOpen?: number;
+  listingTime?: number;
+  historicalHigh?: number;
+  historicalLow?: number;
+  highTime?: number;
+  lowTime?: number;
+  laterExtreme?: 'high' | 'low' | 'same';
+  candlesCount?: number;
 }
 
 interface FundingRateData {
