@@ -628,9 +628,34 @@ export default function App() {
 
   // 实时行情价格字典 (依据本地 WebSocket 流，0 接口权重消耗，高频毫秒级推流/刷新)
   const { livePrices: sseLivePrices } = useMarketPrices();
-  const [livePrices, setLivePrices] = useState<Record<string, { lastPrice: number; markPrice: number; change24h: number }>>({});
-  const livePricesRef = useRef<Record<string, { lastPrice: number; markPrice: number; change24h: number }>>({});
+  const [livePrices, setLivePrices] = useState<Record<string, { lastPrice: number; markPrice: number; change24h: number; fundingIntervalHours?: number; settlementCycle?: string; fundingRate?: number }>>({});
+  const livePricesRef = useRef<Record<string, { lastPrice: number; markPrice: number; change24h: number; fundingIntervalHours?: number; settlementCycle?: string; fundingRate?: number }>>({});
   
+  // 币对资金费结算周期映射表 (如: NILUSDT -> 4h, BTCUSDT -> 8h)
+  const [fundingCycleMap, setFundingCycleMap] = useState<Record<string, string>>({});
+
+  // 批量从后端内存极速获取持仓币对的资金费结算周期 (0 权重消耗)
+  const fetchFundingCycles = useCallback(async (symbols: string[]) => {
+    if (!symbols || symbols.length === 0) return;
+    try {
+      const res = await fetch(`/api/market/funding-info?symbols=${encodeURIComponent(symbols.join(','))}`);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success && json.data) {
+          const map: Record<string, string> = {};
+          for (const [sym, info] of Object.entries(json.data as Record<string, any>)) {
+            if (info.settlementCycle) {
+              map[sym] = info.settlementCycle;
+            }
+          }
+          setFundingCycleMap(prev => ({ ...prev, ...map }));
+        }
+      }
+    } catch (e) {
+      // Silent
+    }
+  }, []);
+
   useEffect(() => {
     if (sseLivePrices && Object.keys(sseLivePrices).length > 0) {
       setLivePrices(prev => ({
@@ -642,7 +667,24 @@ export default function App() {
 
   useEffect(() => {
     livePricesRef.current = livePrices;
+    const map: Record<string, string> = {};
+    for (const [sym, p] of Object.entries(livePrices)) {
+      if ((p as any)?.settlementCycle) {
+        map[sym] = (p as any).settlementCycle;
+      }
+    }
+    if (Object.keys(map).length > 0) {
+      setFundingCycleMap(prev => ({ ...prev, ...map }));
+    }
   }, [livePrices]);
+
+  // 当活跃持仓变动时，自动补充获取对应币对资金费率结算周期
+  useEffect(() => {
+    if (positions.length > 0) {
+      const syms = positions.map(p => p.symbol).filter(Boolean);
+      fetchFundingCycles(syms);
+    }
+  }, [positions, fetchFundingCycles]);
 
   // 实时行情价格引擎：对活跃持仓币对及当前下单币对进行极速刷新 (500ms 轮询本地后端内存)
   useEffect(() => {
@@ -713,6 +755,23 @@ export default function App() {
 
   // Binance WebSocket User Data Stream connection state
   const [userStreamStatus, setUserStreamStatus] = useState<'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'RECONNECTING'>('DISCONNECTED');
+
+  // 左侧面板向左折叠隐藏状态：红框区域可向左折叠隐藏，默认隐藏 (true)
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('app_trade_sidebar_collapsed');
+      if (saved !== null) return saved === 'true';
+    } catch {}
+    return true; // 默认向左折叠隐藏
+  });
+
+  const toggleSidebarCollapse = useCallback(() => {
+    setIsSidebarCollapsed(prev => {
+      const next = !prev;
+      try { localStorage.setItem('app_trade_sidebar_collapsed', String(next)); } catch {}
+      return next;
+    });
+  }, []);
 
   // 左侧栏宽度左右可拖拽调节
   const [tradeSidebarWidth, setTradeSidebarWidth] = useState<number>(() => {
@@ -2680,14 +2739,18 @@ export default function App() {
 
       // Compare baseQty1 & baseQty2, pick min
       const finalAmount = Math.min(baseQty1, baseQty2);
-      const roundedAmount = parseFloat(finalAmount.toFixed(2));
+      // 合约量计算后的数值向下取整，作为下单数量。例如计算后的结果是 16.83，向下取整后为 16
+      const floorAmount = Math.floor(finalAmount);
+
+      // 清除预设比例锁定，确保下单数量保留用户计算出的向下取整结果
+      setOrderRatioPercent(null);
 
       setOrderForm(prev => ({
         ...prev,
-        amount: roundedAmount
+        amount: floorAmount
       }));
 
-      addLog(`[合约量计算] 最终值 = min(基础合约量1: ${baseQty1.toFixed(2)}, 基础合约量2: ${baseQty2.toFixed(2)}) = ${roundedAmount} USDT，已更新至“下单数量”`, 'SUCCESS');
+      addLog(`[合约量计算] 最终值 = min(基础合约量1: ${baseQty1.toFixed(2)}, 基础合约量2: ${baseQty2.toFixed(2)}) = ${finalAmount.toFixed(2)} USDT，向下取整后为: ${floorAmount} USDT，已更新至“下单数量”`, 'SUCCESS');
     } catch (err: any) {
       addLog(`[合约量计算] 获取或计算异常: ${err.message || '未知错误'}`, 'ERROR');
     } finally {
@@ -4803,14 +4866,46 @@ export default function App() {
 
       <div className={activeMainTab === 'TRADE' ? 'flex-1 min-h-0 flex flex-col mt-2.5 overflow-hidden' : 'hidden'}>
         <div className={`flex flex-col lg:flex-row items-stretch gap-0 flex-1 min-h-0 h-full overflow-hidden ${isResizingSidebar ? 'select-none cursor-col-resize' : ''}`}>
-          {/* Left Column: API & Config & Account & Logs */}
-          <div 
-            style={{ width: typeof window !== 'undefined' && window.innerWidth >= 1024 ? `${tradeSidebarWidth}px` : undefined }}
-            className="w-full lg:w-auto shrink-0 flex flex-col space-y-3 h-full min-h-0 overflow-hidden pr-0 lg:pr-1"
-          >
-          {/* Account Status */}
-          <section className="financial-card p-4 space-y-3 shrink-0">
-            {!isConnected ? (
+          {/* 当左侧面板向左折叠隐藏时，展示垂直紧凑展开条 */}
+          {isSidebarCollapsed && (
+            <div 
+              onClick={toggleSidebarCollapse}
+              className="hidden lg:flex flex-col items-center justify-center w-7 shrink-0 bg-[#141416] hover:bg-[#1C1C1E] border border-[#232326] hover:border-emerald-500/40 rounded-lg mr-2 py-4 cursor-pointer group transition-all select-none shadow-sm"
+              title="点击展开左侧面板 (账户资产 / API配置 / 运行日志)"
+            >
+              <div className="w-5 h-5 rounded flex items-center justify-center bg-zinc-800 group-hover:bg-emerald-500/20 text-zinc-400 group-hover:text-emerald-400 transition-colors mb-2">
+                <ChevronRight size={14} className="stroke-[2.5] group-hover:translate-x-0.5 transition-transform" />
+              </div>
+              <span className="text-[11px] font-medium [writing-mode:vertical-lr] tracking-widest text-zinc-400 group-hover:text-emerald-300">
+                展开侧边栏
+              </span>
+            </div>
+          )}
+
+          {/* Left Column: API & Config & Account & Logs (红框区域：可向左折叠隐藏，默认隐藏) */}
+          {!isSidebarCollapsed && (
+            <div 
+              style={{ width: typeof window !== 'undefined' && window.innerWidth >= 1024 ? `${tradeSidebarWidth}px` : undefined }}
+              className="w-full lg:w-auto shrink-0 flex flex-col space-y-3 h-full min-h-0 overflow-hidden pr-0 lg:pr-1 animate-in fade-in slide-in-from-left-2 duration-150"
+            >
+            {/* Account Status */}
+            <section className="financial-card p-4 space-y-3 shrink-0">
+              <div className="flex items-center justify-between pb-1.5 border-b border-[#232326]">
+                <span className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
+                  <Sliders size={13} className="text-emerald-400" />
+                  <span>账户资产与配置</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={toggleSidebarCollapse}
+                  className="flex items-center gap-1 text-[11px] text-zinc-400 hover:text-white px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 border border-zinc-700/60 transition-all cursor-pointer"
+                  title="向左折叠隐藏左侧面板"
+                >
+                  <ChevronLeft size={13} className="stroke-[2.5]" />
+                  <span>向左折叠</span>
+                </button>
+              </div>
+              {!isConnected ? (
               <div className="py-8 text-center space-y-2 border border-dashed border-[#232326] rounded-lg">
                 <AlertCircle size={24} className="mx-auto text-zinc-600" />
                 <p className="text-xs text-zinc-500">请先验证 API 连接以查看余额</p>
@@ -5295,40 +5390,59 @@ export default function App() {
           />
 
         </div>
+        )}
 
         {/* Draggable Divider (Horizontal Resizer Bar) */}
-        <div
-          id="sidebar-drag-resizer"
-          onMouseDown={handleMouseDownResize}
-          onDoubleClick={() => {
-            setTradeSidebarWidth(380);
-            try { localStorage.setItem('app_trade_sidebar_width', '380'); } catch(e) {}
-          }}
-          className="hidden lg:flex items-center justify-center w-3.5 shrink-0 cursor-col-resize group relative select-none z-20 py-1 transition-all"
-          title="按住鼠标左右拖动可调整左侧宽度（向右拖动可拉宽日志区）；双击恢复默认宽度"
-        >
-          {/* Divider Line */}
-          <div className={`w-[2px] h-full rounded-full transition-all duration-150 ${
-            isResizingSidebar 
-              ? 'bg-amber-400 shadow-[0_0_10px_rgba(245,158,11,0.8)] scale-x-125' 
-              : 'bg-zinc-800/90 group-hover:bg-amber-500/70 group-hover:shadow-[0_0_6px_rgba(245,158,11,0.4)]'
-          }`} />
-          {/* Visual Grip Handle Indicator */}
-          <div className={`absolute top-1/2 -translate-y-1/2 flex items-center justify-center w-4 h-8 rounded-sm bg-[#18181b] border transition-all duration-150 shadow-md pointer-events-none ${
-            isResizingSidebar 
-              ? 'border-amber-400 text-amber-400 scale-110 bg-[#241f17] shadow-[0_0_8px_rgba(245,158,11,0.4)]' 
-              : 'border-zinc-700/80 text-zinc-500 group-hover:border-amber-500/60 group-hover:text-amber-400 group-hover:bg-[#1f1d18]'
-          }`}>
-            <GripVertical size={13} className="stroke-[2.5]" />
+        {!isSidebarCollapsed && (
+          <div
+            id="sidebar-drag-resizer"
+            onMouseDown={handleMouseDownResize}
+            onDoubleClick={() => {
+              setTradeSidebarWidth(380);
+              try { localStorage.setItem('app_trade_sidebar_width', '380'); } catch(e) {}
+            }}
+            className="hidden lg:flex items-center justify-center w-3.5 shrink-0 cursor-col-resize group relative select-none z-20 py-1 transition-all"
+            title="按住鼠标左右拖动可调整左侧宽度（向右拖动可拉宽日志区）；双击恢复默认宽度"
+          >
+            {/* Divider Line */}
+            <div className={`w-[2px] h-full rounded-full transition-all duration-150 ${
+              isResizingSidebar 
+                ? 'bg-amber-400 shadow-[0_0_10px_rgba(245,158,11,0.8)] scale-x-125' 
+                : 'bg-zinc-800/90 group-hover:bg-amber-500/70 group-hover:shadow-[0_0_6px_rgba(245,158,11,0.4)]'
+            }`} />
+            {/* Visual Grip Handle Indicator */}
+            <div className={`absolute top-1/2 -translate-y-1/2 flex items-center justify-center w-4 h-8 rounded-sm bg-[#18181b] border transition-all duration-150 shadow-md pointer-events-none ${
+              isResizingSidebar 
+                ? 'border-amber-400 text-amber-400 scale-110 bg-[#241f17] shadow-[0_0_8px_rgba(245,158,11,0.4)]' 
+                : 'border-zinc-700/80 text-zinc-500 group-hover:border-amber-500/60 group-hover:text-amber-400 group-hover:bg-[#1f1d18]'
+            }`}>
+              <GripVertical size={13} className="stroke-[2.5]" />
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Right Column: Trading Area */}
         <div className="flex-1 min-w-0 flex flex-col space-y-3 h-full min-h-0 overflow-hidden pl-0 lg:pl-1">
           {/* Order Module */}
           <section className="financial-card p-4 shrink-0">
-            <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
               <div className="flex items-center gap-3">
+                {/* 侧边栏折叠/展开快捷按钮 */}
+                <button
+                  type="button"
+                  id="btn-toggle-sidebar"
+                  onClick={toggleSidebarCollapse}
+                  className={`px-2.5 py-1 text-xs font-medium rounded-lg border transition-all flex items-center gap-1.5 shadow-sm cursor-pointer active:scale-95 ${
+                    isSidebarCollapsed 
+                      ? 'border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300' 
+                      : 'border-zinc-700/80 bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300'
+                  }`}
+                  title={isSidebarCollapsed ? "展开左侧面板 (账户资产/API配置/运行日志)" : "向左折叠隐藏左侧面板"}
+                >
+                  {isSidebarCollapsed ? <ChevronRight size={14} className="stroke-[2.5]" /> : <ChevronLeft size={14} className="stroke-[2.5]" />}
+                  <span>{isSidebarCollapsed ? "展开侧栏" : "折叠侧栏"}</span>
+                </button>
+
                 <div className="flex items-center gap-2">
                   <Activity size={18} className="text-blue-500" />
                   <h2 className="font-semibold">合约执行终端</h2>
@@ -5346,6 +5460,81 @@ export default function App() {
                   <span className="text-[10px] px-1 py-0.2 bg-amber-500/20 text-amber-300 rounded font-mono font-bold">f*</span>
                 </button>
               </div>
+
+              {/* 红框2区域：红框1中的4条数据（总资产、可用保证金、现货余额、合约余额）在同一行展示 */}
+              {isConnected && (
+                <div className="flex items-center flex-wrap gap-3 sm:gap-5 bg-[#141416] px-3.5 py-1.5 rounded-xl border border-[#232326] shadow-inner">
+                  {/* 1. 总资产 */}
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-zinc-400 font-medium">总资产</span>
+                    <div className="font-mono font-bold text-[15px] text-emerald-400 flex items-baseline gap-1">
+                      <span>{balance.balance.toFixed(2)}</span>
+                      <span className="text-[10px] text-zinc-500 font-normal">USDT</span>
+                    </div>
+                  </div>
+
+                  <div className="h-3.5 w-[1px] bg-[#2a2a2e]" />
+
+                  {/* 2. 可用保证金 */}
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-zinc-400 font-medium">可用保证金</span>
+                    <div className="font-mono font-bold text-[15px] text-blue-400 flex items-baseline gap-1">
+                      <span>{balance.available.toFixed(2)}</span>
+                      <span className="text-[10px] text-zinc-500 font-normal">USDT</span>
+                    </div>
+                  </div>
+
+                  <div className="h-3.5 w-[1px] bg-[#2a2a2e]" />
+
+                  {/* 3. 现货余额 */}
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-zinc-400 font-medium">现货余额</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-mono font-bold text-[15px] text-zinc-200">
+                        {(balance.spotBalance || 0).toFixed(2)}
+                      </span>
+                      <span className="text-[10px] text-zinc-500 font-normal">USDT</span>
+                      <button 
+                        type="button"
+                        onClick={() => {
+                          setTransferType('futures_to_spot');
+                          setTransferAmount('');
+                          setIsTransferModalOpen(true);
+                        }}
+                        className="flex items-center justify-center w-5 h-5 bg-gradient-to-r from-emerald-400 to-green-500 hover:from-emerald-300 hover:to-green-400 active:from-emerald-500 active:to-green-600 text-slate-900 border border-emerald-600 shadow-sm hover:scale-110 active:translate-y-[1px] transition-all duration-200 rounded-md cursor-pointer ml-0.5"
+                        title="点击划转 (从 合约 划转到 现货)"
+                      >
+                        <Plus size={12} className="stroke-[4.5]" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="h-3.5 w-[1px] bg-[#2a2a2e]" />
+
+                  {/* 4. 合约余额 */}
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-zinc-400 font-medium">合约余额</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-mono font-bold text-[15px] text-zinc-200">
+                        {(balance.futuresBalance || 0).toFixed(2)}
+                      </span>
+                      <span className="text-[10px] text-zinc-500 font-normal">USDT</span>
+                      <button 
+                        type="button"
+                        onClick={() => {
+                          setTransferType('spot_to_futures');
+                          setTransferAmount('');
+                          setIsTransferModalOpen(true);
+                        }}
+                        className="flex items-center justify-center w-5 h-5 bg-gradient-to-r from-emerald-400 to-green-500 hover:from-emerald-300 hover:to-green-400 active:from-emerald-500 active:to-green-600 text-slate-900 border border-emerald-600 shadow-sm hover:scale-110 active:translate-y-[1px] transition-all duration-200 rounded-md cursor-pointer ml-0.5"
+                        title="点击划转 (从 现货 划转到 合约)"
+                      >
+                        <Plus size={12} className="stroke-[4.5]" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
             
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -5673,6 +5862,7 @@ export default function App() {
                           const liveInfo = livePrices[pos.symbol] || livePrices[pos.symbol.toUpperCase()];
                           const currentPrice = (liveInfo?.lastPrice || liveInfo?.markPrice) || pos.markPrice || pos.entryPrice;
                           const isLong = pos.side === 'BUY';
+                          const settlementCycle = pos.settlementCycle || fundingCycleMap[pos.symbol] || (liveInfo as any)?.settlementCycle || ((liveInfo as any)?.fundingIntervalHours ? `${(liveInfo as any).fundingIntervalHours}h` : '8h');
 
                           // 依据实时行情计算未实现盈亏与收益率 (ROE%)
                           const livePnl = currentPrice > 0 
@@ -5699,10 +5889,18 @@ export default function App() {
                             >
                               <td className="px-5 py-2 text-center">
                                 <div className="font-bold text-[16.5px] text-[#ff8a65] tracking-wide">{pos.symbol}</div>
-                                <div className={`text-[9px] font-bold px-1 py-0.2 rounded inline-block mt-0.5 ${
-                                  pos.side === 'BUY' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'
-                                }`}>
-                                  {pos.side === 'BUY' ? '多单 (LONG)' : '空单 (SHORT)'}
+                                <div className="flex items-center justify-center gap-1.5 mt-0.5">
+                                  <div className={`text-[9px] font-bold px-1 py-0.2 rounded inline-block ${
+                                    pos.side === 'BUY' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'
+                                  }`}>
+                                    {pos.side === 'BUY' ? '多单 (LONG)' : '空单 (SHORT)'}
+                                  </div>
+                                  <span 
+                                    className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 inline-flex items-center whitespace-nowrap shadow-xs"
+                                    title={`该币对资金费结算周期: 每 ${settlementCycle} 结算一次`}
+                                  >
+                                    周期 {settlementCycle}
+                                  </span>
                                 </div>
                               </td>
                               <td className="px-5 py-2 font-mono text-[16.5px] font-bold text-emerald-300 whitespace-nowrap text-center">
@@ -5744,14 +5942,20 @@ export default function App() {
                                   const isPositive = fee > 0;
                                   const isNegative = fee < 0;
                                   return (
-                                    <div 
-                                      className={`font-bold text-[16.5px] font-mono inline-flex items-center justify-center gap-1 ${
-                                        isPositive ? 'text-emerald-400' : isNegative ? 'text-red-400' : 'text-zinc-400'
-                                      }`}
-                                      title={`该仓位自开仓 (${formatDateTime(pos.openTime || pos.timestamp)}) 至今累计结算资金费\n正数: 获得资金费补贴 (+)\n负数: 支付资金费成本 (-)`}
-                                    >
-                                      <span>{formatFundingFee(fee)}</span>
-                                      <span className="text-[11px] font-normal text-zinc-500 select-none">USDT</span>
+                                    <div className="flex flex-col items-center justify-center">
+                                      <div 
+                                        className={`font-bold text-[16.5px] font-mono inline-flex items-center justify-center gap-1 ${
+                                          isPositive ? 'text-emerald-400' : isNegative ? 'text-red-400' : 'text-zinc-400'
+                                        }`}
+                                        title={`该仓位自开仓 (${formatDateTime(pos.openTime || pos.timestamp)}) 至今累计结算资金费\n结算周期: 每 ${settlementCycle} 结算一次\n正数: 获得资金费补贴 (+)\n负数: 支付资金费成本 (-)`}
+                                      >
+                                        <span>{formatFundingFee(fee)}</span>
+                                        <span className="text-[11px] font-normal text-zinc-500 select-none">USDT</span>
+                                      </div>
+                                      <div className="text-[10px] text-zinc-400 font-mono flex items-center justify-center gap-1 mt-0.5">
+                                        <span className="text-zinc-500">周期:</span>
+                                        <span className="text-amber-300 font-semibold px-1 py-0.2 bg-amber-500/10 rounded border border-amber-500/20">{settlementCycle}</span>
+                                      </div>
                                     </div>
                                   );
                                 })()}

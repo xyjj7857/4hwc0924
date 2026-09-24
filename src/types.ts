@@ -27,6 +27,8 @@ export interface Position {
   timestamp: number;
   openTime?: number;
   accumulatedFundingFee?: number;
+  fundingIntervalHours?: number;
+  settlementCycle?: string;
 }
 
 export interface PositionHistory {

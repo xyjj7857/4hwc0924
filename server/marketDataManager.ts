@@ -1197,25 +1197,42 @@ export class MarketDataManager {
    * 批量获取指定或全量币对的实时价格与标记价 (0 API 权重)
    */
   public getLivePrices(symbols?: string[]): Record<string, { lastPrice: number; markPrice: number; change24h: number }> {
-    const result: Record<string, { lastPrice: number; markPrice: number; change24h: number }> = {};
+    const result: Record<string, { lastPrice: number; markPrice: number; change24h: number; fundingIntervalHours?: number; settlementCycle?: string; fundingRate?: number }> = {};
     if (symbols && symbols.length > 0) {
       for (const rawSym of symbols) {
         const sym = rawSym.trim().toUpperCase();
         const record = this.symbolsMap.get(sym);
+        const intervalHours = record?.fundingIntervalHours || this.fundingInfoMap.get(sym) || 8;
         if (record) {
           result[sym] = {
             lastPrice: record.lastPrice || record.markPrice || 0,
             markPrice: record.markPrice || record.lastPrice || 0,
-            change24h: record.priceChangePercent24h || 0
+            change24h: record.priceChangePercent24h || 0,
+            fundingIntervalHours: intervalHours,
+            settlementCycle: `${intervalHours}h`,
+            fundingRate: (record.fundingRate || 0) * 100
+          };
+        } else if (this.fundingInfoMap.has(sym)) {
+          result[sym] = {
+            lastPrice: 0,
+            markPrice: 0,
+            change24h: 0,
+            fundingIntervalHours: intervalHours,
+            settlementCycle: `${intervalHours}h`,
+            fundingRate: 0
           };
         }
       }
     } else {
       for (const [sym, record] of this.symbolsMap.entries()) {
+        const intervalHours = record.fundingIntervalHours || this.fundingInfoMap.get(sym) || 8;
         result[sym] = {
           lastPrice: record.lastPrice || record.markPrice || 0,
           markPrice: record.markPrice || record.lastPrice || 0,
-          change24h: record.priceChangePercent24h || 0
+          change24h: record.priceChangePercent24h || 0,
+          fundingIntervalHours: intervalHours,
+          settlementCycle: `${intervalHours}h`,
+          fundingRate: (record.fundingRate || 0) * 100
         };
       }
     }

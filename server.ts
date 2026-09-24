@@ -2344,6 +2344,39 @@ async function startServer() {
     }
   });
 
+  // 获取币对资金费率结算周期信息 (0 接口权重消耗，从本地内存快速获取)
+  app.get("/api/market/funding-info", (req, res) => {
+    try {
+      const symbolsQuery = req.query.symbols as string;
+      const symbols = symbolsQuery ? symbolsQuery.split(",").map(s => s.trim().toUpperCase()).filter(Boolean) : undefined;
+      const result: Record<string, { fundingIntervalHours: number; settlementCycle: string; fundingRate: number }> = {};
+      if (symbols && symbols.length > 0) {
+        for (const s of symbols) {
+          const info = marketDataManager.getSymbolFundingInfo(s);
+          result[s] = {
+            fundingIntervalHours: info.fundingIntervalHours,
+            settlementCycle: info.settlementCycle,
+            fundingRate: info.fundingRate
+          };
+        }
+      } else {
+        const fundingInfoMap = (marketDataManager as any).fundingInfoMap as Map<string, number>;
+        if (fundingInfoMap) {
+          for (const [s, interval] of fundingInfoMap.entries()) {
+            result[s] = {
+              fundingIntervalHours: interval,
+              settlementCycle: `${interval}h`,
+              fundingRate: 0
+            };
+          }
+        }
+      }
+      res.json({ success: true, data: result, timestamp: Date.now() });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // Get alert logs with optional filtering by date (YYYY-MM-DD) and boardName
   app.get("/api/alert-logs", (req, res) => {
     try {

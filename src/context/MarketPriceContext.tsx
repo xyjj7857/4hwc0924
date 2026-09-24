@@ -4,6 +4,9 @@ export interface LivePriceInfo {
   lastPrice: number;
   markPrice: number;
   change24h: number;
+  fundingIntervalHours?: number;
+  settlementCycle?: string;
+  fundingRate?: number;
 }
 
 export interface StreamAlertEvent {
