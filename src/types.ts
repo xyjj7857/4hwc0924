@@ -26,6 +26,7 @@ export interface Position {
   pnlPercent: number;
   timestamp: number;
   openTime?: number;
+  accumulatedFundingFee?: number;
 }
 
 export interface PositionHistory {

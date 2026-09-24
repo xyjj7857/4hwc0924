@@ -613,6 +613,19 @@ export default function App() {
   const [openOrders, setOpenOrders] = useState<OpenOrder[]>([]);
   const [isTrading, setIsTrading] = useState(false);
 
+  // 仓位开仓至今历史累计资金费映射表 (key: pos.id 或 pos.symbol, value: 累计资金费 USDT)
+  const [positionFundingFees, setPositionFundingFees] = useState<Record<string, number>>({});
+  const positionFundingFeesRef = useRef<Record<string, number>>({});
+  const fetchActiveFundingFeesRef = useRef<(currentPositions?: Position[]) => Promise<void>>(async () => {});
+
+  const formatFundingFee = useCallback((val: number | undefined) => {
+    if (val === undefined || isNaN(val) || val === 0) return '0.0000';
+    const abs = Math.abs(val);
+    const decimals = abs < 0.001 ? 6 : 4;
+    const sign = val > 0 ? '+' : '';
+    return `${sign}${val.toFixed(decimals)}`;
+  }, []);
+
   // 实时行情价格字典 (依据本地 WebSocket 流，0 接口权重消耗，高频毫秒级推流/刷新)
   const { livePrices: sseLivePrices } = useMarketPrices();
   const [livePrices, setLivePrices] = useState<Record<string, { lastPrice: number; markPrice: number; change24h: number }>>({});
@@ -1796,6 +1809,112 @@ export default function App() {
     }
   }, [isConnected, apiConfig.apiKey, apiConfig.apiSecret]);
 
+  // 获取当前所有持仓币对自开仓时间起历史累计收取的资金费 (支持多币对独立开仓时间与隔离计算)
+  const fetchActiveFundingFees = useCallback(async (currentPositions?: Position[]) => {
+    const posList = currentPositions || positionsRef.current;
+    if (!isConnectedRef.current || !apiConfigRef.current?.apiKey || !apiConfigRef.current?.apiSecret) {
+      return;
+    }
+    if (!posList || posList.length === 0) {
+      setPositionFundingFees({});
+      positionFundingFeesRef.current = {};
+      return;
+    }
+
+    try {
+      const validOpenTimes = posList
+        .map(p => p.openTime || p.timestamp)
+        .filter((t): t is number => typeof t === 'number' && t > 0);
+
+      if (validOpenTimes.length === 0) return;
+      const earliestTime = Math.min(...validOpenTimes);
+      // 留出 10 秒容差，防止纳秒/毫秒时钟偏差
+      const startTime = Math.max(earliestTime - 10000, 0);
+
+      const response = await fetch('/api/binance-proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          endpoint: '/fapi/v1/income',
+          apiKey: apiConfigRef.current.apiKey,
+          apiSecret: apiConfigRef.current.apiSecret,
+          params: {
+            incomeType: 'FUNDING_FEE',
+            startTime: startTime.toString(),
+            limit: '1000'
+          }
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (Array.isArray(data)) {
+          const feeMap: Record<string, number> = {};
+          posList.forEach(pos => {
+            const posStart = (pos.openTime || pos.timestamp || 0) - 5000;
+            const totalFee = data
+              .filter((item: any) =>
+                item.incomeType === 'FUNDING_FEE' &&
+                item.symbol === pos.symbol &&
+                Number(item.time) >= posStart
+              )
+              .reduce((sum: number, item: any) => sum + parseFloat(item.income || '0'), 0);
+
+            feeMap[pos.id] = parseFloat(totalFee.toFixed(6));
+            feeMap[pos.symbol] = parseFloat(totalFee.toFixed(6));
+          });
+
+          setPositionFundingFees(feeMap);
+          positionFundingFeesRef.current = feeMap;
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to fetch active positions funding fees:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchActiveFundingFeesRef.current = fetchActiveFundingFees;
+  }, [fetchActiveFundingFees]);
+
+  // 持仓单累计资金费定时校准：固定在每个整点 06 分 18 秒（HH:06:18）校准一次
+  useEffect(() => {
+    if (!isConnected) return;
+
+    let timerId: NodeJS.Timeout | null = null;
+
+    const scheduleNextCalibration = () => {
+      const now = new Date();
+      const currentSecondsInHour = now.getMinutes() * 60 + now.getSeconds();
+      const targetSecondsInHour = 6 * 60 + 18; // 378 秒，即整点 06分18秒
+
+      const next = new Date(now);
+      if (currentSecondsInHour < targetSecondsInHour) {
+        // 当前小时的 06 分 18 秒
+        next.setMinutes(6, 18, 0);
+      } else {
+        // 下一小时的 06 分 18 秒
+        next.setHours(next.getHours() + 1);
+        next.setMinutes(6, 18, 0);
+      }
+      const msUntilNext = Math.max(next.getTime() - now.getTime(), 1000);
+
+      timerId = setTimeout(() => {
+        if (positionsRef.current.length > 0) {
+          addLog('[资金费定时校准] 到达整点 06 分 18 秒，正在校准所有持仓单历史累计资金费...', 'INFO');
+          fetchActiveFundingFees(positionsRef.current);
+        }
+        scheduleNextCalibration();
+      }, msUntilNext);
+    };
+
+    scheduleNextCalibration();
+
+    return () => {
+      if (timerId) clearTimeout(timerId);
+    };
+  }, [isConnected, fetchActiveFundingFees]);
+
   // Periodic Balance Refresh (Fallback calibration, real-time balance is pushed via WebSocket ACCOUNT_UPDATE)
   useEffect(() => {
     if (!isConnected) return;
@@ -2004,6 +2123,7 @@ export default function App() {
             setPositions(mappedPositions);
             positionsRef.current = mappedPositions;
             checkPositionsRiskRef.current?.();
+            fetchActiveFundingFeesRef.current?.(mappedPositions);
 
             // Check if any position got closed
             if (previousActiveAccountRef.current !== currentAccount) {
@@ -2149,6 +2269,13 @@ export default function App() {
         }, 800);
       }
 
+      // 2.1.2 资金费结算事件主动联动：当监听到整点资金费扣除/派发时，立即触发各持仓累计资金费刷新与余额同步
+      if (reason === 'FUNDING_FEE') {
+        addLog(`[WS私有流推流⚡] 检测到账户资金费结算事件 (FUNDING_FEE)，已同步刷新持仓累计资金费与账户最新账本`, 'INFO');
+        fetchActiveFundingFeesRef.current?.(positionsRef.current);
+        handleFetchBalance();
+      }
+
       // 2.2 Update position deltas
       if (accountData.P && Array.isArray(accountData.P)) {
         let hasChanges = false;
@@ -2240,6 +2367,7 @@ export default function App() {
           positionsRef.current = currentList;
           previousActivePositionsRef.current = currentList;
           checkPositionsRiskRef.current?.();
+          fetchActiveFundingFeesRef.current?.(currentList);
         }
       }
     };
@@ -5527,6 +5655,7 @@ export default function App() {
                       <th className="px-5 py-2 font-medium text-center">开仓 / 标记</th>
                       <th className="px-5 py-2 font-medium text-center">持仓量 / 市值</th>
                       <th className="px-5 py-2 font-medium text-center">未实现盈亏 (ROE%)</th>
+                      <th className="px-5 py-2 font-medium text-center">累计资金费</th>
                       <th className="px-5 py-2 font-medium text-center">风控</th>
                       <th className="px-5 py-2 font-medium text-center">操作</th>
                     </tr>
@@ -5535,7 +5664,7 @@ export default function App() {
                     <AnimatePresence initial={false}>
                       {sortedPositions.length === 0 ? (
                         <tr>
-                          <td colSpan={7} className="px-5 py-6 text-center text-zinc-600 italic text-xs">
+                          <td colSpan={8} className="px-5 py-6 text-center text-zinc-600 italic text-xs">
                             暂无合约持仓。
                           </td>
                         </tr>
@@ -5608,6 +5737,24 @@ export default function App() {
                                     ({livePnlPercent >= 0 ? '+' : ''}{livePnlPercent.toFixed(2)}%)
                                   </span>
                                 </div>
+                              </td>
+                              <td className="px-5 py-2 text-center whitespace-nowrap">
+                                {(() => {
+                                  const fee = positionFundingFees[pos.id] ?? positionFundingFees[pos.symbol] ?? 0;
+                                  const isPositive = fee > 0;
+                                  const isNegative = fee < 0;
+                                  return (
+                                    <div 
+                                      className={`font-bold text-[16.5px] font-mono inline-flex items-center justify-center gap-1 ${
+                                        isPositive ? 'text-emerald-400' : isNegative ? 'text-red-400' : 'text-zinc-400'
+                                      }`}
+                                      title={`该仓位自开仓 (${formatDateTime(pos.openTime || pos.timestamp)}) 至今累计结算资金费\n正数: 获得资金费补贴 (+)\n负数: 支付资金费成本 (-)`}
+                                    >
+                                      <span>{formatFundingFee(fee)}</span>
+                                      <span className="text-[11px] font-normal text-zinc-500 select-none">USDT</span>
+                                    </div>
+                                  );
+                                })()}
                               </td>
                               <td className="px-5 py-2 text-center">
                                 <div className="flex items-center justify-center">
