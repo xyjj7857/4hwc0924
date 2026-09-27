@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
   Play, 
   Square, 
@@ -16,13 +16,21 @@ import {
   Upload,
   Pause,
   ChevronRight,
+  ChevronLeft,
+  ChevronDown,
+  ChevronUp,
   RefreshCw,
   Activity,
   Zap,
   HelpCircle,
   ClipboardList,
   Trash2,
-  Music
+  Music,
+  ArrowUpDown,
+  Info,
+  Lock,
+  ListOrdered,
+  BarChart2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TradeLog, Position } from '../types';
@@ -42,6 +50,8 @@ interface Config {
   amplitudeThreshold: number;
   enableAlertTimeout: boolean;
   alertTimeoutSeconds: number;
+  volumeKCount?: number;
+  gainKCount?: number;
   // Legacy compatibility fields
   xMin?: number;
   xSec?: number;
@@ -56,8 +66,13 @@ interface SymbolData {
   openPrice: number;
   lastPrice: number;
   change: number;
+  highChange?: number;
   change24h: number;
   amplitude?: number;
+  fundingRate?: number;
+  fundingIntervalHours?: number;
+  settlementCycle?: string;
+  nextFundingTime?: number;
   listingOpen?: number;
   listingTime?: number;
   historicalHigh?: number;
@@ -66,6 +81,22 @@ interface SymbolData {
   lowTime?: number;
   laterExtreme?: 'high' | 'low' | 'same';
   candlesCount?: number;
+  minVolumePastK?: number;
+  volumeRatioPastK?: number;
+  maxGainPastK_standard?: number;
+  maxGainPastK_high?: number;
+  past15mCandles?: Array<{
+    kIndex: number;
+    openTime: number;
+    closeTime: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    change: number;
+    highChange: number;
+  }>;
 }
 
 interface FundingRateData {
@@ -125,10 +156,21 @@ const TRANSLATIONS = {
   tableRate: "费率",
   tableCycle: "周期",
   table24hVol: "24h成交额（万）",
-  table15mVol: "成交额（万）",
+  table15mVol: "15m成交额（万）",
   tableGain: "涨幅",
   tableLoss: "跌幅",
+  tableHighGain: "高涨幅",
+  tableHighLoss: "高跌幅",
+  tableFundingCycle: "资金费率(周期)",
+  tablePrice: "推送当前价",
+  tableOpenPrice: "15m开盘价",
+  tableExtremes: "全历史高低",
+  gainModeStandard: "常规模式",
+  gainModeHigh: "高涨幅模式",
   tableAmplitude: "振幅",
+  volumeKCount: "量k 根数 (USDT最低成交额)",
+  gainKCount: "涨跌k 根数 (最大涨幅)",
+  tableVolumeRatio: "量比",
   loading: "加载中...",
   currentTime: "当前时间",
   symbolsUnit: "币种",
@@ -213,6 +255,317 @@ export default function MonitoringAssistant({
 
   const [isAlerting, setIsAlerting] = useState(false);
   const [activeAlert, setActiveAlert] = useState<'gain' | 'loss' | 'amp' | null>(null);
+
+  // --- 区域 1 折叠状态持久化控制 ---
+  const [isArea1Collapsed, setIsArea1Collapsed] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('area1_collapsed_15m');
+      return saved === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleArea1Collapse = useCallback(() => {
+    setIsArea1Collapsed(prev => {
+      const next = !prev;
+      try {
+        localStorage.setItem('area1_collapsed_15m', String(next));
+      } catch {}
+      return next;
+    });
+  }, []);
+
+  // --- 区域 2 各个榜单模块的独立向上折叠状态控制 ---
+  const [collapsedModules, setCollapsedModules] = useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem('area2_collapsed_modules_15m');
+      if (saved) {
+        return JSON.parse(saved);
+      }
+    } catch {}
+    return {};
+  });
+
+  const toggleModuleCollapse = useCallback((moduleId: string) => {
+    setCollapsedModules(prev => {
+      const next = { ...prev, [moduleId]: !prev[moduleId] };
+      try {
+        localStorage.setItem('area2_collapsed_modules_15m', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }, []);
+
+  const collapseAllModules = () => {
+    const all = {
+      gainers15m: true,
+      losers15m: true,
+      amplitude15m: true,
+      gainers24h: true,
+      losers24h: true,
+    };
+    setCollapsedModules(all);
+    try {
+      localStorage.setItem('area2_collapsed_modules_15m', JSON.stringify(all));
+    } catch {}
+  };
+
+  const expandAllModules = () => {
+    setCollapsedModules({});
+    try {
+      localStorage.removeItem('area2_collapsed_modules_15m');
+    } catch {}
+  };
+
+  // --- 自定义 量k 数量 (默认 12 条，取当前未完结 15m 前 N 根完整 K 线的最低交易额 USDT) ---
+  const [volumeKCount, setVolumeKCount] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('monitor_15m_volume_k_count');
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        if (!isNaN(parsed) && parsed >= 1 && parsed <= 30) return parsed;
+      }
+    } catch {}
+    return 12;
+  });
+
+  const handleUpdateVolumeKCount = useCallback(async (val: number) => {
+    const clamped = Math.max(1, Math.min(30, val));
+    setVolumeKCount(clamped);
+    try {
+      localStorage.setItem('monitor_15m_volume_k_count', String(clamped));
+    } catch {}
+    try {
+      await fetch('/api/monitoring/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ volumeKCount: clamped })
+      });
+    } catch (err) {
+      console.error('Failed to sync volumeKCount to server:', err);
+    }
+  }, []);
+
+  // --- 自定义 涨跌k 数量 (默认 6 条，取当前未完结 15m 前 M 根完结 K 线的最大涨幅) ---
+  const [gainKCount, setGainKCount] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('monitor_15m_gain_k_count');
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        if (!isNaN(parsed) && parsed >= 1 && parsed <= 30) return parsed;
+      }
+    } catch {}
+    return 6;
+  });
+
+  const handleUpdateGainKCount = useCallback(async (val: number) => {
+    const clamped = Math.max(1, Math.min(30, val));
+    setGainKCount(clamped);
+    try {
+      localStorage.setItem('monitor_15m_gain_k_count', String(clamped));
+    } catch {}
+    try {
+      await fetch('/api/monitoring/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gainKCount: clamped })
+      });
+    } catch (err) {
+      console.error('Failed to sync gainKCount to server:', err);
+    }
+  }, []);
+
+  // --- 涨跌幅计算模式：'standard' (常规模式：基准为15m开盘价) 或 'high' (高涨幅模式：基准为当前价) ---
+  const [gainMode, setGainMode] = useState<'standard' | 'high'>(() => {
+    try {
+      const saved = localStorage.getItem('monitor_15m_gain_mode');
+      if (saved === 'high' || saved === 'standard') return saved;
+    } catch {}
+    return 'standard';
+  });
+
+  const toggleGainMode = useCallback((mode: 'standard' | 'high') => {
+    setGainMode(mode);
+    try {
+      localStorage.setItem('monitor_15m_gain_mode', mode);
+    } catch {}
+  }, []);
+
+  // --- 排序方案状态：方案1、固定（默认，排序不发生变化） | 方案2、排序（随涨跌幅实时重排序） ---
+  const [sortScheme, setSortScheme] = useState<'fixed' | 'dynamic'>(() => {
+    try {
+      const saved = localStorage.getItem('monitor_15m_sort_scheme');
+      if (saved === 'dynamic' || saved === 'fixed') return saved;
+    } catch {}
+    return 'fixed';
+  });
+
+  const toggleSortScheme = useCallback((scheme: 'fixed' | 'dynamic') => {
+    setSortScheme(scheme);
+    try {
+      localStorage.setItem('monitor_15m_sort_scheme', scheme);
+    } catch {}
+  }, []);
+
+  // 价格通用格式化辅助函数
+  const formatPriceVal = useCallback((price?: number | null) => {
+    if (price === undefined || price === null || isNaN(price) || price === 0) return '--';
+    const abs = Math.abs(price);
+    if (abs >= 1000) {
+      return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    if (abs >= 1) return price.toFixed(4);
+    if (abs >= 0.01) return price.toFixed(5);
+    if (abs >= 0.0001) return price.toFixed(6);
+    return price.toFixed(8);
+  }, []);
+
+  // 格式化涨跌幅文本
+  const formatChangeText = useCallback((val?: number | null) => {
+    if (val === undefined || val === null || isNaN(val)) return '0.00%';
+    const prefix = val > 0 ? '+' : '';
+    return `${prefix}${val.toFixed(2)}%`;
+  }, []);
+
+  // 聚合当前币种的最新显示数据（实时推送当前价、15m开盘价、资金费率、结算周期、常规涨幅、高涨幅、量k、涨跌k）
+  const getSymbolDisplayData = useCallback((item: SymbolData) => {
+    const livePriceObj = livePrices[item.symbol];
+    const currentPrice = (livePriceObj && livePriceObj.lastPrice > 0) ? livePriceObj.lastPrice : (item.lastPrice || 0);
+    const openPrice = item.openPrice || 0;
+
+    // 常规涨跌幅: (当前价 - 15m开盘价) / 15m开盘价 * 100
+    let standardChange = item.change;
+    if (currentPrice > 0 && openPrice > 0) {
+      standardChange = ((currentPrice - openPrice) / openPrice) * 100;
+    }
+
+    // 高涨幅模式: (当前价 - 15m开盘价) / 当前价 * 100
+    let highGain = item.highChange !== undefined ? item.highChange : standardChange;
+    if (currentPrice > 0 && openPrice > 0) {
+      highGain = ((currentPrice - openPrice) / currentPrice) * 100;
+    }
+
+    const effectiveChange = gainMode === 'high' ? highGain : standardChange;
+
+    // 资金费率与结算周期
+    let fundingRate = item.fundingRate;
+    let settlementCycle = item.settlementCycle;
+    if (fundingRate === undefined || !settlementCycle) {
+      const found = fundingRates.find(f => f.symbol === item.symbol) || contextFundingRates?.find(f => f.symbol === item.symbol);
+      if (found) {
+        if (fundingRate === undefined) fundingRate = found.fundingRate;
+        if (!settlementCycle) settlementCycle = found.settlementCycle;
+      }
+    }
+
+    // 历史最高/最低价与后出标记
+    let historicalHigh = item.historicalHigh || 0;
+    let historicalLow = item.historicalLow || 0;
+    let highTime = item.highTime || 0;
+    let lowTime = item.lowTime || 0;
+    let laterExtreme = item.laterExtreme || 'same';
+
+    if (currentPrice > 0) {
+      if (historicalHigh === 0 || currentPrice > historicalHigh) {
+        historicalHigh = currentPrice;
+        highTime = Date.now();
+        laterExtreme = 'high';
+      }
+      if (historicalLow === 0 || currentPrice < historicalLow) {
+        historicalLow = currentPrice;
+        lowTime = Date.now();
+        laterExtreme = 'low';
+      }
+    }
+
+    // 动态计算 量k 指标（当前未完结 15m 成交额 / 前 volumeKCount 根完整K线最低成交额）
+    const current15mVolume = item.volume15m || 0;
+    let minVolumePastK = item.minVolumePastK || 0;
+    let volumeRatioPastK = item.volumeRatioPastK || 0;
+
+    if (item.past15mCandles && item.past15mCandles.length > 0) {
+      const volCandles = item.past15mCandles.slice(0, Math.max(1, volumeKCount));
+      const validVols = volCandles.map(c => c.volume).filter(v => v > 0);
+      if (validVols.length > 0) {
+        minVolumePastK = Math.min(...validVols);
+        volumeRatioPastK = minVolumePastK > 0 ? (current15mVolume / minVolumePastK) : 0;
+      }
+    } else if (minVolumePastK > 0) {
+      volumeRatioPastK = current15mVolume / minVolumePastK;
+    }
+
+    // 动态计算 涨跌k 指标（当前未完结 15m K线前的 gainKCount 根完结K线的最大涨幅）
+    let maxGainPastK = gainMode === 'high' ? (item.maxGainPastK_high ?? 0) : (item.maxGainPastK_standard ?? 0);
+    if (item.past15mCandles && item.past15mCandles.length > 0) {
+      const gainCandles = item.past15mCandles.slice(0, Math.max(1, gainKCount));
+      const validGains = gainCandles.map(c => gainMode === 'high' ? c.highChange : c.change);
+      if (validGains.length > 0) {
+        maxGainPastK = Math.max(...validGains);
+      }
+    }
+
+    return {
+      currentPrice,
+      openPrice,
+      standardChange,
+      highGain,
+      effectiveChange,
+      fundingRate: fundingRate !== undefined ? fundingRate : 0,
+      settlementCycle: settlementCycle || '8h',
+      listingOpen: item.listingOpen || 0,
+      listingTime: item.listingTime || 0,
+      historicalHigh,
+      historicalLow,
+      highTime,
+      lowTime,
+      laterExtreme,
+      candlesCount: item.candlesCount || 0,
+      currentVolume: current15mVolume,
+      minVolumePastK,
+      volumeRatioPastK,
+      maxGainPastK
+    };
+  }, [livePrices, gainMode, fundingRates, contextFundingRates, volumeKCount, gainKCount]);
+
+  // 依据当前模式与排序方案展示 15M 各榜单
+  const displayGainers = useMemo(() => {
+    if (!results?.gainers || results.gainers.length === 0) return [];
+    if (sortScheme === 'fixed') return results.gainers;
+    return [...results.gainers].sort((a, b) => {
+      const changeA = getSymbolDisplayData(a).effectiveChange;
+      const changeB = getSymbolDisplayData(b).effectiveChange;
+      return changeB - changeA;
+    });
+  }, [results?.gainers, sortScheme, getSymbolDisplayData]);
+
+  const displayLosers = useMemo(() => {
+    if (!results?.losers || results.losers.length === 0) return [];
+    if (sortScheme === 'fixed') return results.losers;
+    return [...results.losers].sort((a, b) => {
+      const changeA = getSymbolDisplayData(a).effectiveChange;
+      const changeB = getSymbolDisplayData(b).effectiveChange;
+      return changeA - changeB;
+    });
+  }, [results?.losers, sortScheme, getSymbolDisplayData]);
+
+  const displayAmplitude = useMemo(() => {
+    if (!results?.amplitude15m || results.amplitude15m.length === 0) return [];
+    if (sortScheme === 'fixed') return results.amplitude15m;
+    return [...results.amplitude15m].sort((a, b) => (b.amplitude || 0) - (a.amplitude || 0));
+  }, [results?.amplitude15m, sortScheme]);
+
+  const displayGainers24h = useMemo(() => {
+    if (!results?.gainers24h || results.gainers24h.length === 0) return [];
+    if (sortScheme === 'fixed') return results.gainers24h;
+    return [...results.gainers24h].sort((a, b) => b.change24h - a.change24h);
+  }, [results?.gainers24h, sortScheme]);
+
+  const displayLosers24h = useMemo(() => {
+    if (!results?.losers24h || results.losers24h.length === 0) return [];
+    if (sortScheme === 'fixed') return results.losers24h;
+    return [...results.losers24h].sort((a, b) => a.change24h - b.change24h);
+  }, [results?.losers24h, sortScheme]);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -457,7 +810,15 @@ export default function MonitoringAssistant({
   useEffect(() => {
     if (sse15m) {
       setIsRunning(Boolean(sse15m.isRunning));
-      if (sse15m.config) setConfig(sse15m.config);
+      if (sse15m.config) {
+        setConfig(sse15m.config);
+        if (sse15m.config.volumeKCount && !localStorage.getItem('monitor_15m_volume_k_count')) {
+          setVolumeKCount(sse15m.config.volumeKCount);
+        }
+        if (sse15m.config.gainKCount && !localStorage.getItem('monitor_15m_gain_k_count')) {
+          setGainKCount(sse15m.config.gainKCount);
+        }
+      }
       if (sse15m.scanStats) setScanStats(sse15m.scanStats);
       if (sse15m.results) setResults(sse15m.results);
       if (sse15m.fundingRates) setFundingRates(sse15m.fundingRates);
@@ -482,7 +843,15 @@ export default function MonitoringAssistant({
           if (!text || text.trim().startsWith('<')) return;
           const data = JSON.parse(text);
           setIsRunning(data.isRunning);
-          if (data.config) setConfig(data.config);
+          if (data.config) {
+            setConfig(data.config);
+            if (data.config.volumeKCount && !localStorage.getItem('monitor_15m_volume_k_count')) {
+              setVolumeKCount(data.config.volumeKCount);
+            }
+            if (data.config.gainKCount && !localStorage.getItem('monitor_15m_gain_k_count')) {
+              setGainKCount(data.config.gainKCount);
+            }
+          }
           setScanStats(data.scanStats);
           setResults(data.results);
           setFundingRates(data.fundingRates || []);
@@ -689,22 +1058,446 @@ export default function MonitoringAssistant({
     );
   };
 
+  const renderBoardCard = ({
+    moduleId,
+    title,
+    icon,
+    themeColor,
+    dataList,
+    valueType,
+    is24h = false,
+    helpManual
+  }: {
+    moduleId: 'gainers15m' | 'losers15m' | 'amplitude15m' | 'gainers24h' | 'losers24h';
+    title: string;
+    icon: React.ReactNode;
+    themeColor: 'emerald' | 'red' | 'amber';
+    dataList: SymbolData[];
+    valueType: 'gain' | 'loss' | 'amplitude' | 'change24h_gain' | 'change24h_loss';
+    is24h?: boolean;
+    helpManual: React.ReactNode;
+  }) => {
+    const isCollapsed = Boolean(collapsedModules[moduleId]);
+    const topItem = dataList && dataList.length > 0 ? dataList[0] : null;
+    const topData = topItem ? getSymbolDisplayData(topItem) : null;
+
+    let topPreviewVal = '--';
+    if (topData) {
+      if (valueType === 'gain') topPreviewVal = formatChangeText(topData.effectiveChange);
+      else if (valueType === 'loss') topPreviewVal = formatChangeText(topData.effectiveChange);
+      else if (valueType === 'amplitude') topPreviewVal = `${(topItem?.amplitude || 0).toFixed(2)}%`;
+      else if (valueType === 'change24h_gain') topPreviewVal = `+${(topItem?.change24h || 0).toFixed(2)}%`;
+      else if (valueType === 'change24h_loss') topPreviewVal = `${(topItem?.change24h || 0).toFixed(2)}%`;
+    }
+
+    const themeBorder = themeColor === 'red' ? 'border-red-500/30' : themeColor === 'amber' ? 'border-amber-500/30' : 'border-emerald-500/30';
+    const themeBgIcon = themeColor === 'red' ? 'bg-red-500/10 text-red-500 border-red-500/20' : themeColor === 'amber' ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20';
+    const themeTitleColor = themeColor === 'red' ? 'text-red-400' : themeColor === 'amber' ? 'text-amber-400' : 'text-emerald-400';
+
+    return (
+      <section className="bg-[#141416]/60 rounded-2xl border border-white/10 overflow-hidden shadow-xl transition-all">
+        {/* Module Header */}
+        <div 
+          onClick={() => toggleModuleCollapse(moduleId)}
+          className="px-4 py-3 bg-white/[0.03] hover:bg-white/[0.06] border-b border-white/5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className={`w-8 h-8 rounded-lg flex items-center justify-center border shadow-md shrink-0 ${themeBgIcon}`}>
+              {icon}
+            </div>
+            <h2 className={`text-base sm:text-lg font-bold tracking-tight font-sans ${themeTitleColor}`}>
+              {title}
+            </h2>
+
+            {/* Collapsed TOP 1 summary badge */}
+            {isCollapsed && topItem && (
+              <div className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/5 border border-white/10 text-xs font-mono">
+                <span className="text-zinc-400 font-bold">TOP1:</span>
+                <span className="text-white font-bold">{topItem.symbol.replace('USDT', '')}</span>
+                <span className={`font-bold ${themeTitleColor}`}>{topPreviewVal}</span>
+              </div>
+            )}
+
+            {/* Help Manual Button */}
+            <div className="relative group/help flex items-center" onClick={(e) => e.stopPropagation()}>
+              <button
+                type="button"
+                className="p-1 rounded-full text-zinc-400 hover:text-white hover:bg-white/10 transition-all cursor-help focus:outline-none flex items-center justify-center"
+                title={`${title}说明书`}
+              >
+                <HelpCircle className="w-4 h-4 text-zinc-300 stroke-[2.2]" />
+              </button>
+              {helpManual}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-xs text-gray-500 uppercase font-bold tracking-wider font-mono bg-white/5 px-2 py-0.5 rounded">
+              TOP 5
+            </span>
+            <button
+              type="button"
+              className="p-1 text-zinc-400 hover:text-white transition-colors"
+              title={isCollapsed ? "展开模块" : "向上折叠模块"}
+            >
+              {isCollapsed ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Module Content */}
+        {!isCollapsed && (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse min-w-[760px]">
+              <thead>
+                <tr className="bg-white/[0.02] text-[12px] text-gray-400 uppercase font-bold tracking-wider border-b border-white/5">
+                  <th className="px-4 py-3 text-left w-[18%]">{t.tableSymbol}</th>
+                  <th className="px-3 py-3 text-right w-[13%]">{t.tablePrice}</th>
+                  <th className="px-3 py-3 text-right w-[13%]">{is24h ? '24h开盘价' : t.tableOpenPrice}</th>
+                  <th className="px-3 py-3 text-right w-[16%]">
+                    <div className="flex items-center justify-end gap-1">
+                      <span>{t.tableExtremes}</span>
+                      <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-purple-500/20 text-purple-300">
+                        全历史
+                      </span>
+                    </div>
+                  </th>
+                  <th className="px-3 py-3 text-center w-[13%]">{t.tableFundingCycle}</th>
+                  <th className="px-3 py-3 text-right w-[13%]">
+                    <div className="flex items-center justify-end gap-1" title={is24h ? '24小时总成交额' : `当前未完结15m成交额 / 前${volumeKCount}根完整K线最低成交额比值`}>
+                      <span>{is24h ? '24h成交额' : t.table15mVol}</span>
+                      {!is24h && (
+                        <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-mono">
+                          量比(前{volumeKCount}K)
+                        </span>
+                      )}
+                    </div>
+                  </th>
+                  <th className="px-4 py-3 text-right w-[14%]">
+                    <div className="flex items-center justify-end gap-1 flex-wrap">
+                      <span>
+                        {valueType === 'amplitude'
+                          ? t.tableAmplitude
+                          : is24h
+                            ? (valueType === 'change24h_gain' ? '24h涨幅' : '24h跌幅')
+                            : (gainMode === 'high' ? t.tableHighGain : t.tableGain)}
+                      </span>
+                      {!is24h && (
+                        <>
+                          <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300" title={`前${gainKCount}根完结K线最大涨幅`}>
+                            前{gainKCount}K高
+                          </span>
+                          <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-white/10 text-zinc-300">
+                            {gainMode === 'high' ? '现价分母' : '开盘分母'}
+                          </span>
+                        </>
+                      )}
+                      <span className={`text-[10px] font-normal px-1 py-0.5 rounded ${sortScheme === 'fixed' ? 'bg-purple-500/20 text-purple-300' : 'bg-indigo-500/20 text-indigo-300'}`}>
+                        {sortScheme === 'fixed' ? '固定' : '实时排序'}
+                      </span>
+                    </div>
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                <AnimatePresence mode="popLayout">
+                  {dataList.map((item, idx) => {
+                    const isHolding = isHoldingPosition(item.symbol);
+                    const data = getSymbolDisplayData(item);
+                    
+                    let shouldHighlight = false;
+                    if (isAlerting) {
+                      if (valueType === 'gain' && data.effectiveChange >= config.gainThreshold) shouldHighlight = true;
+                      if (valueType === 'loss' && Math.abs(data.effectiveChange) >= config.lossThreshold) shouldHighlight = true;
+                      if (valueType === 'amplitude' && (item.amplitude || 0) >= config.amplitudeThreshold) shouldHighlight = true;
+                    }
+
+                    let mainValueText = '';
+                    let mainValueColor = 'text-emerald-400';
+                    if (valueType === 'gain') {
+                      mainValueText = formatChangeText(data.effectiveChange);
+                      mainValueColor = 'text-emerald-400';
+                    } else if (valueType === 'loss') {
+                      mainValueText = formatChangeText(data.effectiveChange);
+                      mainValueColor = 'text-red-400';
+                    } else if (valueType === 'amplitude') {
+                      mainValueText = `${(item.amplitude || 0).toFixed(2)}%`;
+                      mainValueColor = 'text-amber-400';
+                    } else if (valueType === 'change24h_gain') {
+                      mainValueText = `+${(item.change24h || 0).toFixed(2)}%`;
+                      mainValueColor = 'text-emerald-400';
+                    } else if (valueType === 'change24h_loss') {
+                      mainValueText = `${(item.change24h || 0).toFixed(2)}%`;
+                      mainValueColor = 'text-red-400';
+                    }
+
+                    return (
+                      <motion.tr 
+                        key={item.symbol} 
+                        initial={{ opacity: 0, x: -20 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        transition={{ delay: idx * 0.04 }}
+                        className={`transition-all group cursor-pointer border-l-4 ${
+                          shouldHighlight 
+                            ? 'bg-emerald-500/20 hover:bg-emerald-500/30 border-emerald-500 shadow-[inset_0_0_12px_rgba(16,185,129,0.3)] animate-pulse font-bold' 
+                            : 'hover:bg-white/5 border-transparent'
+                        }`}
+                        title="点击同步交易与复制合约"
+                        onClick={() => handleRowClick(item.symbol)}
+                      >
+                        {/* 1. 币种 */}
+                        <td className="px-4 py-3 text-left">
+                          <div className="flex items-center">
+                            <span className={`font-bold text-[18px] sm:text-[20px] ${
+                              isHolding 
+                                ? 'text-[#d946ef]' 
+                                : (shouldHighlight ? 'text-emerald-400' : 'text-zinc-200 group-hover:text-emerald-400')
+                            } transition-colors uppercase font-sans`}>
+                              {item.symbol.replace('USDT', '')}
+                            </span>
+                            {isHolding && (
+                              <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
+                                持仓中
+                              </span>
+                            )}
+                          </div>
+                        </td>
+
+                        {/* 2. 推送当前价 */}
+                        <td className="px-3 py-3 text-right font-mono text-[15px] sm:text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
+                          {formatPriceVal(data.currentPrice)}
+                        </td>
+
+                        {/* 3. 周期开盘价 */}
+                        <td className="px-3 py-3 text-right font-mono text-[14px] sm:text-[15px] font-medium text-zinc-400">
+                          {formatPriceVal(data.openPrice)}
+                        </td>
+
+                        {/* 4. 上线开盘 / 历史最高 / 历史最低 与 后出极值标记 */}
+                        <td className="px-3 py-2 text-right">
+                          <div className="flex flex-col items-end gap-0.5 font-mono text-[12px] sm:text-[13px] leading-tight">
+                            <div className="flex items-center gap-1.5 justify-end" title="币对上线首根K线开盘价">
+                              <span className="text-[10px] text-zinc-500 font-sans font-medium">上线开盘</span>
+                              <span className="font-semibold text-zinc-300">
+                                {data.listingOpen > 0 ? formatPriceVal(data.listingOpen) : '--'}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1.5 justify-end">
+                              <span className="text-[10px] text-zinc-500 font-sans font-medium">历史高</span>
+                              <span className={`font-semibold ${data.laterExtreme === 'high' ? 'text-emerald-400 font-bold' : 'text-zinc-300'}`}>
+                                {data.historicalHigh > 0 ? formatPriceVal(data.historicalHigh) : '--'}
+                              </span>
+                              {data.laterExtreme === 'high' ? (
+                                <span 
+                                  className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                  title="上线以来后创出历史最高价（多头结构）"
+                                >
+                                  后创高 ▲
+                                </span>
+                              ) : (
+                                <span className="w-1" />
+                              )}
+                            </div>
+                            <div className="flex items-center gap-1.5 justify-end">
+                              <span className="text-[10px] text-zinc-500 font-sans font-medium">历史低</span>
+                              <span className={`font-semibold ${data.laterExtreme === 'low' ? 'text-red-400 font-bold' : 'text-zinc-400'}`}>
+                                {data.historicalLow > 0 ? formatPriceVal(data.historicalLow) : '--'}
+                              </span>
+                              {data.laterExtreme === 'low' ? (
+                                <span 
+                                  className="text-[9px] font-sans font-bold px-1 py-0.2 rounded bg-red-500/20 text-red-300 border border-red-500/40 shrink-0 whitespace-nowrap shadow-sm"
+                                  title="上线以来后创出历史最低价（空头结构）"
+                                >
+                                  后创低 ▼
+                                </span>
+                              ) : (
+                                <span className="w-1" />
+                              )}
+                            </div>
+                          </div>
+                        </td>
+
+                        {/* 5. 资金费率 (周期) */}
+                        <td className="px-3 py-3 text-center">
+                          <div className="inline-flex items-center gap-1 font-mono text-[13px] sm:text-[14px]">
+                            <span className={`font-bold ${data.fundingRate > 0 ? 'text-amber-300' : data.fundingRate < 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                              {data.fundingRate > 0 ? '+' : ''}{data.fundingRate.toFixed(4)}%
+                            </span>
+                            <span className="text-zinc-500 text-xs font-normal">
+                              ({data.settlementCycle})
+                            </span>
+                          </div>
+                        </td>
+
+                        {/* 6. 成交额 & 量比 */}
+                        <td className={`px-3 py-3 text-right font-mono ${shouldHighlight ? 'text-emerald-300' : 'text-emerald-400'}`}>
+                          <div className="text-[14px] sm:text-[16px] font-bold leading-tight">
+                            {formatVolume(is24h ? (item.volume24h || 0) : data.currentVolume)}
+                          </div>
+                          {!is24h ? (
+                            <div 
+                              className="flex items-center justify-end gap-1 mt-1 text-[11px] font-mono cursor-help"
+                              title={`当前未完结15m成交额: ${formatVolume(data.currentVolume)} 万 USDT\n前${volumeKCount}根完结15m K线最低成交额: ${formatVolume(data.minVolumePastK)} 万 USDT\n比值 (当前/前${volumeKCount}K最低) = ${data.volumeRatioPastK > 0 ? data.volumeRatioPastK.toFixed(2) : '--'}倍`}
+                            >
+                              <span className="text-zinc-500 text-[10px]">量比:</span>
+                              <span className={`px-1.5 py-0.2 rounded text-[11px] font-bold transition-all ${
+                                data.volumeRatioPastK >= 2.0 
+                                  ? 'bg-amber-500/25 text-amber-300 border border-amber-500/40 shadow-sm' 
+                                  : data.volumeRatioPastK >= 1.0 
+                                    ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/40' 
+                                    : 'bg-white/5 text-zinc-400 border border-white/10'
+                              }`}>
+                                {data.volumeRatioPastK > 0 ? `${data.volumeRatioPastK.toFixed(2)}x` : '--'}
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="text-[10px] text-zinc-500 font-sans mt-0.5">24h累计</div>
+                          )}
+                        </td>
+
+                        {/* 7. 涨跌幅 / 振幅 & 前K最大涨幅 */}
+                        <td className="px-4 py-3 text-right">
+                          <div className="flex flex-col items-end">
+                            <div className={`flex items-center justify-end gap-1 ${mainValueColor} font-bold text-[18px] sm:text-[20px] font-mono leading-tight`}>
+                              {mainValueText}
+                              <ChevronRight className={`w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all ${mainValueColor}`} />
+                            </div>
+                            {!is24h ? (
+                              <div 
+                                className="flex items-center justify-end gap-1 mt-1 text-[11px] font-mono text-zinc-400 cursor-help"
+                                title={`当前未完结K线前的${gainKCount}根完结K线最大涨幅 (${gainMode === 'high' ? '高涨幅模式' : '常规模式'})`}
+                              >
+                                <span className="text-zinc-500 text-[10px]">前{gainKCount}K高:</span>
+                                <span className={`font-bold ${data.maxGainPastK > 0 ? 'text-emerald-300' : 'text-zinc-400'}`}>
+                                  {formatChangeText(data.maxGainPastK)}
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="text-[10px] text-zinc-500 font-sans mt-0.5">
+                                24h全天变化
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </motion.tr>
+                    );
+                  })}
+                </AnimatePresence>
+                {(!dataList || dataList.length === 0) && (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-12 text-center text-gray-600 italic text-[16px] font-medium">
+                      {t.waitingScan}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    );
+  };
+
   return (
     <div className="text-gray-100 font-sans selection:bg-red-500/30 min-h-[calc(100vh-170px)] flex flex-col gap-6">
       <audio ref={audioRef} />
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 mt-1 flex-1 items-stretch">
+      {/* Main Grid: Responsive 2-column or full width */}
+      <div className="flex flex-col lg:flex-row gap-6 items-start w-full">
         
-        {/* Left Column: Config & Audio OR Funding Rate Ranking */}
-        <div className="lg:col-span-4 flex flex-col space-y-5 h-full">
+        {/* ========================================================================= */}
+        {/* 区域 1：监控控制面板 (可向左折叠) */}
+        {/* ========================================================================= */}
+        {isArea1Collapsed ? (
+          <>
+            {/* 桌面端折叠窄条 (向右展开) */}
+            <div className="hidden lg:flex flex-col items-center w-14 shrink-0 bg-[#141416]/80 rounded-2xl border border-white/10 p-2.5 py-4 shadow-xl sticky top-4 transition-all group select-none">
+              <button
+                type="button"
+                onClick={() => setIsArea1Collapsed(false)}
+                className="w-9 h-9 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 hover:text-white flex items-center justify-center transition-all cursor-pointer shadow-md group hover:scale-105 active:scale-95"
+                title="向右展开控制面板与资金费率（区域1）"
+              >
+                <ChevronRight className="w-5 h-5 group-hover:translate-x-0.5 transition-transform" />
+              </button>
+
+              <div className="my-4 flex flex-col items-center gap-2">
+                <span 
+                  className={`w-2.5 h-2.5 rounded-full ${isRunning ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'}`} 
+                  title={isRunning ? "程序运行中" : "程序未启动"} 
+                />
+                <span 
+                  className={`w-2 h-2 rounded-full ${dataEngine?.markPriceActive ? 'bg-purple-400' : 'bg-amber-400'}`} 
+                  title="资金费率引擎状态" 
+                />
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setIsArea1Collapsed(false)}
+                className="flex-1 flex flex-col items-center justify-center py-6 cursor-pointer text-zinc-400 hover:text-emerald-300 transition-colors"
+                title="点击向右展开区域1"
+              >
+                <span className="[writing-mode:vertical-rl] text-xs tracking-widest font-bold uppercase select-none">
+                  区域 1 · 控制中心 & 资金费率
+                </span>
+              </button>
+            </div>
+
+            {/* 移动端折叠横条 */}
+            <div className="lg:hidden w-full bg-[#141416]/80 border border-white/10 rounded-xl p-3 flex items-center justify-between shadow-md">
+              <div className="flex items-center gap-2 text-xs font-bold text-zinc-300">
+                <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'}`} />
+                <span>区域1 · 控制中心与资金费率 (已向左收起)</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsArea1Collapsed(false)}
+                className="px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 text-xs font-bold flex items-center gap-1 cursor-pointer"
+              >
+                <span>展开</span>
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="w-full lg:w-[380px] xl:w-[410px] shrink-0 flex flex-col space-y-5 animate-in fade-in slide-in-from-left-2 duration-150">
+            {/* 区域1 头部控制栏：向左折叠按钮 */}
+            <div className="bg-[#141416]/90 px-4 py-2.5 rounded-xl border border-white/10 flex items-center justify-between text-xs shadow-md">
+              <span className="font-bold text-zinc-300 flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-500'}`} />
+                <span>区域 1 · 控制中心与资金费率</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsArea1Collapsed(true)}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-300 hover:text-white border border-white/10 transition-all cursor-pointer font-bold text-xs group active:scale-95"
+                title="向左折叠收起整个左侧区域"
+              >
+                <ChevronLeft className="w-3.5 h-3.5 text-emerald-400 group-hover:-translate-x-0.5 transition-transform" />
+                <span>向左折叠</span>
+              </button>
+            </div>
           
           {showSettings ? (
             <>
               {/* Config Card */}
               <section className="bg-white/5 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col min-h-[400px]">
-                <div className="px-5 py-4 border-b border-white/10 bg-white/5 flex items-center gap-2">
-                  <Settings className="w-4 h-4 text-gray-400" />
-                  <h2 className="font-bold text-sm uppercase tracking-wider">{t.parameterConfig}</h2>
+                <div className="px-5 py-4 border-b border-white/10 bg-white/5 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Settings className="w-4 h-4 text-gray-400" />
+                    <h2 className="font-bold text-sm uppercase tracking-wider">{t.parameterConfig}</h2>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsArea1Collapsed(true)}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-400 hover:text-white border border-white/10 text-xs transition-all cursor-pointer"
+                    title="向左折叠"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>向左折叠</span>
+                  </button>
                 </div>
                 <div className="p-5 space-y-6 flex-1 overflow-y-auto">
                   
@@ -750,6 +1543,34 @@ export default function MonitoringAssistant({
                           onChange={e => updateConfig({...config, n1: parseInt(e.target.value) || 0})}
                           className="w-full bg-black/40 border border-white/10 rounded-lg px-2 py-1.5 text-xs focus:border-emerald-500 outline-none font-mono"
                         />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-gray-400 block">{t.volumeKCount}</label>
+                        <div className="flex gap-1 items-center">
+                          <input 
+                            type="number" 
+                            min="1"
+                            max="30"
+                            value={volumeKCount} 
+                            onChange={e => handleUpdateVolumeKCount(parseInt(e.target.value) || 1)}
+                            className="w-full bg-black/40 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-center text-cyan-300 font-bold focus:border-cyan-500 outline-none font-mono"
+                          />
+                          <span className="text-[10px] text-zinc-500">根</span>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-gray-400 block">{t.gainKCount}</label>
+                        <div className="flex gap-1 items-center">
+                          <input 
+                            type="number" 
+                            min="1"
+                            max="30"
+                            value={gainKCount} 
+                            onChange={e => handleUpdateGainKCount(parseInt(e.target.value) || 1)}
+                            className="w-full bg-black/40 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-center text-emerald-300 font-bold focus:border-emerald-500 outline-none font-mono"
+                          />
+                          <span className="text-[10px] text-zinc-500">根</span>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1100,30 +1921,41 @@ export default function MonitoringAssistant({
                         <RefreshCw className={`w-3.5 h-3.5 text-zinc-400 group-hover:text-yellow-500 transition-all ${isFetchingFunding ? 'animate-spin text-yellow-500' : ''}`} />
                       </button>
                     </div>
-                    {fundingRates.length > 0 && (
-                      <div className="flex items-center gap-1.5 text-[18px] font-mono">
-                        <button
-                          onClick={() => setFundingPage(p => Math.max(1, p - 1))}
-                          disabled={safeFundingPage <= 1}
-                          className="px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-white/5 text-zinc-300 transition-colors cursor-pointer"
-                        >
-                          &lt;
-                        </button>
-                        <span className="text-zinc-400 text-[16.5px] font-bold">
-                          {safeFundingPage} / {totalFundingPages}
-                        </span>
-                        <button
-                          onClick={() => setFundingPage(p => Math.min(totalFundingPages, p + 1))}
-                          disabled={safeFundingPage >= totalFundingPages}
-                          className="px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-white/5 text-zinc-300 transition-colors cursor-pointer"
-                        >
-                          &gt;
-                        </button>
-                        <span className="text-[15px] text-zinc-500 font-bold ml-0.5">
-                          (Top {fundingRates.length})
-                        </span>
-                      </div>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {fundingRates.length > 0 && (
+                        <div className="flex items-center gap-1.5 text-[18px] font-mono">
+                          <button
+                            onClick={() => setFundingPage(p => Math.max(1, p - 1))}
+                            disabled={safeFundingPage <= 1}
+                            className="px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-white/5 text-zinc-300 transition-colors cursor-pointer"
+                          >
+                            &lt;
+                          </button>
+                          <span className="text-zinc-400 text-[16.5px] font-bold">
+                            {safeFundingPage} / {totalFundingPages}
+                          </span>
+                          <button
+                            onClick={() => setFundingPage(p => Math.min(totalFundingPages, p + 1))}
+                            disabled={safeFundingPage >= totalFundingPages}
+                            className="px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-white/5 text-zinc-300 transition-colors cursor-pointer"
+                          >
+                            &gt;
+                          </button>
+                          <span className="text-[15px] text-zinc-500 font-bold ml-0.5">
+                            (Top {fundingRates.length})
+                          </span>
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setIsArea1Collapsed(true)}
+                        className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-zinc-300 hover:text-white border border-white/10 text-xs font-sans font-medium transition-all cursor-pointer group ml-1"
+                        title="向左折叠收起整个区域1"
+                      >
+                        <ChevronLeft className="w-3.5 h-3.5 text-emerald-400 group-hover:-translate-x-0.5 transition-transform" />
+                        <span>向左折叠</span>
+                      </button>
+                    </div>
                   </div>
                   <div className="flex-1 overflow-y-auto scrollbar-hide">
                     <table className="w-full text-left border-collapse">
@@ -1305,10 +2137,209 @@ export default function MonitoringAssistant({
           </section>
 
         </div>
+        )}
 
-        {/* Right Column: Results */}
-        <div className="lg:col-span-8 flex flex-col space-y-6 h-full">
+        {/* ========================================================================= */}
+        {/* 区域 2：行情异动与榜单监控 (纵向排列，每个模块支持向上折叠) */}
+        {/* ========================================================================= */}
+        <div className="flex-1 min-w-0 w-full flex flex-col space-y-5">
           
+          {/* 区域2 顶部工具栏：模式切换 + 排序方案 + 量k + 涨跌k + 全部展开 / 全部折叠 */}
+          <div className="bg-[#141416]/90 px-4 py-2.5 rounded-xl border border-white/10 flex items-center justify-between flex-wrap gap-3 text-xs shadow-md">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              <span className="font-bold text-zinc-200 text-sm">区域 2 · 行情异动与榜单监控</span>
+              <span className="text-zinc-500 font-mono text-xs hidden sm:inline">(共 5 个榜单 · 纵向排列)</span>
+            </div>
+
+            <div className="flex items-center gap-3 flex-wrap">
+              {/* 折叠/展开控制区 按钮 */}
+              <button
+                type="button"
+                onClick={toggleArea1Collapse}
+                className="px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 active:scale-95 text-zinc-300 hover:text-white border border-white/10 transition-all font-medium text-xs cursor-pointer flex items-center gap-1.5"
+                title={isArea1Collapsed ? "向右展开左侧控制区" : "向左折叠隐藏左侧控制区以获得更宽广的看盘视野"}
+              >
+                {isArea1Collapsed ? <ChevronRight className="w-3.5 h-3.5 text-emerald-400" /> : <ChevronLeft className="w-3.5 h-3.5 text-emerald-400" />}
+                <span>{isArea1Collapsed ? '展开控制区' : '向左折叠'}</span>
+              </button>
+
+              {/* 涨幅计算模式切换 */}
+              <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/10 shadow-inner">
+                <span className="text-zinc-400 text-xs px-2 font-medium flex items-center gap-1">
+                  <ArrowUpDown className="w-3.5 h-3.5 text-emerald-400" />
+                  模式:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => toggleGainMode('standard')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    gainMode === 'standard'
+                      ? 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/40 shadow-sm'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="常规模式：以15m开盘价为分母 (当前价 - 15m开盘价) ÷ 15m开盘价 × 100%"
+                >
+                  常规模式
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggleGainMode('high')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    gainMode === 'high'
+                      ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/40 shadow-sm'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="高涨幅模式：以推送当前价为分母 (当前价 - 15m开盘价) ÷ 当前价 × 100%"
+                >
+                  高涨幅模式
+                </button>
+                {/* 模式说明悬浮提示 */}
+                <div className="relative group/mode-tip ml-1">
+                  <span className="cursor-help text-zinc-400 hover:text-zinc-200 p-0.5 inline-block">
+                    <Info className="w-3.5 h-3.5 text-zinc-400" />
+                  </span>
+                  <div className="absolute right-0 top-full mt-2 hidden group-hover/mode-tip:block z-50 w-72 p-3 rounded-xl bg-[#121316] border border-white/20 shadow-2xl text-[11px] text-zinc-300 pointer-events-none leading-relaxed">
+                    <p className="font-bold text-white mb-1.5 pb-1 border-b border-white/10">涨跌幅计算模式说明</p>
+                    <p className="mb-1"><strong className="text-emerald-400">常规模式：</strong>(当前价 - 15m开盘价) ÷ 15m开盘价 × 100%（传统交易所行情基准）</p>
+                    <p><strong className="text-cyan-400">高涨幅模式：</strong>(当前价 - 15m开盘价) ÷ 当前价 × 100%（以推送现价为基准）</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 排序方案切换：方案1、固定（默认） | 方案2、排序 */}
+              <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/10 shadow-inner">
+                <span className="text-zinc-400 text-xs px-2 font-medium flex items-center gap-1">
+                  <ListOrdered className="w-3.5 h-3.5 text-emerald-400" />
+                  排序方案:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => toggleSortScheme('fixed')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                    sortScheme === 'fixed'
+                      ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 shadow-sm'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="方案1·固定：排序不发生变化，保持入榜固定排位，仅数值实时更新（默认方案）"
+                >
+                  <Lock className="w-3 h-3 text-emerald-300" />
+                  <span>方案1·固定</span>
+                  <span className="text-[10px] text-emerald-300/80 font-normal">(默认)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggleSortScheme('dynamic')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                    sortScheme === 'dynamic'
+                      ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 shadow-sm'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="方案2·排序：随涨跌幅或高涨跌幅变化，实时重新对榜单排位进行排序"
+                >
+                  <ArrowUpDown className="w-3 h-3 text-emerald-300" />
+                  <span>方案2·排序</span>
+                </button>
+                {/* 排序说明悬浮提示 */}
+                <div className="relative group/sort-tip ml-1">
+                  <span className="cursor-help text-zinc-400 hover:text-zinc-200 p-0.5 inline-block">
+                    <Info className="w-3.5 h-3.5 text-zinc-400" />
+                  </span>
+                  <div className="absolute right-0 top-full mt-2 hidden group-hover/sort-tip:block z-50 w-72 p-3 rounded-xl bg-[#121316] border border-white/20 shadow-2xl text-[11px] text-zinc-300 pointer-events-none leading-relaxed">
+                    <p className="font-bold text-white mb-1.5 pb-1 border-b border-white/10">榜单排序方案说明</p>
+                    <p className="mb-1"><strong className="text-emerald-300">方案1·固定（默认）：</strong>涨跌幅或高涨跌幅数值发生变动时，行排位固定不跳动，保持上轮结算顺序。</p>
+                    <p><strong className="text-emerald-300">方案2·排序：</strong>涨跌幅或高涨跌幅数值发生变动时，实时动态重新排序排位。</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 量k 自定义根数控制 */}
+              <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/10 shadow-inner">
+                <span className="text-zinc-400 text-xs px-2 font-medium flex items-center gap-1" title="自定义量k数量：取当前未完结15M K线前的N根完整K线最低交易额(USDT)计算成交额比值">
+                  <BarChart2 className="w-3.5 h-3.5 text-cyan-400" />
+                  量k:
+                </span>
+                <div className="flex items-center gap-1 pr-1">
+                  <input
+                    type="number"
+                    min="1"
+                    max="30"
+                    value={volumeKCount}
+                    onChange={e => handleUpdateVolumeKCount(parseInt(e.target.value) || 1)}
+                    className="w-12 bg-black/60 border border-white/10 rounded px-1.5 py-0.5 text-xs text-center font-mono text-cyan-300 font-bold focus:border-cyan-500 outline-none"
+                  />
+                  <span className="text-[11px] text-zinc-500">根</span>
+                </div>
+                {/* 量k 悬浮说明 */}
+                <div className="relative group/volk-tip">
+                  <span className="cursor-help text-zinc-400 hover:text-zinc-200 p-0.5 inline-block">
+                    <Info className="w-3 h-3 text-cyan-400/80" />
+                  </span>
+                  <div className="absolute right-0 top-full mt-2 hidden group-hover/volk-tip:block z-50 w-72 p-3 rounded-xl bg-[#121316] border border-white/20 shadow-2xl text-[11px] text-zinc-300 pointer-events-none leading-relaxed">
+                    <p className="font-bold text-white mb-1.5 pb-1 border-b border-white/10 flex items-center gap-1 text-cyan-300">
+                      <BarChart2 className="w-3.5 h-3.5" />
+                      量k 说明 (默认12条完整15M K线)
+                    </p>
+                    <p className="mb-1 text-zinc-300">• 取当前未完结 15m K 线之前的 <strong className="text-cyan-300">{volumeKCount} 根</strong>完整 15m K 线的最低交易额 (USDT计价)。</p>
+                    <p className="text-zinc-300">• 在 15m 成交额单元格实时展示：<span className="text-cyan-300 font-mono font-bold">当前未完结成交额 ÷ 前{volumeKCount}根最低成交额</span> 的比值。</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 涨跌k 自定义根数控制 */}
+              <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/10 shadow-inner">
+                <span className="text-zinc-400 text-xs px-2 font-medium flex items-center gap-1" title="自定义涨跌k数量：取当前未完结15M K线前的N根完结K线按当前模式计算的最大涨幅">
+                  <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+                  涨跌k:
+                </span>
+                <div className="flex items-center gap-1 pr-1">
+                  <input
+                    type="number"
+                    min="1"
+                    max="30"
+                    value={gainKCount}
+                    onChange={e => handleUpdateGainKCount(parseInt(e.target.value) || 1)}
+                    className="w-12 bg-black/60 border border-white/10 rounded px-1.5 py-0.5 text-xs text-center font-mono text-emerald-300 font-bold focus:border-emerald-500 outline-none"
+                  />
+                  <span className="text-[11px] text-zinc-500">根</span>
+                </div>
+                {/* 涨跌k 悬浮说明 */}
+                <div className="relative group/gaink-tip">
+                  <span className="cursor-help text-zinc-400 hover:text-zinc-200 p-0.5 inline-block">
+                    <Info className="w-3 h-3 text-emerald-400/80" />
+                  </span>
+                  <div className="absolute right-0 top-full mt-2 hidden group-hover/gaink-tip:block z-50 w-72 p-3 rounded-xl bg-[#121316] border border-white/20 shadow-2xl text-[11px] text-zinc-300 pointer-events-none leading-relaxed">
+                    <p className="font-bold text-white mb-1.5 pb-1 border-b border-white/10 flex items-center gap-1 text-emerald-300">
+                      <TrendingUp className="w-3.5 h-3.5" />
+                      涨跌k 说明 (默认6条完结15M K线)
+                    </p>
+                    <p className="mb-1 text-zinc-300">• 取当前未完结 15m K 线之前的 <strong className="text-emerald-300">{gainKCount} 根</strong>完结 15m K 线的最大涨幅。</p>
+                    <p className="text-zinc-300">• 计算参照当前选取的模式（<strong className="text-emerald-300">常规模式</strong>或<strong className="text-cyan-300">高涨幅模式</strong>）实时计算并在涨跌幅处展示。</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={expandAllModules}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 active:scale-95 text-zinc-300 hover:text-white border border-white/10 transition-all font-medium text-xs cursor-pointer"
+                  title="一键展开全部榜单模块"
+                >
+                  全部展开
+                </button>
+                <button
+                  type="button"
+                  onClick={collapseAllModules}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 active:scale-95 text-zinc-300 hover:text-white border border-white/10 transition-all font-medium text-xs cursor-pointer"
+                  title="一键向上折叠全部榜单模块"
+                >
+                  全部折叠
+                </button>
+              </div>
+            </div>
+          </div>
+
           {/* Alert Banner */}
           <AnimatePresence>
             {isAlerting && (
@@ -1347,459 +2378,275 @@ export default function MonitoringAssistant({
             )}
           </AnimatePresence>
 
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-[320px]">
-            
-            {/* Gainers List */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center border border-emerald-500/20 shadow-md">
-                    <TrendingUp className="w-5 h-5 text-emerald-500 animate-pulse" />
+          {/* 1. 15分钟涨幅榜 */}
+          {renderBoardCard({
+            moduleId: 'gainers15m',
+            title: t.gainer15m,
+            icon: <TrendingUp className="w-5 h-5 text-emerald-500 animate-pulse" />,
+            themeColor: 'emerald',
+            dataList: displayGainers,
+            valueType: 'gain',
+            helpManual: (
+              <div className="absolute left-0 top-full mt-2 hidden group-hover/help:block z-50 w-80 sm:w-96 p-4 rounded-2xl bg-[#121316]/98 border border-emerald-500/40 shadow-[0_12px_32px_rgba(0,0,0,0.85),0_0_20px_rgba(16,185,129,0.25)] backdrop-blur-xl text-left pointer-events-none transition-all">
+                <div className="flex items-center gap-2 pb-2.5 mb-2.5 border-b border-white/10">
+                  <div className="w-6 h-6 rounded-md bg-emerald-500/20 flex items-center justify-center border border-emerald-500/40">
+                    <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
                   </div>
-                  <h2 className="text-[24px] font-bold text-emerald-500 tracking-tight">{t.gainer15m}</h2>
-
-                  {/* 15分钟涨幅榜说明书 */}
-                  <div className="relative group/gain15-help flex items-center">
-                    <button
-                      type="button"
-                      className="p-1 rounded-full text-white hover:text-emerald-300 hover:bg-white/10 transition-all cursor-help focus:outline-none flex items-center justify-center"
-                      title="15分钟涨幅榜说明书"
-                      aria-label="15分钟涨幅榜说明书"
-                    >
-                      <HelpCircle className="w-5 h-5 text-white stroke-[2.3] drop-shadow-[0_0_8px_rgba(255,255,255,0.5)]" />
-                    </button>
-
-                    <div className="absolute left-0 top-full mt-2 hidden group-hover/gain15-help:block z-50 w-80 sm:w-96 p-4 rounded-2xl bg-[#121316]/98 border border-emerald-500/40 shadow-[0_12px_32px_rgba(0,0,0,0.85),0_0_20px_rgba(16,185,129,0.25)] backdrop-blur-xl text-left pointer-events-none transition-all">
-                      <div className="flex items-center gap-2 pb-2.5 mb-2.5 border-b border-white/10">
-                        <div className="w-6 h-6 rounded-md bg-emerald-500/20 flex items-center justify-center border border-emerald-500/40">
-                          <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
-                        </div>
-                        <span className="font-bold text-sm text-emerald-300 tracking-wide">15分钟涨幅榜 · 说明书</span>
-                      </div>
-                      
-                      <div className="space-y-2.5 text-xs text-zinc-300 leading-relaxed">
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
-                            1. 刷新周期与刷新时刻
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-zinc-200 font-medium">基准周期：</span>以 15 分钟为一个完整周期（00, 15, 30, 45 分）。</p>
-                            <p>• <span className="text-zinc-200 font-medium">周期结算：</span>在每根 15m K 线的第 <span className="text-emerald-300 font-semibold">{config.yMin ?? 14}分{String(config.ySec ?? 30).padStart(2, '0')}秒</span> 实时结算并更新榜单。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
-                            2. 筛选门槛与计算公式
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT 且 15m成交额 ≥ {formatVolume(config.n1)} USDT。</p>
-                            <p>• <span className="text-zinc-200 font-medium">计算公式：</span><span className="text-emerald-300 font-mono font-bold">(当前最新价 - 15m开盘价) ÷ 15m开盘价 × 100%</span>。</p>
-                            <p>• <span className="text-zinc-200 font-medium">榜单排序：</span>按 15 分钟涨幅从大到小降序排列，展示 TOP 5 标的。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
-                            3. 异动标签与警报机制
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-emerald-400 font-medium">涨幅警报：</span>当 15m 涨幅 ≥ {config.gainThreshold}% 时，触发涨幅警报与语音播报。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
-                            4. 快速交易与持仓识别
-                          </div>
-                          <p className="text-zinc-400 pl-3">
-                            若榜单中的币对在当前持仓中，自动显示紫色 <span className="text-[#d946ef] font-bold">[持仓中]</span> 标签并将币名标为亮紫色；点击任意行可快速联动切换至交易看板。
-                          </p>
-                        </div>
-                      </div>
+                  <span className="font-bold text-sm text-emerald-300 tracking-wide">15分钟涨幅榜 · 说明书</span>
+                </div>
+                <div className="space-y-2.5 text-xs text-zinc-300 leading-relaxed">
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+                      1. 刷新周期与时刻
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">基准周期：</span>以 15 分钟为一个完整周期（00, 15, 30, 45 分）。</p>
+                      <p>• <span className="text-zinc-200 font-medium">周期结算：</span>在每根 15m K 线的第 <span className="text-emerald-300 font-semibold">{config.yMin ?? 14}分{String(config.ySec ?? 30).padStart(2, '0')}秒</span> 实时结算并更新榜单。</p>
                     </div>
                   </div>
-                </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
-              </div>
-              
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
-                    <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.table15mVol}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.tableGain}</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-white/5">
-                      <AnimatePresence mode="popLayout">
-                        {results?.gainers.map((item, idx) => {
-                          const isHolding = isHoldingPosition(item.symbol);
-                          const shouldHighlight = isAlerting && item.change >= config.gainThreshold;
-                          return (
-                            <motion.tr 
-                              key={item.symbol}
-                              initial={{ opacity: 0, x: -20 }}
-                              animate={{ opacity: 1, x: 0 }}
-                              exit={{ opacity: 0, scale: 0.95 }}
-                              transition={{ delay: idx * 0.05 }}
-                              className={`transition-all group cursor-pointer border-l-4 ${
-                                shouldHighlight 
-                                  ? 'bg-emerald-500/20 hover:bg-emerald-500/30 border-emerald-500 shadow-[inset_0_0_12px_rgba(16,185,129,0.3)] animate-pulse font-bold' 
-                                  : 'hover:bg-white/5 border-transparent'
-                              }`}
-                              title="点击同步交易"
-                              onClick={() => handleRowClick(item.symbol)}
-                            >
-                              <td className="px-4 py-3 text-left">
-                                <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
-                                    isHolding 
-                                      ? 'text-[#d946ef]' 
-                                      : (shouldHighlight ? 'text-emerald-400' : 'text-zinc-200 group-hover:text-emerald-500')
-                                  } transition-colors uppercase`}>
-                                    {item.symbol.replace('USDT', '')}
-                                  </span>
-                                  {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
-                                      持仓中
-                                    </span>
-                                  )}
-                                </div>
-                              </td>
-                              <td className={`px-2 py-3 text-center font-mono text-[18px] font-bold ${shouldHighlight ? 'text-emerald-300' : 'text-emerald-500'}`}>
-                                {formatVolume(item.volume15m)}
-                              </td>
-                              <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-emerald-500 font-bold text-[21px] font-sans">
-                                  +{item.change.toFixed(2)}%
-                                  <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-emerald-500" />
-                                </div>
-                              </td>
-                            </motion.tr>
-                          );
-                        })}
-                      </AnimatePresence>
-                      {(!results || results.gainers.length === 0) && (
-                        <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
-                            {t.waitingScan}
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </section>
-
-            {/* Losers List */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-red-500/10 rounded-lg flex items-center justify-center border border-red-500/20 shadow-md">
-                    <TrendingDown className="w-5 h-5 text-red-500 animate-pulse" />
-                  </div>
-                  <h2 className="text-[24px] font-bold text-red-500 tracking-tight">{t.loser15m}</h2>
-
-                  {/* 15分钟跌幅榜说明书 */}
-                  <div className="relative group/loss15-help flex items-center">
-                    <button
-                      type="button"
-                      className="p-1 rounded-full text-white hover:text-red-300 hover:bg-white/10 transition-all cursor-help focus:outline-none flex items-center justify-center"
-                      title="15分钟跌幅榜说明书"
-                      aria-label="15分钟跌幅榜说明书"
-                    >
-                      <HelpCircle className="w-5 h-5 text-white stroke-[2.3] drop-shadow-[0_0_8px_rgba(255,255,255,0.5)]" />
-                    </button>
-
-                    <div className="absolute left-0 top-full mt-2 hidden group-hover/loss15-help:block z-50 w-80 sm:w-96 p-4 rounded-2xl bg-[#121316]/98 border border-red-500/40 shadow-[0_12px_32px_rgba(0,0,0,0.85),0_0_20px_rgba(239,68,68,0.25)] backdrop-blur-xl text-left pointer-events-none transition-all">
-                      <div className="flex items-center gap-2 pb-2.5 mb-2.5 border-b border-white/10">
-                        <div className="w-6 h-6 rounded-md bg-red-500/20 flex items-center justify-center border border-red-500/40">
-                          <TrendingDown className="w-3.5 h-3.5 text-red-400" />
-                        </div>
-                        <span className="font-bold text-sm text-red-300 tracking-wide">15分钟跌幅榜 · 说明书</span>
-                      </div>
-                      
-                      <div className="space-y-2.5 text-xs text-zinc-300 leading-relaxed">
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
-                            1. 刷新周期与刷新时刻
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-zinc-200 font-medium">基准周期：</span>以 15 分钟为一个完整周期（00, 15, 30, 45 分）。</p>
-                            <p>• <span className="text-zinc-200 font-medium">周期结算：</span>在每根 15m K 线的第 <span className="text-red-300 font-semibold">{config.yMin ?? 14}分{String(config.ySec ?? 30).padStart(2, '0')}秒</span> 实时结算并更新榜单。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
-                            2. 筛选门槛与计算公式
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT 且 15m成交额 ≥ {formatVolume(config.n1)} USDT。</p>
-                            <p>• <span className="text-zinc-200 font-medium">计算公式：</span><span className="text-red-300 font-mono font-bold">(当前最新价 - 15m开盘价) ÷ 15m开盘价 × 100%</span>。</p>
-                            <p>• <span className="text-zinc-200 font-medium">榜单排序：</span>按 15 分钟跌幅从大到小升序排列（跌幅最大排前），展示 TOP 5 标的。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
-                            3. 异动标签与警报机制
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-red-400 font-medium">跌幅警报：</span>当 15m 跌幅绝对值 ≥ {config.lossThreshold}% 时，触发跌幅警报与语音播报。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
-                            4. 快速交易与持仓识别
-                          </div>
-                          <p className="text-zinc-400 pl-3">
-                            若榜单中的币对在当前持仓中，自动显示紫色 <span className="text-[#d946ef] font-bold">[持仓中]</span> 标签并将币名标为亮紫色；点击任意行可快速联动切换至交易看板。
-                          </p>
-                        </div>
-                      </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+                      2. 筛选门槛与计算公式
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT 且 15m成交额 ≥ {formatVolume(config.n1)} USDT。</p>
+                      <p>• <span className="text-zinc-200 font-medium">常规模式：</span><span className="text-emerald-300 font-mono font-bold">(当前最新价 - 15m开盘价) ÷ 15m开盘价 × 100%</span>。</p>
+                      <p>• <span className="text-zinc-200 font-medium">高涨幅模式：</span><span className="text-cyan-300 font-mono font-bold">(当前最新价 - 15m开盘价) ÷ 当前最新价 × 100%</span>。</p>
                     </div>
                   </div>
-                </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
-              </div>
-              
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
-                    <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.table15mVol}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.tableLoss}</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-white/5">
-                      <AnimatePresence mode="popLayout">
-                        {results?.losers.map((item, idx) => {
-                          const isHolding = isHoldingPosition(item.symbol);
-                          const shouldHighlight = isAlerting && Math.abs(item.change) >= config.lossThreshold;
-                          return (
-                            <motion.tr 
-                              key={item.symbol} 
-                              initial={{ opacity: 0, x: -20 }}
-                              animate={{ opacity: 1, x: 0 }}
-                              exit={{ opacity: 0, scale: 0.95 }}
-                              transition={{ delay: idx * 0.05 }}
-                              className={`transition-all group cursor-pointer border-l-4 ${
-                                shouldHighlight 
-                                  ? 'bg-red-500/20 hover:bg-red-500/30 border-red-500 shadow-[inset_0_0_12px_rgba(239,68,68,0.3)] animate-pulse font-bold' 
-                                  : 'hover:bg-white/5 border-transparent'
-                              }`}
-                              title="点击同步交易"
-                              onClick={() => handleRowClick(item.symbol)}
-                            >
-                              <td className="px-4 py-3 text-left">
-                                <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
-                                    isHolding 
-                                      ? 'text-[#d946ef]' 
-                                      : (shouldHighlight ? 'text-red-400' : 'text-zinc-200 group-hover:text-red-500')
-                                  } transition-colors uppercase`}>
-                                    {item.symbol.replace('USDT', '')}
-                                  </span>
-                                  {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
-                                      持仓中
-                                    </span>
-                                  )}
-                                </div>
-                              </td>
-                              <td className={`px-2 py-3 text-center font-mono text-[18px] font-bold ${shouldHighlight ? 'text-red-300' : 'text-emerald-500'}`}>
-                                {formatVolume(item.volume15m)}
-                              </td>
-                              <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-red-500 font-bold text-[21px] font-sans">
-                                  {item.change.toFixed(2)}%
-                                  <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-red-500" />
-                                </div>
-                              </td>
-                            </motion.tr>
-                          );
-                        })}
-                      </AnimatePresence>
-                      {(!results || results.losers.length === 0) && (
-                        <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
-                            {t.waitingScan}
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </section>
-
-            {/* Amplitude List */}
-            <section className="space-y-4 flex flex-col h-full flex-1">
-              <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-amber-500/10 rounded-lg flex items-center justify-center border border-amber-500/20 shadow-md">
-                    <Activity className="w-5 h-5 text-amber-500 animate-pulse" />
-                  </div>
-                  <h2 className="text-[24px] font-bold text-amber-500 tracking-tight">{t.amplitude15m}</h2>
-
-                  {/* 15分钟振幅榜说明书 */}
-                  <div className="relative group/amp15-help flex items-center">
-                    <button
-                      type="button"
-                      className="p-1 rounded-full text-white hover:text-amber-300 hover:bg-white/10 transition-all cursor-help focus:outline-none flex items-center justify-center"
-                      title="15分钟振幅榜说明书"
-                      aria-label="15分钟振幅榜说明书"
-                    >
-                      <HelpCircle className="w-5 h-5 text-white stroke-[2.3] drop-shadow-[0_0_8px_rgba(255,255,255,0.5)]" />
-                    </button>
-
-                    <div className="absolute left-0 top-full mt-2 hidden group-hover/amp15-help:block z-50 w-80 sm:w-96 p-4 rounded-2xl bg-[#121316]/98 border border-amber-500/40 shadow-[0_12px_32px_rgba(0,0,0,0.85),0_0_20px_rgba(245,158,11,0.25)] backdrop-blur-xl text-left pointer-events-none transition-all">
-                      <div className="flex items-center gap-2 pb-2.5 mb-2.5 border-b border-white/10">
-                        <div className="w-6 h-6 rounded-md bg-amber-500/20 flex items-center justify-center border border-amber-500/40">
-                          <Activity className="w-3.5 h-3.5 text-amber-400" />
-                        </div>
-                        <span className="font-bold text-sm text-amber-300 tracking-wide">15分钟振幅榜 · 说明书</span>
-                      </div>
-                      
-                      <div className="space-y-2.5 text-xs text-zinc-300 leading-relaxed">
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
-                            1. 刷新周期与刷新时刻
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-zinc-200 font-medium">基准周期：</span>以 15 分钟为一个完整周期（00, 15, 30, 45 分）。</p>
-                            <p>• <span className="text-zinc-200 font-medium">周期结算：</span>在每根 15m K 线的第 <span className="text-amber-300 font-semibold">{config.yMin ?? 14}分{String(config.ySec ?? 30).padStart(2, '0')}秒</span> 实时结算并更新榜单。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
-                            2. 筛选门槛与计算公式
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT 且 15m成交额 ≥ {formatVolume(config.n1)} USDT。</p>
-                            <p>• <span className="text-zinc-200 font-medium">计算公式：</span><span className="text-amber-300 font-mono font-bold">(15m最高价 - 15m最低价) ÷ 15m开盘价 × 100%</span>。</p>
-                            <p>• <span className="text-zinc-200 font-medium">榜单排序：</span>按 15 分钟振幅从大到小降序排列，展示 TOP 5 标的。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
-                            3. 异动标签与警报机制
-                          </div>
-                          <div className="text-zinc-400 pl-3 space-y-1">
-                            <p>• <span className="text-amber-400 font-medium">振幅警报：</span>当 15m 振幅 ≥ {config.amplitudeThreshold}% 时，触发振幅警报与语音播报。</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
-                            4. 快速交易与持仓识别
-                          </div>
-                          <p className="text-zinc-400 pl-3">
-                            若榜单中的币对在当前持仓中，自动显示紫色 <span className="text-[#d946ef] font-bold">[持仓中]</span> 标签并将币名标为亮紫色；点击任意行可快速联动切换至交易看板。
-                          </p>
-                        </div>
-                      </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+                      3. 量k 与 涨跌k 动态指标
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">量k (默认12根)：</span>取当前未完结15m K线前 {volumeKCount} 根完整K线的最低成交额(USDT)，在成交额处展示「当前未完结成交额 ÷ 前{volumeKCount}根最低成交额」的比值。</p>
+                      <p>• <span className="text-zinc-200 font-medium">涨跌k (默认6根)：</span>取当前未完结15m K线前 {gainKCount} 根完结K线在当前模式下的最大涨幅并展示。</p>
                     </div>
                   </div>
-                </div>
-                <span className="text-[15px] text-gray-500 uppercase font-bold tracking-widest font-mono">Top 5</span>
-              </div>
-              
-              <div className="bg-[#141416]/40 rounded-2xl border border-white/10 overflow-hidden shadow-2xl flex-1 flex flex-col">
-                <div className="flex-1 overflow-auto">
-                  <table className="w-full text-left border-collapse">
-                    <thead>
-                      <tr className="bg-white/5 text-[15px] text-gray-500 uppercase font-bold tracking-wider">
-                        <th className="px-4 py-3 w-[33%] text-left">{t.tableSymbol}</th>
-                        <th className="px-2 py-3 w-[34%] text-center">{t.table15mVol}</th>
-                        <th className="px-4 py-3 w-[33%] text-right">{t.tableAmplitude}</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-white/5">
-                      <AnimatePresence mode="popLayout">
-                        {results?.amplitude15m?.map((item, idx) => {
-                          const isHolding = isHoldingPosition(item.symbol);
-                          const shouldHighlight = isAlerting && (item.amplitude || 0) >= config.amplitudeThreshold;
-                          return (
-                            <motion.tr 
-                              key={item.symbol} 
-                              initial={{ opacity: 0, x: -20 }}
-                              animate={{ opacity: 1, x: 0 }}
-                              exit={{ opacity: 0, scale: 0.95 }}
-                              transition={{ delay: idx * 0.05 }}
-                              className={`transition-all group cursor-pointer border-l-4 ${
-                                shouldHighlight 
-                                  ? 'bg-amber-500/20 hover:bg-amber-500/30 border-amber-500 shadow-[inset_0_0_12px_rgba(245,158,11,0.3)] animate-pulse font-bold' 
-                                  : 'hover:bg-white/5 border-transparent'
-                              }`}
-                              title="点击同步交易"
-                              onClick={() => handleRowClick(item.symbol)}
-                            >
-                              <td className="px-4 py-3 text-left">
-                                <div className="flex items-center">
-                                  <span className={`font-bold text-[21px] ${
-                                    isHolding 
-                                      ? 'text-[#d946ef]' 
-                                      : (shouldHighlight ? 'text-amber-400' : 'text-zinc-200 group-hover:text-amber-500')
-                                  } transition-colors uppercase`}>
-                                    {item.symbol.replace('USDT', '')}
-                                  </span>
-                                  {isHolding && (
-                                    <span className="ml-2 text-[11px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
-                                      持仓中
-                                    </span>
-                                  )}
-                                </div>
-                              </td>
-                              <td className={`px-2 py-3 text-center font-mono text-[18px] font-bold ${shouldHighlight ? 'text-amber-300' : 'text-emerald-500'}`}>
-                                {formatVolume(item.volume15m)}
-                              </td>
-                              <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-amber-500 font-bold text-[21px] font-sans">
-                                  {(item.amplitude || 0).toFixed(2)}%
-                                  <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-amber-500" />
-                                </div>
-                              </td>
-                            </motion.tr>
-                          );
-                        })}
-                      </AnimatePresence>
-                      {(!results || !results.amplitude15m || results.amplitude15m.length === 0) && (
-                        <tr>
-                          <td colSpan={3} className="px-4 py-12 text-center text-gray-600 italic text-[18px] font-medium">
-                            {t.waitingScan}
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+                      4. 快速交易与持仓识别
+                    </div>
+                    <p className="text-zinc-400 pl-3">
+                      持仓中的币对自动显示紫色 <span className="text-[#d946ef] font-bold">[持仓中]</span> 标签并将币名标为亮紫色；点击任意行联动切换至交易看板并复制合约。
+                    </p>
+                  </div>
                 </div>
               </div>
-            </section>
+            )
+          })}
 
-          </div>
+          {/* 2. 15分钟跌幅榜 */}
+          {renderBoardCard({
+            moduleId: 'losers15m',
+            title: t.loser15m,
+            icon: <TrendingDown className="w-5 h-5 text-red-500 animate-pulse" />,
+            themeColor: 'red',
+            dataList: displayLosers,
+            valueType: 'loss',
+            helpManual: (
+              <div className="absolute left-0 top-full mt-2 hidden group-hover/help:block z-50 w-80 sm:w-96 p-4 rounded-2xl bg-[#121316]/98 border border-red-500/40 shadow-[0_12px_32px_rgba(0,0,0,0.85),0_0_20px_rgba(239,68,68,0.25)] backdrop-blur-xl text-left pointer-events-none transition-all">
+                <div className="flex items-center gap-2 pb-2.5 mb-2.5 border-b border-white/10">
+                  <div className="w-6 h-6 rounded-md bg-red-500/20 flex items-center justify-center border border-red-500/40">
+                    <TrendingDown className="w-3.5 h-3.5 text-red-400" />
+                  </div>
+                  <span className="font-bold text-sm text-red-300 tracking-wide">15分钟跌幅榜 · 说明书</span>
+                </div>
+                <div className="space-y-2.5 text-xs text-zinc-300 leading-relaxed">
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
+                      1. 刷新周期与时刻
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">基准周期：</span>以 15 分钟为一个完整周期（00, 15, 30, 45 分）。</p>
+                      <p>• <span className="text-zinc-200 font-medium">周期结算：</span>在每根 15m K 线的第 <span className="text-red-300 font-semibold">{config.yMin ?? 14}分{String(config.ySec ?? 30).padStart(2, '0')}秒</span> 实时结算并更新榜单。</p>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
+                      2. 筛选门槛与计算公式
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT 且 15m成交额 ≥ {formatVolume(config.n1)} USDT。</p>
+                      <p>• <span className="text-zinc-200 font-medium">常规模式：</span><span className="text-red-300 font-mono font-bold">(当前最新价 - 15m开盘价) ÷ 15m开盘价 × 100%</span>。</p>
+                      <p>• <span className="text-zinc-200 font-medium">高跌幅模式：</span><span className="text-red-400 font-mono font-bold">(当前最新价 - 15m开盘价) ÷ 当前最新价 × 100%</span>。</p>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
+                      3. 量k 与 涨跌k 动态指标
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">量k (默认12根)：</span>取当前未完结15m K线前 {volumeKCount} 根完整K线的最低成交额(USDT)，实时展示比值。</p>
+                      <p>• <span className="text-zinc-200 font-medium">涨跌k (默认6根)：</span>取当前未完结15m K线前 {gainKCount} 根完结K线在当前模式下的最大涨幅并展示。</p>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
+                      4. 快速交易与持仓识别
+                    </div>
+                    <p className="text-zinc-400 pl-3">
+                      持仓中的币对自动显示紫色 <span className="text-[#d946ef] font-bold">[持仓中]</span> 标签并将币名标为亮紫色；点击任意行联动切换至交易看板并复制合约。
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+
+          {/* 3. 15分钟振幅榜 */}
+          {renderBoardCard({
+            moduleId: 'amplitude15m',
+            title: t.amplitude15m,
+            icon: <Activity className="w-5 h-5 text-amber-500 animate-pulse" />,
+            themeColor: 'amber',
+            dataList: displayAmplitude,
+            valueType: 'amplitude',
+            helpManual: (
+              <div className="absolute left-0 top-full mt-2 hidden group-hover/help:block z-50 w-80 sm:w-96 p-4 rounded-2xl bg-[#121316]/98 border border-amber-500/40 shadow-[0_12px_32px_rgba(0,0,0,0.85),0_0_20px_rgba(245,158,11,0.25)] backdrop-blur-xl text-left pointer-events-none transition-all">
+                <div className="flex items-center gap-2 pb-2.5 mb-2.5 border-b border-white/10">
+                  <div className="w-6 h-6 rounded-md bg-amber-500/20 flex items-center justify-center border border-amber-500/40">
+                    <Activity className="w-3.5 h-3.5 text-amber-400" />
+                  </div>
+                  <span className="font-bold text-sm text-amber-300 tracking-wide">15分钟振幅榜 · 说明书</span>
+                </div>
+                <div className="space-y-2.5 text-xs text-zinc-300 leading-relaxed">
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
+                      1. 刷新周期与时刻
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">基准周期：</span>以 15 分钟为一个完整周期（00, 15, 30, 45 分）。</p>
+                      <p>• <span className="text-zinc-200 font-medium">周期结算：</span>在每根 15m K 线的第 <span className="text-amber-300 font-semibold">{config.yMin ?? 14}分{String(config.ySec ?? 30).padStart(2, '0')}秒</span> 实时结算并更新榜单。</p>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
+                      2. 筛选门槛与计算公式
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT 且 15m成交额 ≥ {formatVolume(config.n1)} USDT。</p>
+                      <p>• <span className="text-zinc-200 font-medium">计算公式：</span><span className="text-amber-300 font-mono font-bold">(15m最高价 - 15m最低价) ÷ 15m最低价 × 100%</span>。</p>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
+                      3. 量k 与 涨跌k 动态指标
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">量k (默认12根)：</span>取当前未完结15m K线前 {volumeKCount} 根完整K线的最低成交额(USDT)，实时展示比值。</p>
+                      <p>• <span className="text-zinc-200 font-medium">涨跌k (默认6根)：</span>取当前未完结15m K线前 {gainKCount} 根完结K线在当前模式下的最大涨幅并展示。</p>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
+                      4. 快速交易与持仓识别
+                    </div>
+                    <p className="text-zinc-400 pl-3">
+                      持仓中的币对自动显示紫色 <span className="text-[#d946ef] font-bold">[持仓中]</span> 标签并将币名标为亮紫色；点击任意行联动切换至交易看板并复制合约。
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+
+          {/* 4. 24小时涨幅榜 */}
+          {renderBoardCard({
+            moduleId: 'gainers24h',
+            title: t.gainer24h,
+            icon: <TrendingUp className="w-5 h-5 text-emerald-400" />,
+            themeColor: 'emerald',
+            dataList: displayGainers24h,
+            valueType: 'change24h_gain',
+            is24h: true,
+            helpManual: (
+              <div className="absolute left-0 top-full mt-2 hidden group-hover/help:block z-50 w-80 sm:w-96 p-4 rounded-2xl bg-[#121316]/98 border border-emerald-500/40 shadow-[0_12px_32px_rgba(0,0,0,0.85),0_0_20px_rgba(16,185,129,0.25)] backdrop-blur-xl text-left pointer-events-none transition-all">
+                <div className="flex items-center gap-2 pb-2.5 mb-2.5 border-b border-white/10">
+                  <div className="w-6 h-6 rounded-md bg-emerald-500/20 flex items-center justify-center border border-emerald-500/40">
+                    <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+                  </div>
+                  <span className="font-bold text-sm text-emerald-300 tracking-wide">24小时涨幅榜 · 说明书</span>
+                </div>
+                <div className="space-y-2.5 text-xs text-zinc-300 leading-relaxed">
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+                      1. 统计周期与门槛
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">统计周期：</span>滚动 24 小时。</p>
+                      <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT。</p>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+                      2. 排序规则
+                    </div>
+                    <p className="text-zinc-400 pl-3">
+                      按 24h 涨幅降序排列，展示 TOP 5 标的。支持资金费率展示与一键联动下单。
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+
+          {/* 5. 24小时跌幅榜 */}
+          {renderBoardCard({
+            moduleId: 'losers24h',
+            title: t.loser24h,
+            icon: <TrendingDown className="w-5 h-5 text-red-400" />,
+            themeColor: 'red',
+            dataList: displayLosers24h,
+            valueType: 'change24h_loss',
+            is24h: true,
+            helpManual: (
+              <div className="absolute left-0 top-full mt-2 hidden group-hover/help:block z-50 w-80 sm:w-96 p-4 rounded-2xl bg-[#121316]/98 border border-red-500/40 shadow-[0_12px_32px_rgba(0,0,0,0.85),0_0_20px_rgba(239,68,68,0.25)] backdrop-blur-xl text-left pointer-events-none transition-all">
+                <div className="flex items-center gap-2 pb-2.5 mb-2.5 border-b border-white/10">
+                  <div className="w-6 h-6 rounded-md bg-red-500/20 flex items-center justify-center border border-red-500/40">
+                    <TrendingDown className="w-3.5 h-3.5 text-red-400" />
+                  </div>
+                  <span className="font-bold text-sm text-red-300 tracking-wide">24小时跌幅榜 · 说明书</span>
+                </div>
+                <div className="space-y-2.5 text-xs text-zinc-300 leading-relaxed">
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
+                      1. 统计周期与门槛
+                    </div>
+                    <div className="text-zinc-400 pl-3 space-y-1">
+                      <p>• <span className="text-zinc-200 font-medium">统计周期：</span>滚动 24 小时。</p>
+                      <p>• <span className="text-zinc-200 font-medium">成交额门槛：</span>24h成交额 ≥ {formatVolume(config.m1)} USDT。</p>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"></span>
+                      2. 排序规则
+                    </div>
+                    <p className="text-zinc-400 pl-3">
+                      按 24h 跌幅升序排列（跌幅最大排前），展示 TOP 5 标的。支持资金费率展示与一键联动下单。
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+
         </div>
 
       </div>

@@ -614,10 +614,10 @@ export class MarketDataManager {
         // 更新当前未完结的一根 K 线
         candles[candles.length - 1] = candle;
       } else if (candle.openTime > last.openTime) {
-        // 新一根 15m K 线产生，推入数组并限制最多保留 200 根
+        // 新一根 15m K 线产生，推入数组并限制最多保留 500 根
         candles.push(candle);
-        if (candles.length > 200) {
-          record.candles15m = candles.slice(-200);
+        if (candles.length > 500) {
+          record.candles15m = candles.slice(-500);
         }
       }
     }
@@ -681,7 +681,7 @@ export class MarketDataManager {
           const rawKlines = await this.fetchBinanceBackend('/fapi/v1/klines', {
             symbol,
             interval: '15m',
-            limit: '200'
+            limit: '500'
           });
 
           if (Array.isArray(rawKlines) && rawKlines.length > 0) {
@@ -720,9 +720,9 @@ export class MarketDataManager {
               if (lastCandle && (lastCandle as any).isLiveWs) {
                 const merged = historicalCandles.filter(c => c.openTime < lastCandle.openTime);
                 merged.push(lastCandle);
-                record.candles15m = merged.slice(-200);
+                record.candles15m = merged.slice(-500);
               } else {
-                record.candles15m = historicalCandles.slice(-200);
+                record.candles15m = historicalCandles.slice(-500);
               }
             }
           }
@@ -898,53 +898,14 @@ export class MarketDataManager {
   }
 
   /**
-   * 获取某币对当前 15m K 线（直接由最新内存推送计算）
+   * 获取某币对当前 15m K 线及历史完结 15m K 线量化指标
+   * 包含：
+   *  - 当前未完结 15m 价格、成交额、常规涨跌幅、高涨幅、振幅
+   *  - 量k: 当前未完结 15m 前 volumeKCount 根完整完结 15m K 线的最低交易额(USDT计价)及比值(当前未完结成交额/最低成交额)
+   *  - 涨跌k: 当前未完结 15m 前 gainKCount 根完结 15m K 线在常规模式与高涨幅模式下的最大涨幅
+   *  - past15mCandles: 历史完结 15m 蜡烛数组，供前端实时动态重算
    */
-  public getSymbol15mKline(symbol: string): {
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number; // quoteVolume (USDT)
-    change: number;
-    amplitude: number;
-  } | null {
-    const record = this.symbolsMap.get(symbol);
-    if (!record || record.candles15m.length === 0) return null;
-
-    const latest = record.candles15m[record.candles15m.length - 1];
-    const open = latest.open;
-    const high = latest.high;
-    const low = latest.low;
-    const close = latest.close;
-    const volume = latest.quoteVolume; // 阶段一门槛 N 比对的是 USDT 额度
-
-    const change = open > 0 ? ((close - open) / open) * 100 : 0;
-    const amplitude = low > 0 ? ((high - low) / low) * 100 : 0;
-
-    return {
-      open,
-      high,
-      low,
-      close,
-      volume,
-      change,
-      amplitude
-    };
-  }
-
-  /**
-   * 本地完全基于已订阅的 15m 真实 K 线数据流聚合生成当前未完结 4H K 线数据
-   * 严禁订阅 4 小时数据流，4H 周期对齐 UTC 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
-   * 聚合要素：
-   *  - 未完结4H开盘价: 当前4H窗口内首根 15m K线的开盘价
-   *  - 未完结4H最高价: 当前4H窗口内所有 15m K线最高价与最新现价的极大值
-   *  - 未完结4H最低价: 当前4H窗口内所有 15m K线最低价与最新现价的极小值
-   *  - 未完结4H最新价: 当前最新推送价 (或末尾 15m 蜡烛的收盘价)
-   *  - 未完结4H成交额: 当前4H窗口内所有 15m K线的成交额累加和
-   *  - 4H涨跌幅 / 高涨幅 / 振幅: 纯基于上述 15m 聚合数据实时计算
-   */
-  public getSymbol4hKline(symbol: string): {
+  public getSymbol15mKline(symbol: string, volumeKCount: number = 12, gainKCount: number = 6): {
     open: number;
     high: number;
     low: number;
@@ -955,6 +916,160 @@ export class MarketDataManager {
     amplitude: number;
     periodStartTime: number;
     candlesCount: number;
+    minVolumePastK: number;
+    volumeRatioPastK: number;
+    maxGainPastK_standard: number;
+    maxGainPastK_high: number;
+    past15mCandles: Array<{
+      kIndex: number;
+      openTime: number;
+      closeTime: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+      change: number;
+      highChange: number;
+    }>;
+  } | null {
+    const record = this.symbolsMap.get(symbol);
+    if (!record || record.candles15m.length === 0) return null;
+
+    const FIFTEEN_MINS_MS = 15 * 60 * 1000;
+    const now = Date.now();
+    const current15mStart = Math.floor(now / FIFTEEN_MINS_MS) * FIFTEEN_MINS_MS;
+
+    const sorted15m = [...record.candles15m].sort((a, b) => a.openTime - b.openTime);
+
+    // 当前未完结 15m 蜡烛
+    const currentCandle = sorted15m.find(c => c.openTime >= current15mStart) || sorted15m[sorted15m.length - 1];
+    const completedCandles = sorted15m.filter(c => c.openTime < currentCandle.openTime && c.open > 0 && c.close > 0);
+
+    const open = currentCandle.open;
+    let high = currentCandle.high;
+    let low = currentCandle.low;
+    const volume = currentCandle.quoteVolume || 0;
+
+    const livePrice = record.lastPrice > 0 ? record.lastPrice : currentCandle.close;
+    const close = livePrice > 0 ? livePrice : open;
+
+    if (close > 0) {
+      high = Math.max(high, close);
+      low = Math.min(low, close);
+    }
+
+    const change = open > 0 ? ((close - open) / open) * 100 : 0;
+    const highChange = close > 0 && open > 0 ? ((close - open) / close) * 100 : change;
+    const amplitude = (low > 0 && high >= low) ? ((high - low) / low) * 100 : 0;
+
+    // 聚合当前未完结 15m 前的完结 15m K 线
+    const maxK = Math.max(volumeKCount, gainKCount, 30);
+    const past15mCandles: Array<{
+      kIndex: number;
+      openTime: number;
+      closeTime: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+      change: number;
+      highChange: number;
+    }> = [];
+
+    const reversedCompleted = [...completedCandles].reverse();
+    for (let i = 0; i < Math.min(reversedCompleted.length, maxK); i++) {
+      const c = reversedCompleted[i];
+      const kChange = c.open > 0 ? ((c.close - c.open) / c.open) * 100 : 0;
+      const kHighChange = c.close > 0 && c.open > 0 ? ((c.close - c.open) / c.close) * 100 : kChange;
+
+      past15mCandles.push({
+        kIndex: i + 1,
+        openTime: c.openTime,
+        closeTime: c.closeTime,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.quoteVolume || 0,
+        change: kChange,
+        highChange: kHighChange
+      });
+    }
+
+    // 1. 量k 计算：当前未完结 15m 前 volumeKCount 根完整 15m K 线的最低交易额(USDT计价)
+    const targetVolCandles = past15mCandles.slice(0, Math.max(1, volumeKCount));
+    const validVolumes = targetVolCandles.map(c => c.volume).filter(v => v > 0);
+    const minVolumePastK = validVolumes.length > 0 ? Math.min(...validVolumes) : 0;
+    const volumeRatioPastK = minVolumePastK > 0 ? (volume / minVolumePastK) : 0;
+
+    // 2. 涨跌k 计算：当前未完结 15m 前 gainKCount 根完结 15m K 线的最大涨幅
+    const targetGainCandles = past15mCandles.slice(0, Math.max(1, gainKCount));
+    const validStandardGains = targetGainCandles.map(c => c.change);
+    const validHighGains = targetGainCandles.map(c => c.highChange);
+    const maxGainPastK_standard = validStandardGains.length > 0 ? Math.max(...validStandardGains) : 0;
+    const maxGainPastK_high = validHighGains.length > 0 ? Math.max(...validHighGains) : 0;
+
+    return {
+      open,
+      high,
+      low: isFinite(low) ? low : open,
+      close,
+      volume,
+      change,
+      highChange,
+      amplitude,
+      periodStartTime: current15mStart,
+      candlesCount: sorted15m.length,
+      minVolumePastK,
+      volumeRatioPastK,
+      maxGainPastK_standard,
+      maxGainPastK_high,
+      past15mCandles
+    };
+  }
+
+  /**
+   * 本地完全基于已订阅的 15m 真实 K 线数据流聚合生成当前未完结 4H K 线数据及历史完结 4H K 线指标
+   * 严禁订阅 4 小时数据流，4H 周期对齐 UTC 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
+   * 聚合要素：
+   *  - 未完结4H开盘价: 当前4H窗口内首根 15m K线的开盘价
+   *  - 未完结4H最高价: 当前4H窗口内所有 15m K线最高价与最新现价的极大值
+   *  - 未完结4H最低价: 当前4H窗口内所有 15m K线最低价与最新现价的极小值
+   *  - 未完结4H最新价: 当前最新推送价 (或末尾 15m 蜡烛的收盘价)
+   *  - 未完结4H成交额: 当前4H窗口内所有 15m K线的成交额累加和
+   *  - 4H涨跌幅 / 高涨幅 / 振幅: 纯基于上述 15m 聚合数据实时计算
+   *  - 量k: 当前未完结4H K线前 volumeKCount 根完整4H K线的最低交易额(USDT计价)及比值(当前未完结成交额/最低成交额)
+   *  - 涨跌k: 当前未完结4H K线前 gainKCount 根完结4H K线在常规模式与高涨幅模式下的最大涨幅
+   */
+  public getSymbol4hKline(symbol: string, volumeKCount: number = 12, gainKCount: number = 6): {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number; // quoteVolume (USDT)
+    change: number;
+    highChange: number;
+    amplitude: number;
+    periodStartTime: number;
+    candlesCount: number;
+    minVolumePastK: number;
+    volumeRatioPastK: number;
+    maxGainPastK_standard: number;
+    maxGainPastK_high: number;
+    past4hCandles: Array<{
+      kIndex: number;
+      openTime: number;
+      closeTime: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+      change: number;
+      highChange: number;
+    }>;
   } | null {
     const record = this.symbolsMap.get(symbol);
     if (!record || record.candles15m.length === 0) return null;
@@ -1013,6 +1128,63 @@ export class MarketDataManager {
     const highChange = close > 0 && open > 0 ? ((close - open) / close) * 100 : change;
     const amplitude = (low > 0 && high >= low) ? ((high - low) / low) * 100 : 0;
 
+    // 聚合当前未完结 4H K 线之前的已完结 4H K 线 (完全基于已有的 15m 蜡烛聚合，严禁订阅 4H K线流)
+    const maxK = Math.max(volumeKCount, gainKCount, 30);
+    const past4hCandles: Array<{
+      kIndex: number;
+      openTime: number;
+      closeTime: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+      change: number;
+      highChange: number;
+    }> = [];
+
+    for (let k = 1; k <= maxK; k++) {
+      const windowStart = current4hStart - k * FOUR_HOURS_MS;
+      const windowEnd = current4hStart - (k - 1) * FOUR_HOURS_MS;
+      const kCandles = sorted15m.filter(c => c.openTime >= windowStart && c.openTime < windowEnd && c.open > 0 && c.close > 0);
+      if (kCandles.length > 0) {
+        const kOpen = kCandles[0].open;
+        const kClose = kCandles[kCandles.length - 1].close;
+        const kHigh = Math.max(...kCandles.map(c => c.high));
+        const kLow = Math.min(...kCandles.map(c => c.low));
+        const kVolume = kCandles.reduce((sum, c) => sum + (c.quoteVolume || 0), 0);
+        const kChange = kOpen > 0 ? ((kClose - kOpen) / kOpen) * 100 : 0;
+        const kHighChange = kClose > 0 && kOpen > 0 ? ((kClose - kOpen) / kClose) * 100 : kChange;
+
+        past4hCandles.push({
+          kIndex: k,
+          openTime: windowStart,
+          closeTime: windowEnd,
+          open: kOpen,
+          high: kHigh,
+          low: kLow,
+          close: kClose,
+          volume: kVolume,
+          change: kChange,
+          highChange: kHighChange
+        });
+      }
+    }
+
+    // 1. 量k 计算：当前未完结 4H K 线前的 volumeKCount 根完整 4H K 线的最低交易额(USDT计价)
+    const targetVolCandles = past4hCandles.slice(0, Math.max(1, volumeKCount));
+    const validVolumes = targetVolCandles.map(c => c.volume).filter(v => v > 0);
+    const minVolumePastK = validVolumes.length > 0 ? Math.min(...validVolumes) : 0;
+    // 当前未完结成交额 / 前 volumeKCount 根 K 线最低成交额的比值
+    const volumeRatioPastK = minVolumePastK > 0 ? (volume / minVolumePastK) : 0;
+
+    // 2. 涨跌k 计算：当前未完结 4H K 线前的 gainKCount 根完结 4H K 线的最大涨幅 (常规模式 / 高涨幅模式)
+    const targetGainCandles = past4hCandles.slice(0, Math.max(1, gainKCount));
+    const validStandardGains = targetGainCandles.map(c => c.change);
+    const validHighGains = targetGainCandles.map(c => c.highChange);
+    const maxGainPastK_standard = validStandardGains.length > 0 ? Math.max(...validStandardGains) : 0;
+    const maxGainPastK_high = validHighGains.length > 0 ? Math.max(...validHighGains) : 0;
+
     return {
       open,
       high,
@@ -1023,7 +1195,12 @@ export class MarketDataManager {
       highChange,
       amplitude,
       periodStartTime: current4hStart,
-      candlesCount: in4hCandles.length
+      candlesCount: in4hCandles.length,
+      minVolumePastK,
+      volumeRatioPastK,
+      maxGainPastK_standard,
+      maxGainPastK_high,
+      past4hCandles: past4hCandles.slice(0, 30)
     };
   }
 

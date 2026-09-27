@@ -29,7 +29,8 @@ import {
   ArrowUpDown,
   Info,
   Lock,
-  ListOrdered
+  ListOrdered,
+  BarChart2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TradeLog, Position } from '../types';
@@ -56,6 +57,8 @@ interface Config {
   settleSec?: number;
   minVolume24h?: number;
   minVolumeCycle?: number;
+  volumeKCount?: number;
+  gainKCount?: number;
   // Legacy compatibility fields
   xMin?: number;
   xSec?: number;
@@ -85,6 +88,22 @@ interface SymbolData {
   lowTime?: number;
   laterExtreme?: 'high' | 'low' | 'same';
   candlesCount?: number;
+  minVolumePastK?: number;
+  volumeRatioPastK?: number;
+  maxGainPastK_standard?: number;
+  maxGainPastK_high?: number;
+  past4hCandles?: Array<{
+    kIndex: number;
+    openTime: number;
+    closeTime: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    change: number;
+    highChange: number;
+  }>;
 }
 
 interface VolumeSpikeData {
@@ -193,6 +212,9 @@ const TRANSLATIONS = {
   gainModeStandard: "常规模式",
   gainModeHigh: "高涨幅模式",
   tableAmplitude: "振幅",
+  volumeKCount: "量k 根数 (USDT最低成交额)",
+  gainKCount: "涨跌k 根数 (最大涨幅)",
+  tableVolumeRatio: "量比",
   loading: "加载中...",
   currentTime: "当前时间",
   symbolsUnit: "币种",
@@ -251,7 +273,55 @@ export default function MonitoringAssistant4h({
     amplitudeThreshold: 15,
     enableAlertTimeout: true,
     alertTimeoutSeconds: 15,
+    volumeKCount: 12,
+    gainKCount: 6,
   });
+
+  // 自定义 量k 数量 (默认 12 条，即当前未完结4H K线前的12根完整K线最低成交额)
+  const [volumeKCount, setVolumeKCount] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('monitor_4h_volume_k_count');
+      if (saved) return Math.max(1, parseInt(saved) || 12);
+    } catch {}
+    return 12;
+  });
+
+  // 自定义 涨跌k 数量 (默认 6 条，即当前未完结4H K线前的6根完结K线在常规/高涨幅模式下的最大涨幅)
+  const [gainKCount, setGainKCount] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('monitor_4h_gain_k_count');
+      if (saved) return Math.max(1, parseInt(saved) || 6);
+    } catch {}
+    return 6;
+  });
+
+  const handleUpdateVolumeKCount = useCallback((val: number) => {
+    const clamped = Math.max(1, Math.min(30, val));
+    setVolumeKCount(clamped);
+    try {
+      localStorage.setItem('monitor_4h_volume_k_count', String(clamped));
+    } catch {}
+    setConfig(prev => ({ ...prev, volumeKCount: clamped }));
+    fetch("/api/monitoring-4h/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ volumeKCount: clamped })
+    }).catch(() => {});
+  }, []);
+
+  const handleUpdateGainKCount = useCallback((val: number) => {
+    const clamped = Math.max(1, Math.min(30, val));
+    setGainKCount(clamped);
+    try {
+      localStorage.setItem('monitor_4h_gain_k_count', String(clamped));
+    } catch {}
+    setConfig(prev => ({ ...prev, gainKCount: clamped }));
+    fetch("/api/monitoring-4h/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gainKCount: clamped })
+    }).catch(() => {});
+  }, []);
 
   const [fourHourBoards, setFourHourBoards] = useState<FourHourBoards>({
     gainers: [],
@@ -448,6 +518,32 @@ export default function MonitoringAssistant4h({
       }
     }
 
+    // 动态计算 量k 指标（当前未完结成交额 / 前 volumeKCount 根完整K线最低成交额）
+    const current4hVolume = item.volume15m || 0;
+    let minVolumePastK = item.minVolumePastK || 0;
+    let volumeRatioPastK = item.volumeRatioPastK || 0;
+
+    if (item.past4hCandles && item.past4hCandles.length > 0) {
+      const volCandles = item.past4hCandles.slice(0, Math.max(1, volumeKCount));
+      const validVols = volCandles.map(c => c.volume).filter(v => v > 0);
+      if (validVols.length > 0) {
+        minVolumePastK = Math.min(...validVols);
+        volumeRatioPastK = minVolumePastK > 0 ? (current4hVolume / minVolumePastK) : 0;
+      }
+    } else if (minVolumePastK > 0) {
+      volumeRatioPastK = current4hVolume / minVolumePastK;
+    }
+
+    // 动态计算 涨跌k 指标（当前未完结K线前的 gainKCount 根完结K线的最大涨幅，随常规模式/高涨幅模式动态切换）
+    let maxGainPastK = gainMode === 'high' ? (item.maxGainPastK_high ?? 0) : (item.maxGainPastK_standard ?? 0);
+    if (item.past4hCandles && item.past4hCandles.length > 0) {
+      const gainCandles = item.past4hCandles.slice(0, Math.max(1, gainKCount));
+      const validGains = gainCandles.map(c => gainMode === 'high' ? c.highChange : c.change);
+      if (validGains.length > 0) {
+        maxGainPastK = Math.max(...validGains);
+      }
+    }
+
     return {
       currentPrice,
       openPrice,
@@ -463,9 +559,13 @@ export default function MonitoringAssistant4h({
       highTime,
       lowTime,
       laterExtreme,
-      candlesCount: item.candlesCount || 0
+      candlesCount: item.candlesCount || 0,
+      currentVolume: current4hVolume,
+      minVolumePastK,
+      volumeRatioPastK,
+      maxGainPastK
     };
-  }, [livePrices, gainMode, fundingRates, contextFundingRates]);
+  }, [livePrices, gainMode, fundingRates, contextFundingRates, volumeKCount, gainKCount]);
 
   // 聚合 1H 放量币对的实时信息
   const getSpikeDisplayData = useCallback((item: VolumeSpikeData) => {
@@ -849,7 +949,15 @@ export default function MonitoringAssistant4h({
       if (typeof sse4h.isRunning === 'boolean') {
         setIsRunning(Boolean(sse4h.isRunning));
       }
-      if (sse4h.config) setConfig(sse4h.config);
+      if (sse4h.config) {
+        setConfig(sse4h.config);
+        if (sse4h.config.volumeKCount && !localStorage.getItem('monitor_4h_volume_k_count')) {
+          setVolumeKCount(sse4h.config.volumeKCount);
+        }
+        if (sse4h.config.gainKCount && !localStorage.getItem('monitor_4h_gain_k_count')) {
+          setGainKCount(sse4h.config.gainKCount);
+        }
+      }
       if (sse4h.scanStats) setScanStats(sse4h.scanStats);
 
       // Support sse4h.results (from server getFullResults4h()) or direct fourHourBoards/spikeAnd24hBoards
@@ -1349,6 +1457,34 @@ export default function MonitoringAssistant4h({
                           onChange={e => updateConfig({...config, n1: parseInt(e.target.value) || 0})}
                           className="w-full bg-black/40 border border-white/10 rounded-lg px-2 py-1.5 text-xs focus:border-purple-500 outline-none font-mono"
                         />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-gray-400 block">{t.volumeKCount}</label>
+                        <div className="flex gap-1 items-center">
+                          <input 
+                            type="number" 
+                            min="1"
+                            max="30"
+                            value={volumeKCount} 
+                            onChange={e => handleUpdateVolumeKCount(parseInt(e.target.value) || 1)}
+                            className="w-full bg-black/40 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-center text-cyan-300 font-bold focus:border-cyan-500 outline-none font-mono"
+                          />
+                          <span className="text-[10px] text-zinc-500">根</span>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-gray-400 block">{t.gainKCount}</label>
+                        <div className="flex gap-1 items-center">
+                          <input 
+                            type="number" 
+                            min="1"
+                            max="30"
+                            value={gainKCount} 
+                            onChange={e => handleUpdateGainKCount(parseInt(e.target.value) || 1)}
+                            className="w-full bg-black/40 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-center text-emerald-300 font-bold focus:border-emerald-500 outline-none font-mono"
+                          />
+                          <span className="text-[10px] text-zinc-500">根</span>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -2138,6 +2274,74 @@ export default function MonitoringAssistant4h({
                 </div>
               </div>
 
+              {/* 量k 自定义根数控制 */}
+              <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/10 shadow-inner">
+                <span className="text-zinc-400 text-xs px-2 font-medium flex items-center gap-1" title="自定义量k数量：取当前未完结4H K线前的N根完整K线最低交易额(USDT)计算成交额比值">
+                  <BarChart2 className="w-3.5 h-3.5 text-cyan-400" />
+                  量k:
+                </span>
+                <div className="flex items-center gap-1 pr-1">
+                  <input
+                    type="number"
+                    min="1"
+                    max="30"
+                    value={volumeKCount}
+                    onChange={e => handleUpdateVolumeKCount(parseInt(e.target.value) || 1)}
+                    className="w-12 bg-black/60 border border-white/10 rounded px-1.5 py-0.5 text-xs text-center font-mono text-cyan-300 font-bold focus:border-cyan-500 outline-none"
+                  />
+                  <span className="text-[11px] text-zinc-500">根</span>
+                </div>
+                {/* 量k 悬浮说明 */}
+                <div className="relative group/volk-tip">
+                  <span className="cursor-help text-zinc-400 hover:text-zinc-200 p-0.5 inline-block">
+                    <Info className="w-3 h-3 text-cyan-400/80" />
+                  </span>
+                  <div className="absolute right-0 top-full mt-2 hidden group-hover/volk-tip:block z-50 w-72 p-3 rounded-xl bg-[#121316] border border-white/20 shadow-2xl text-[11px] text-zinc-300 pointer-events-none leading-relaxed">
+                    <p className="font-bold text-white mb-1.5 pb-1 border-b border-white/10 flex items-center gap-1 text-cyan-300">
+                      <BarChart2 className="w-3.5 h-3.5" />
+                      量k 说明 (默认12条完整4H K线)
+                    </p>
+                    <p className="mb-1 text-zinc-300">完全基于本地已订阅 15m 真实 K 线聚合计算，严禁订阅 4H K 线流。</p>
+                    <p className="mb-1 text-zinc-300">• 取当前未完结 4H K 线之前的 <strong className="text-cyan-300">{volumeKCount} 根</strong>完整 4H K 线的最低交易额 (USDT计价)。</p>
+                    <p className="text-zinc-300">• 在 4H 成交额单元格实时展示：<span className="text-cyan-300 font-mono font-bold">当前未完结成交额 ÷ 前{volumeKCount}根最低成交额</span> 的比值。</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 涨跌k 自定义根数控制 */}
+              <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/10 shadow-inner">
+                <span className="text-zinc-400 text-xs px-2 font-medium flex items-center gap-1" title="自定义涨跌k数量：取当前未完结4H K线前的N根完结K线按当前模式计算的最大涨幅">
+                  <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+                  涨跌k:
+                </span>
+                <div className="flex items-center gap-1 pr-1">
+                  <input
+                    type="number"
+                    min="1"
+                    max="30"
+                    value={gainKCount}
+                    onChange={e => handleUpdateGainKCount(parseInt(e.target.value) || 1)}
+                    className="w-12 bg-black/60 border border-white/10 rounded px-1.5 py-0.5 text-xs text-center font-mono text-emerald-300 font-bold focus:border-emerald-500 outline-none"
+                  />
+                  <span className="text-[11px] text-zinc-500">根</span>
+                </div>
+                {/* 涨跌k 悬浮说明 */}
+                <div className="relative group/gaink-tip">
+                  <span className="cursor-help text-zinc-400 hover:text-zinc-200 p-0.5 inline-block">
+                    <Info className="w-3 h-3 text-emerald-400/80" />
+                  </span>
+                  <div className="absolute right-0 top-full mt-2 hidden group-hover/gaink-tip:block z-50 w-72 p-3 rounded-xl bg-[#121316] border border-white/20 shadow-2xl text-[11px] text-zinc-300 pointer-events-none leading-relaxed">
+                    <p className="font-bold text-white mb-1.5 pb-1 border-b border-white/10 flex items-center gap-1 text-emerald-300">
+                      <TrendingUp className="w-3.5 h-3.5" />
+                      涨跌k 说明 (默认6条完结4H K线)
+                    </p>
+                    <p className="mb-1 text-zinc-300">完全基于本地已订阅 15m 真实 K 线聚合计算，严禁订阅 4H K 线流。</p>
+                    <p className="mb-1 text-zinc-300">• 取当前未完结 4H K 线之前的 <strong className="text-emerald-300">{gainKCount} 根</strong>完结 4H K 线的最大涨幅。</p>
+                    <p className="text-zinc-300">• 计算参照当前选取的模式（<strong className="text-emerald-300">常规模式</strong>或<strong className="text-cyan-300">高涨幅模式</strong>）实时计算并在涨跌幅处展示。</p>
+                  </div>
+                </div>
+              </div>
+
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
@@ -2297,6 +2501,18 @@ export default function MonitoringAssistant4h({
                             <p>• <span className="text-emerald-400 font-medium">涨幅警报：</span>当 4h 涨幅 ≥ {config.gainThreshold}% 时，触发涨幅警报与语音播报。</p>
                           </div>
                         </div>
+
+                        <div>
+                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0"></span>
+                            4. 量k 与 涨跌k 聚合计算规则
+                          </div>
+                          <div className="text-zinc-400 pl-3 space-y-1">
+                            <p>• <span className="text-cyan-300 font-medium">严禁订阅 4H 流：</span>所有数据均由本地 15m 真实 K 线聚合计算。</p>
+                            <p>• <span className="text-zinc-200 font-medium">量k (默认12根)：</span>取当前未完结4H K线前 {volumeKCount} 根完整K线的最低成交额(USDT)，在4H成交额处实时展示「当前未完结成交额 ÷ 前{volumeKCount}根K线最低成交额」的比值。</p>
+                            <p>• <span className="text-zinc-200 font-medium">涨跌k (默认6根)：</span>取当前未完结4H K线前 {gainKCount} 根完结K线在当前模式下的最大涨幅并展示。</p>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -2337,10 +2553,20 @@ export default function MonitoringAssistant4h({
                           </div>
                         </th>
                         <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
-                        <th className="px-3 py-3 text-right w-[13%]">{t.table4hVol}</th>
-                        <th className="px-4 py-3 text-right w-[14%]">
+                        <th className="px-3 py-3 text-right w-[14%]">
+                          <div className="flex items-center justify-end gap-1" title={`当前未完结4H成交额 / 前${volumeKCount}根完整K线最低成交额比值`}>
+                            <span>{t.table4hVol}</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-mono">
+                              量比(前{volumeKCount}K)
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-4 py-3 text-right w-[15%]">
                           <div className="flex items-center justify-end gap-1">
                             <span>{gainMode === 'high' ? t.tableHighGain : t.tableGain}</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300" title={`前${gainKCount}根完结K线最大涨幅`}>
+                              前{gainKCount}K高
+                            </span>
                             <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-white/10 text-zinc-300">
                               {gainMode === 'high' ? '现价分母' : '开盘分母'}
                             </span>
@@ -2456,16 +2682,44 @@ export default function MonitoringAssistant4h({
                                 </div>
                               </td>
 
-                              {/* 6. 4H成交额 */}
-                              <td className={`px-3 py-3 text-right font-mono text-[16px] font-bold ${shouldHighlight ? 'text-emerald-300' : 'text-emerald-500'}`}>
-                                {formatVolume(item.volume15m)}
+                              {/* 6. 4H成交额 & 量比 */}
+                              <td className={`px-3 py-3 text-right font-mono ${shouldHighlight ? 'text-emerald-300' : 'text-emerald-500'}`}>
+                                <div className="text-[15px] sm:text-[16px] font-bold leading-tight">
+                                  {formatVolume(data.currentVolume)}
+                                </div>
+                                <div 
+                                  className="flex items-center justify-end gap-1 mt-1 text-[11px] font-mono cursor-help"
+                                  title={`当前未完结4H成交额: ${formatVolume(data.currentVolume)} 万 USDT\n前${volumeKCount}根完结4H K线最低成交额: ${formatVolume(data.minVolumePastK)} 万 USDT\n比值 (当前/前${volumeKCount}K最低) = ${data.volumeRatioPastK > 0 ? data.volumeRatioPastK.toFixed(2) : '--'}倍`}
+                                >
+                                  <span className="text-zinc-500 text-[10px]">量比:</span>
+                                  <span className={`px-1.5 py-0.2 rounded text-[11px] font-bold transition-all ${
+                                    data.volumeRatioPastK >= 2.0 
+                                      ? 'bg-amber-500/25 text-amber-300 border border-amber-500/40 shadow-sm' 
+                                      : data.volumeRatioPastK >= 1.0 
+                                        ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/40' 
+                                        : 'bg-white/5 text-zinc-400 border border-white/10'
+                                  }`}>
+                                    {data.volumeRatioPastK > 0 ? `${data.volumeRatioPastK.toFixed(2)}x` : '--'}
+                                  </span>
+                                </div>
                               </td>
 
-                              {/* 7. 涨幅 */}
+                              {/* 7. 涨幅 & 前K最大涨幅 */}
                               <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-emerald-400 font-bold text-[19px] sm:text-[21px] font-mono">
-                                  {formatChangeText(data.effectiveChange)}
-                                  <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-emerald-400" />
+                                <div className="flex flex-col items-end">
+                                  <div className="flex items-center justify-end gap-1 text-emerald-400 font-bold text-[19px] sm:text-[21px] font-mono leading-tight">
+                                    {formatChangeText(data.effectiveChange)}
+                                    <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-emerald-400" />
+                                  </div>
+                                  <div 
+                                    className="flex items-center justify-end gap-1 mt-1 text-[11px] font-mono text-zinc-400 cursor-help"
+                                    title={`当前未完结K线前的${gainKCount}根完结K线最大涨幅 (${gainMode === 'high' ? '高涨幅模式' : '常规模式'})`}
+                                  >
+                                    <span className="text-zinc-500 text-[10px]">前{gainKCount}K高:</span>
+                                    <span className={`font-bold ${data.maxGainPastK > 0 ? 'text-emerald-300' : 'text-zinc-400'}`}>
+                                      {formatChangeText(data.maxGainPastK)}
+                                    </span>
+                                  </div>
                                 </div>
                               </td>
                             </motion.tr>
@@ -2578,6 +2832,18 @@ export default function MonitoringAssistant4h({
                             <p>• <span className="text-red-400 font-medium">跌幅警报：</span>当 4h 跌幅绝对值 ≥ {config.lossThreshold}% 时，触发跌幅警报与语音播报。</p>
                           </div>
                         </div>
+
+                        <div>
+                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0"></span>
+                            4. 量k 与 涨跌k 聚合计算规则
+                          </div>
+                          <div className="text-zinc-400 pl-3 space-y-1">
+                            <p>• <span className="text-cyan-300 font-medium">严禁订阅 4H 流：</span>所有数据均由本地 15m 真实 K 线聚合计算。</p>
+                            <p>• <span className="text-zinc-200 font-medium">量k (默认12根)：</span>取当前未完结4H K线前 {volumeKCount} 根完整K线的最低成交额(USDT)，在4H成交额处实时展示「当前未完结成交额 ÷ 前{volumeKCount}根K线最低成交额」的比值。</p>
+                            <p>• <span className="text-zinc-200 font-medium">涨跌k (默认6根)：</span>取当前未完结4H K线前 {gainKCount} 根完结K线在当前模式下的最大涨幅并展示。</p>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -2618,10 +2884,20 @@ export default function MonitoringAssistant4h({
                           </div>
                         </th>
                         <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
-                        <th className="px-3 py-3 text-right w-[13%]">{t.table4hVol}</th>
-                        <th className="px-4 py-3 text-right w-[14%]">
+                        <th className="px-3 py-3 text-right w-[14%]">
+                          <div className="flex items-center justify-end gap-1" title={`当前未完结4H成交额 / 前${volumeKCount}根完整K线最低成交额比值`}>
+                            <span>{t.table4hVol}</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-mono">
+                              量比(前{volumeKCount}K)
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-4 py-3 text-right w-[15%]">
                           <div className="flex items-center justify-end gap-1">
                             <span>{gainMode === 'high' ? t.tableHighLoss : t.tableLoss}</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300" title={`前${gainKCount}根完结K线最大涨幅`}>
+                              前{gainKCount}K高
+                            </span>
                             <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-white/10 text-zinc-300">
                               {gainMode === 'high' ? '现价分母' : '开盘分母'}
                             </span>
@@ -2737,16 +3013,44 @@ export default function MonitoringAssistant4h({
                                 </div>
                               </td>
 
-                              {/* 6. 4H成交额 */}
-                              <td className={`px-3 py-3 text-right font-mono text-[16px] font-bold ${shouldHighlight ? 'text-red-300' : 'text-emerald-500'}`}>
-                                {formatVolume(item.volume15m)}
+                              {/* 6. 4H成交额 & 量比 */}
+                              <td className={`px-3 py-3 text-right font-mono ${shouldHighlight ? 'text-red-300' : 'text-emerald-500'}`}>
+                                <div className="text-[15px] sm:text-[16px] font-bold leading-tight">
+                                  {formatVolume(data.currentVolume)}
+                                </div>
+                                <div 
+                                  className="flex items-center justify-end gap-1 mt-1 text-[11px] font-mono cursor-help"
+                                  title={`当前未完结4H成交额: ${formatVolume(data.currentVolume)} 万 USDT\n前${volumeKCount}根完结4H K线最低成交额: ${formatVolume(data.minVolumePastK)} 万 USDT\n比值 (当前/前${volumeKCount}K最低) = ${data.volumeRatioPastK > 0 ? data.volumeRatioPastK.toFixed(2) : '--'}倍`}
+                                >
+                                  <span className="text-zinc-500 text-[10px]">量比:</span>
+                                  <span className={`px-1.5 py-0.2 rounded text-[11px] font-bold transition-all ${
+                                    data.volumeRatioPastK >= 2.0 
+                                      ? 'bg-amber-500/25 text-amber-300 border border-amber-500/40 shadow-sm' 
+                                      : data.volumeRatioPastK >= 1.0 
+                                        ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/40' 
+                                        : 'bg-white/5 text-zinc-400 border border-white/10'
+                                  }`}>
+                                    {data.volumeRatioPastK > 0 ? `${data.volumeRatioPastK.toFixed(2)}x` : '--'}
+                                  </span>
+                                </div>
                               </td>
 
-                              {/* 7. 跌幅 */}
+                              {/* 7. 跌幅 & 前K最大涨幅 */}
                               <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-red-500 font-bold text-[19px] sm:text-[21px] font-mono">
-                                  {formatChangeText(data.effectiveChange)}
-                                  <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-red-500" />
+                                <div className="flex flex-col items-end">
+                                  <div className="flex items-center justify-end gap-1 text-red-500 font-bold text-[19px] sm:text-[21px] font-mono leading-tight">
+                                    {formatChangeText(data.effectiveChange)}
+                                    <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-red-500" />
+                                  </div>
+                                  <div 
+                                    className="flex items-center justify-end gap-1 mt-1 text-[11px] font-mono text-zinc-400 cursor-help"
+                                    title={`当前未完结K线前的${gainKCount}根完结K线最大涨幅 (${gainMode === 'high' ? '高涨幅模式' : '常规模式'})`}
+                                  >
+                                    <span className="text-zinc-500 text-[10px]">前{gainKCount}K高:</span>
+                                    <span className={`font-bold ${data.maxGainPastK > 0 ? 'text-emerald-300' : 'text-zinc-400'}`}>
+                                      {formatChangeText(data.maxGainPastK)}
+                                    </span>
+                                  </div>
                                 </div>
                               </td>
                             </motion.tr>
@@ -2829,6 +3133,18 @@ export default function MonitoringAssistant4h({
                             <p>• <span className="text-amber-400 font-medium">振幅警报：</span>当 4h 振幅 ≥ {config.amplitudeThreshold}% 时，触发振幅警报与语音播报。</p>
                           </div>
                         </div>
+
+                        <div>
+                          <div className="font-bold text-white mb-0.5 flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0"></span>
+                            4. 量k 与 涨跌k 聚合计算规则
+                          </div>
+                          <div className="text-zinc-400 pl-3 space-y-1">
+                            <p>• <span className="text-cyan-300 font-medium">严禁订阅 4H 流：</span>所有数据均由本地 15m 真实 K 线聚合计算。</p>
+                            <p>• <span className="text-zinc-200 font-medium">量k (默认12根)：</span>取当前未完结4H K线前 {volumeKCount} 根完整K线的最低成交额(USDT)，在4H成交额处实时展示「当前未完结成交额 ÷ 前{volumeKCount}根K线最低成交额」的比值。</p>
+                            <p>• <span className="text-zinc-200 font-medium">涨跌k (默认6根)：</span>取当前未完结4H K线前 {gainKCount} 根完结K线在当前模式下的最大涨幅并展示。</p>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -2869,8 +3185,22 @@ export default function MonitoringAssistant4h({
                           </div>
                         </th>
                         <th className="px-3 py-3 text-center w-[14%]">{t.tableFundingCycle}</th>
-                        <th className="px-3 py-3 text-right w-[13%]">{t.table4hVol}</th>
-                        <th className="px-4 py-3 text-right w-[14%]">{t.tableAmplitude}</th>
+                        <th className="px-3 py-3 text-right w-[14%]">
+                          <div className="flex items-center justify-end gap-1" title={`当前未完结4H成交额 / 前${volumeKCount}根完整K线最低成交额比值`}>
+                            <span>{t.table4hVol}</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-mono">
+                              量比(前{volumeKCount}K)
+                            </span>
+                          </div>
+                        </th>
+                        <th className="px-4 py-3 text-right w-[15%]">
+                          <div className="flex items-center justify-end gap-1">
+                            <span>{t.tableAmplitude}</span>
+                            <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300" title={`前${gainKCount}根完结K线最大涨幅`}>
+                              前{gainKCount}K高
+                            </span>
+                          </div>
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
@@ -2978,16 +3308,44 @@ export default function MonitoringAssistant4h({
                                 </div>
                               </td>
 
-                              {/* 6. 4H成交额 */}
-                              <td className={`px-3 py-3 text-right font-mono text-[16px] font-bold ${shouldHighlight ? 'text-amber-300' : 'text-emerald-500'}`}>
-                                {formatVolume(item.volume15m)}
+                              {/* 6. 4H成交额 & 量比 */}
+                              <td className={`px-3 py-3 text-right font-mono ${shouldHighlight ? 'text-amber-300' : 'text-emerald-500'}`}>
+                                <div className="text-[15px] sm:text-[16px] font-bold leading-tight">
+                                  {formatVolume(data.currentVolume)}
+                                </div>
+                                <div 
+                                  className="flex items-center justify-end gap-1 mt-1 text-[11px] font-mono cursor-help"
+                                  title={`当前未完结4H成交额: ${formatVolume(data.currentVolume)} 万 USDT\n前${volumeKCount}根完结4H K线最低成交额: ${formatVolume(data.minVolumePastK)} 万 USDT\n比值 (当前/前${volumeKCount}K最低) = ${data.volumeRatioPastK > 0 ? data.volumeRatioPastK.toFixed(2) : '--'}倍`}
+                                >
+                                  <span className="text-zinc-500 text-[10px]">量比:</span>
+                                  <span className={`px-1.5 py-0.2 rounded text-[11px] font-bold transition-all ${
+                                    data.volumeRatioPastK >= 2.0 
+                                      ? 'bg-amber-500/25 text-amber-300 border border-amber-500/40 shadow-sm' 
+                                      : data.volumeRatioPastK >= 1.0 
+                                        ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/40' 
+                                        : 'bg-white/5 text-zinc-400 border border-white/10'
+                                  }`}>
+                                    {data.volumeRatioPastK > 0 ? `${data.volumeRatioPastK.toFixed(2)}x` : '--'}
+                                  </span>
+                                </div>
                               </td>
 
-                              {/* 7. 振幅 */}
+                              {/* 7. 振幅 & 前K最大涨幅 */}
                               <td className="px-4 py-3 text-right">
-                                <div className="flex items-center justify-end gap-1 text-amber-500 font-bold text-[19px] sm:text-[21px] font-mono">
-                                  {(item.amplitude || 0).toFixed(2)}%
-                                  <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-amber-500" />
+                                <div className="flex flex-col items-end">
+                                  <div className="flex items-center justify-end gap-1 text-amber-500 font-bold text-[19px] sm:text-[21px] font-mono leading-tight">
+                                    {(item.amplitude || 0).toFixed(2)}%
+                                    <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all text-amber-500" />
+                                  </div>
+                                  <div 
+                                    className="flex items-center justify-end gap-1 mt-1 text-[11px] font-mono text-zinc-400 cursor-help"
+                                    title={`当前未完结K线前的${gainKCount}根完结K线最大涨幅 (${gainMode === 'high' ? '高涨幅模式' : '常规模式'})`}
+                                  >
+                                    <span className="text-zinc-500 text-[10px]">前{gainKCount}K高:</span>
+                                    <span className={`font-bold ${data.maxGainPastK > 0 ? 'text-emerald-300' : 'text-zinc-400'}`}>
+                                      {formatChangeText(data.maxGainPastK)}
+                                    </span>
+                                  </div>
                                 </div>
                               </td>
                             </motion.tr>

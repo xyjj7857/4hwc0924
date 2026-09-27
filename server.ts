@@ -154,6 +154,8 @@ interface MonitoringConfig {
   amplitudeThreshold: number;
   enableAlertTimeout: boolean;
   alertTimeoutSeconds: number;
+  volumeKCount?: number;
+  gainKCount?: number;
   // Legacy compatibility fields
   xMin?: number;
   xSec?: number;
@@ -175,6 +177,8 @@ const DEFAULT_CONFIG: MonitoringConfig = {
   amplitudeThreshold: 8,
   enableAlertTimeout: true,
   alertTimeoutSeconds: 15,
+  volumeKCount: 12,
+  gainKCount: 6,
 };
 
 interface MonitorLog {
@@ -544,9 +548,11 @@ const runCycleScan15m = async () => {
       const vol24h = marketDataManager.getSymbol24hVolume(symbol);
       if (vol24h <= min24h) continue;
 
-      const kline = marketDataManager.getSymbol15mKline(symbol);
+      const kline = marketDataManager.getSymbol15mKline(symbol, config.volumeKCount || 12, config.gainKCount || 6);
       if (kline && kline.volume > min15m) {
         passedCount++;
+        const highChange = kline.close > 0 && kline.open > 0 ? ((kline.close - kline.open) / kline.close) * 100 : kline.change;
+        const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
         finalResults.push({
           symbol,
           volume24h: vol24h,
@@ -554,8 +560,16 @@ const runCycleScan15m = async () => {
           openPrice: kline.open,
           lastPrice: kline.close,
           change: kline.change,
+          highChange,
           change24h: marketDataManager.getSymbol24hChange(symbol),
-          amplitude: kline.amplitude
+          amplitude: kline.amplitude,
+          fundingRate: fundingInfo?.fundingRate,
+          settlementCycle: fundingInfo?.settlementCycle,
+          minVolumePastK: kline.minVolumePastK,
+          volumeRatioPastK: kline.volumeRatioPastK,
+          maxGainPastK_standard: kline.maxGainPastK_standard,
+          maxGainPastK_high: kline.maxGainPastK_high,
+          past15mCandles: kline.past15mCandles
         });
       }
     }
@@ -730,6 +744,8 @@ interface MonitoringConfig4h extends MonitoringConfig {
   volumeSpikeC: number;
   volumeSpikeX: number;
   volumeSpikeMinute: number;
+  volumeKCount?: number;
+  gainKCount?: number;
 }
 
 const DEFAULT_CONFIG_4H: MonitoringConfig4h = {
@@ -749,6 +765,8 @@ const DEFAULT_CONFIG_4H: MonitoringConfig4h = {
   volumeSpikeC: 10000000,
   volumeSpikeX: 5,
   volumeSpikeMinute: 50,
+  volumeKCount: 12,
+  gainKCount: 6,
 };
 
 let config4h: MonitoringConfig4h = { ...DEFAULT_CONFIG_4H };
@@ -803,8 +821,10 @@ const getLiveEnrichedScanResults15m = () => {
         const vol24h = marketDataManager.getSymbol24hVolume(symbol);
         if (vol24h <= min24h) continue;
 
-        const kline = marketDataManager.getSymbol15mKline(symbol);
+        const kline = marketDataManager.getSymbol15mKline(symbol, config.volumeKCount || 12, config.gainKCount || 6);
         if (kline && kline.volume > min15m) {
+          const highChange = kline.close > 0 && kline.open > 0 ? ((kline.close - kline.open) / kline.close) * 100 : kline.change;
+          const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
           finalResults.push({
             symbol,
             volume24h: vol24h,
@@ -812,8 +832,16 @@ const getLiveEnrichedScanResults15m = () => {
             openPrice: kline.open,
             lastPrice: kline.close,
             change: kline.change,
+            highChange,
             change24h: marketDataManager.getSymbol24hChange(symbol),
-            amplitude: kline.amplitude
+            amplitude: kline.amplitude,
+            fundingRate: fundingInfo?.fundingRate,
+            settlementCycle: fundingInfo?.settlementCycle,
+            minVolumePastK: kline.minVolumePastK,
+            volumeRatioPastK: kline.volumeRatioPastK,
+            maxGainPastK_standard: kline.maxGainPastK_standard,
+            maxGainPastK_high: kline.maxGainPastK_high,
+            past15mCandles: kline.past15mCandles
           });
         }
       }
@@ -851,20 +879,27 @@ const getLiveEnrichedScanResults15m = () => {
   if (!baseResults) return null;
 
   const enrichItem15m = (item: any) => {
-    const kline = marketDataManager.getSymbol15mKline(item.symbol);
+    const kline = marketDataManager.getSymbol15mKline(item.symbol, config.volumeKCount || 12, config.gainKCount || 6);
     const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
     const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
-    const price = marketDataManager.getSymbolPrice(item.symbol);
+    const price = marketDataManager.getSymbolPrice(item.symbol) || (kline ? kline.close : item.lastPrice);
     const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
+    const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
+    const openPrice = kline ? kline.open : item.openPrice;
+    const change = kline ? kline.change : item.change;
+    const highChange = (price > 0 && openPrice > 0) ? ((price - openPrice) / price) * 100 : (kline ? kline.highChange : (item.highChange || change));
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
       volume15m: kline ? kline.volume : item.volume15m,
-      openPrice: kline ? kline.open : item.openPrice,
+      openPrice,
       lastPrice: price > 0 ? price : (kline ? kline.close : item.lastPrice),
-      change: kline ? kline.change : item.change,
+      change,
+      highChange,
       change24h: chg24h !== 0 ? chg24h : item.change24h,
       amplitude: kline ? kline.amplitude : item.amplitude,
+      fundingRate: fundingInfo?.fundingRate ?? item.fundingRate,
+      settlementCycle: fundingInfo?.settlementCycle ?? item.settlementCycle,
       listingOpen: extremes.listingOpen,
       listingTime: extremes.listingTime,
       historicalHigh: extremes.historicalHigh,
@@ -872,7 +907,12 @@ const getLiveEnrichedScanResults15m = () => {
       highTime: extremes.highTime,
       lowTime: extremes.lowTime,
       laterExtreme: extremes.laterExtreme,
-      candlesCount: extremes.candlesCount
+      candlesCount: extremes.candlesCount,
+      minVolumePastK: kline ? kline.minVolumePastK : item.minVolumePastK,
+      volumeRatioPastK: kline ? kline.volumeRatioPastK : item.volumeRatioPastK,
+      maxGainPastK_standard: kline ? kline.maxGainPastK_standard : item.maxGainPastK_standard,
+      maxGainPastK_high: kline ? kline.maxGainPastK_high : item.maxGainPastK_high,
+      past15mCandles: kline ? kline.past15mCandles : item.past15mCandles
     };
   };
 
@@ -881,11 +921,20 @@ const getLiveEnrichedScanResults15m = () => {
     const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
     const price = marketDataManager.getSymbolPrice(item.symbol);
     const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
+    const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
+    const kline = marketDataManager.getSymbol15mKline(item.symbol, config.volumeKCount || 12, config.gainKCount || 6);
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
-      lastPrice: price > 0 ? price : item.lastPrice,
+      volume15m: kline ? kline.volume : item.volume15m,
+      openPrice: kline ? kline.open : item.openPrice,
+      lastPrice: price > 0 ? price : (kline ? kline.close : item.lastPrice),
+      change: kline ? kline.change : item.change,
+      highChange: (price > 0 && kline && kline.open > 0) ? ((price - kline.open) / price) * 100 : (kline ? kline.highChange : (item.highChange || item.change)),
       change24h: chg24h !== 0 ? chg24h : item.change24h,
+      amplitude: kline ? kline.amplitude : item.amplitude,
+      fundingRate: fundingInfo?.fundingRate ?? item.fundingRate,
+      settlementCycle: fundingInfo?.settlementCycle ?? item.settlementCycle,
       listingOpen: extremes.listingOpen,
       listingTime: extremes.listingTime,
       historicalHigh: extremes.historicalHigh,
@@ -893,7 +942,12 @@ const getLiveEnrichedScanResults15m = () => {
       highTime: extremes.highTime,
       lowTime: extremes.lowTime,
       laterExtreme: extremes.laterExtreme,
-      candlesCount: extremes.candlesCount
+      candlesCount: extremes.candlesCount,
+      minVolumePastK: kline ? kline.minVolumePastK : item.minVolumePastK,
+      volumeRatioPastK: kline ? kline.volumeRatioPastK : item.volumeRatioPastK,
+      maxGainPastK_standard: kline ? kline.maxGainPastK_standard : item.maxGainPastK_standard,
+      maxGainPastK_high: kline ? kline.maxGainPastK_high : item.maxGainPastK_high,
+      past15mCandles: kline ? kline.past15mCandles : item.past15mCandles
     };
   };
 
@@ -922,7 +976,7 @@ const getFullResults4h = () => {
         const vol24h = marketDataManager.getSymbol24hVolume(symbol);
         if (vol24h <= min24h) continue;
 
-        const kline = marketDataManager.getSymbol4hKline(symbol);
+        const kline = marketDataManager.getSymbol4hKline(symbol, config4h.volumeKCount || 12, config4h.gainKCount || 6);
         if (kline && kline.volume > min4h) {
           const highChange = kline.close > 0 && kline.open > 0 ? ((kline.close - kline.open) / kline.close) * 100 : kline.change;
           const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
@@ -939,7 +993,12 @@ const getFullResults4h = () => {
             fundingRate: fundingInfo.fundingRate,
             fundingIntervalHours: fundingInfo.fundingIntervalHours,
             settlementCycle: fundingInfo.settlementCycle,
-            nextFundingTime: fundingInfo.nextFundingTime
+            nextFundingTime: fundingInfo.nextFundingTime,
+            minVolumePastK: kline.minVolumePastK,
+            volumeRatioPastK: kline.volumeRatioPastK,
+            maxGainPastK_standard: kline.maxGainPastK_standard,
+            maxGainPastK_high: kline.maxGainPastK_high,
+            past4hCandles: kline.past4hCandles
           });
         }
       }
@@ -1032,7 +1091,7 @@ const getFullResults4h = () => {
   }
 
   const enrichItem4h = (item: any) => {
-    const kline = marketDataManager.getSymbol4hKline(item.symbol);
+    const kline = marketDataManager.getSymbol4hKline(item.symbol, config4h.volumeKCount || 12, config4h.gainKCount || 6);
     const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
     const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
     const price = marketDataManager.getSymbolPrice(item.symbol) || (kline ? kline.close : item.lastPrice);
@@ -1055,6 +1114,9 @@ const getFullResults4h = () => {
     const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : change;
     const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
 
+    const minVol = kline ? kline.minVolumePastK : (item.minVolumePastK || 0);
+    const volRatio = minVol > 0 ? (vol4h / minVol) : (kline ? kline.volumeRatioPastK : (item.volumeRatioPastK || 0));
+
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
@@ -1076,7 +1138,12 @@ const getFullResults4h = () => {
       highTime: extremes.highTime,
       lowTime: extremes.lowTime,
       laterExtreme: extremes.laterExtreme,
-      candlesCount: extremes.candlesCount
+      candlesCount: extremes.candlesCount,
+      minVolumePastK: minVol,
+      volumeRatioPastK: volRatio,
+      maxGainPastK_standard: kline ? kline.maxGainPastK_standard : (item.maxGainPastK_standard || 0),
+      maxGainPastK_high: kline ? kline.maxGainPastK_high : (item.maxGainPastK_high || 0),
+      past4hCandles: kline?.past4hCandles || item.past4hCandles || []
     };
   };
 
@@ -1230,7 +1297,7 @@ const runCycleScan4h = async () => {
       const vol24h = marketDataManager.getSymbol24hVolume(symbol);
       if (vol24h <= min24h) continue;
 
-      const kline = marketDataManager.getSymbol4hKline(symbol);
+      const kline = marketDataManager.getSymbol4hKline(symbol, config4h.volumeKCount || 12, config4h.gainKCount || 6);
       if (kline && kline.volume > min4h) {
         passedCount++;
         const highChange = kline.close > 0 && kline.open > 0 ? ((kline.close - kline.open) / kline.close) * 100 : kline.change;
@@ -1248,7 +1315,12 @@ const runCycleScan4h = async () => {
           fundingRate: fundingInfo.fundingRate,
           fundingIntervalHours: fundingInfo.fundingIntervalHours,
           settlementCycle: fundingInfo.settlementCycle,
-          nextFundingTime: fundingInfo.nextFundingTime
+          nextFundingTime: fundingInfo.nextFundingTime,
+          minVolumePastK: kline.minVolumePastK,
+          volumeRatioPastK: kline.volumeRatioPastK,
+          maxGainPastK_standard: kline.maxGainPastK_standard,
+          maxGainPastK_high: kline.maxGainPastK_high,
+          past4hCandles: kline.past4hCandles
         });
       }
     }
@@ -1929,7 +2001,9 @@ async function startServer() {
         settleMin: newConfig.settleMin ?? newConfig.yMin ?? config.settleMin,
         settleSec: newConfig.settleSec ?? newConfig.ySec ?? config.settleSec,
         minVolume24h: newConfig.minVolume24h ?? newConfig.m1 ?? config.minVolume24h,
-        minVolumeCycle: newConfig.minVolumeCycle ?? newConfig.n1 ?? config.minVolumeCycle
+        minVolumeCycle: newConfig.minVolumeCycle ?? newConfig.n1 ?? config.minVolumeCycle,
+        volumeKCount: newConfig.volumeKCount ?? config.volumeKCount ?? 12,
+        gainKCount: newConfig.gainKCount ?? config.gainKCount ?? 6
       };
       saveConfigState(config);
       addMonitorLog('[扫描监控] 15M监控配置参数已更新并成功同步到后端。', 'SUCCESS');
@@ -2099,7 +2173,9 @@ async function startServer() {
         minVolume24h: newConfig.m1 ?? newConfig.minVolume24h ?? config4h.minVolume24h,
         minVolumeCycle: newConfig.n1 ?? newConfig.minVolumeCycle ?? config4h.minVolumeCycle,
         m1: newConfig.m1 ?? newConfig.minVolume24h ?? config4h.m1,
-        n1: newConfig.n1 ?? newConfig.minVolumeCycle ?? config4h.n1
+        n1: newConfig.n1 ?? newConfig.minVolumeCycle ?? config4h.n1,
+        volumeKCount: newConfig.volumeKCount ?? config4h.volumeKCount ?? 12,
+        gainKCount: newConfig.gainKCount ?? config4h.gainKCount ?? 6
       };
       try {
         db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run("monitoring_config_4h", JSON.stringify(config4h));

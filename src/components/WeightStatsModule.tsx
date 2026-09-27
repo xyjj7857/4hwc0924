@@ -236,7 +236,7 @@ export default function WeightStatsModule() {
 
   // 计算接口消耗排行
   const endpointRanking = useMemo(() => {
-    const list = Object.entries(status.endpointBreakdown).map(([ep, item]) => ({
+    const list = Object.entries(status.endpointBreakdown).map(([ep, item]: [string, any]) => ({
       endpoint: ep,
       count: item.count,
       weight: item.weight,
