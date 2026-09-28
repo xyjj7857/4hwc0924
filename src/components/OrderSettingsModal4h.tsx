@@ -10,11 +10,17 @@ import {
   Target, 
   DollarSign, 
   Coins,
-  HelpCircle
+  HelpCircle,
+  Layers
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 export interface OrderSettings4h {
+  // 0. 最大持仓单数量 (默认10，默认勾选)
+  maxPositionCount?: {
+    enabled: boolean;
+    value: string; // 默认 '10'
+  };
   // 1. 杠杆倍数
   leverage: {
     enabled: boolean;
@@ -49,6 +55,10 @@ export interface OrderSettings4h {
 }
 
 export const DEFAULT_ORDER_SETTINGS_4H: OrderSettings4h = {
+  maxPositionCount: {
+    enabled: true,
+    value: '10'
+  },
   leverage: {
     enabled: true,
     value: '10'
@@ -89,11 +99,19 @@ export default function OrderSettingsModal4h({
   settings,
   onSave
 }: OrderSettingsModal4hProps) {
-  const [formData, setFormData] = useState<OrderSettings4h>(settings);
+  const [formData, setFormData] = useState<OrderSettings4h>(() => ({
+    ...DEFAULT_ORDER_SETTINGS_4H,
+    ...settings,
+    maxPositionCount: settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
+  }));
 
   useEffect(() => {
     if (isOpen) {
-      setFormData(settings);
+      setFormData({
+        ...DEFAULT_ORDER_SETTINGS_4H,
+        ...settings,
+        maxPositionCount: settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
+      });
     }
   }, [isOpen, settings]);
 
@@ -116,6 +134,7 @@ export default function OrderSettingsModal4h({
   };
 
   const activeCount = [
+    formData.maxPositionCount?.enabled,
     formData.leverage.enabled,
     formData.calcQtyPercent.enabled,
     formData.minOrderAmount.enabled,
@@ -178,6 +197,52 @@ export default function OrderSettingsModal4h({
 
           {/* 弹窗内容表单区 */}
           <div className="p-6 overflow-y-auto space-y-4.5 flex-1 text-sm custom-scrollbar">
+
+            {/* 0. 最大持仓单数量 (在最上方，默认10，默认勾选) */}
+            <div className={`p-4 rounded-2xl border transition-all ${
+              formData.maxPositionCount?.enabled 
+                ? 'bg-amber-500/[0.06] border-amber-500/40 shadow-sm' 
+                : 'bg-white/[0.02] border-white/5 opacity-75 hover:opacity-100'
+            }`}>
+              <div className="flex items-center justify-between mb-3">
+                <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                  <input 
+                    type="checkbox" 
+                    checked={formData.maxPositionCount?.enabled ?? true}
+                    onChange={e => setFormData(prev => ({
+                      ...prev,
+                      maxPositionCount: { 
+                        enabled: e.target.checked,
+                        value: prev.maxPositionCount?.value || '10'
+                      }
+                    }))}
+                    className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500 bg-white/10 border-white/20 accent-amber-500 cursor-pointer"
+                  />
+                  <span className="font-bold text-zinc-100 flex items-center gap-1.5">
+                    <Layers className="w-4 h-4 text-amber-400" />
+                    最大持仓单数量
+                  </span>
+                </label>
+                <span className="text-xs text-zinc-400 font-mono">持仓上限控制</span>
+              </div>
+              <div className="pl-6">
+                <span className="text-[11px] text-zinc-400 mb-1 block">同时持仓币对上限 (超过此数量不再自动开新仓)</span>
+                <input 
+                  type="text" 
+                  value={formData.maxPositionCount?.value ?? '10'}
+                  placeholder="默认 10"
+                  onChange={e => handleNumberInput(e.target.value, (val) => setFormData(prev => ({
+                    ...prev,
+                    maxPositionCount: { 
+                      enabled: prev.maxPositionCount?.enabled ?? true,
+                      value: val 
+                    }
+                  })))}
+                  disabled={!formData.maxPositionCount?.enabled}
+                  className="w-full px-3 py-2 bg-black/40 border border-white/15 rounded-xl font-mono text-white placeholder-zinc-600 focus:outline-none focus:border-amber-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                />
+              </div>
+            </div>
 
             {/* 1. 杠杆倍数 */}
             <div className={`p-4 rounded-2xl border transition-all ${

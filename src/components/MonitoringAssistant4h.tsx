@@ -399,7 +399,14 @@ export default function MonitoringAssistant4h({
   const [orderSettings, setOrderSettings] = useState<OrderSettings4h>(() => {
     try {
       const saved = localStorage.getItem('monitoring4h_order_settings');
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          ...DEFAULT_ORDER_SETTINGS_4H,
+          ...parsed,
+          maxPositionCount: parsed.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
+        };
+      }
     } catch {}
     return DEFAULT_ORDER_SETTINGS_4H;
   });
@@ -471,6 +478,7 @@ export default function MonitoringAssistant4h({
   // 统计是否有任何生效的下单设置
   const hasActiveOrderSettings = useMemo(() => {
     return Boolean(
+      orderSettings.maxPositionCount?.enabled ||
       orderSettings.leverage.enabled ||
       orderSettings.calcQtyPercent.enabled ||
       orderSettings.minOrderAmount.enabled ||
@@ -483,6 +491,7 @@ export default function MonitoringAssistant4h({
   // 统计已启用的下单设置项数
   const activeOrderSettingsCount = useMemo(() => {
     return [
+      orderSettings.maxPositionCount?.enabled,
       orderSettings.leverage.enabled,
       orderSettings.calcQtyPercent.enabled,
       orderSettings.minOrderAmount.enabled,
