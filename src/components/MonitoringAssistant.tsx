@@ -69,6 +69,9 @@ interface SymbolData {
   highChange?: number;
   change24h: number;
   amplitude?: number;
+  high?: number;
+  low?: number;
+  closePos?: number;
   fundingRate?: number;
   fundingIntervalHours?: number;
   settlementCycle?: string;
@@ -187,6 +190,26 @@ const TRANSLATIONS = {
   stopProgram: "停止程序",
   startProgram: "启动程序",
   settleCountdown: "15分钟结算倒计时",
+  tableClosePos: "收位",
+};
+
+// 方案A：收位纯数值与状态色
+const getClosePosStyle = (val?: number) => {
+  if (val === undefined || isNaN(val)) return 'text-zinc-500';
+  if (val >= 80) return 'text-emerald-400 font-bold'; // >= 80% 翠绿高亮 (高位强势)
+  if (val >= 60) return 'text-emerald-300 font-semibold'; // 60~80% 偏强多头
+  if (val >= 40) return 'text-zinc-300 font-medium'; // 40~60% 中位均衡
+  if (val >= 20) return 'text-amber-400 font-medium'; // 20~40% 偏弱
+  return 'text-rose-400 font-bold'; // <= 20% 暗红 (低位弱势)
+};
+
+const getClosePosTag = (val?: number) => {
+  if (val === undefined || isNaN(val)) return '--';
+  if (val >= 80) return '高位';
+  if (val >= 60) return '偏强';
+  if (val >= 40) return '中位';
+  if (val >= 20) return '偏弱';
+  return '低位';
 };
 
 export default function MonitoringAssistant({ 
@@ -505,12 +528,29 @@ export default function MonitoringAssistant({
       }
     }
 
+    // 动态计算 当前K线高低价与收位 (方案 A)
+    let currentHigh = item.high || currentPrice;
+    let currentLow = item.low || currentPrice;
+    if (currentPrice > 0) {
+      if (currentHigh <= 0 || currentPrice > currentHigh) currentHigh = currentPrice;
+      if (currentLow <= 0 || currentPrice < currentLow) currentLow = currentPrice;
+    }
+    let closePos = item.closePos;
+    if (currentHigh > currentLow && currentPrice > 0) {
+      closePos = Math.min(100, Math.max(0, ((currentPrice - currentLow) / (currentHigh - currentLow)) * 100));
+    } else if (closePos === undefined) {
+      closePos = 50.0;
+    }
+
     return {
       currentPrice,
       openPrice,
       standardChange,
       highGain,
       effectiveChange,
+      high: currentHigh,
+      low: currentLow,
+      closePos,
       fundingRate: fundingRate !== undefined ? fundingRate : 0,
       settlementCycle: settlementCycle || '8h',
       listingOpen: item.listingOpen || 0,
@@ -1148,13 +1188,13 @@ export default function MonitoringAssistant({
         {/* Module Content */}
         {!isCollapsed && (
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse min-w-[760px]">
+            <table className="w-full text-left border-collapse min-w-[880px]">
               <thead>
-                <tr className="bg-white/[0.02] text-[12px] text-gray-400 uppercase font-bold tracking-wider border-b border-white/5">
-                  <th className="px-4 py-3 text-left w-[18%]">{t.tableSymbol}</th>
-                  <th className="px-3 py-3 text-right w-[13%]">{t.tablePrice}</th>
-                  <th className="px-3 py-3 text-right w-[13%]">{is24h ? '24h开盘价' : t.tableOpenPrice}</th>
-                  <th className="px-3 py-3 text-right w-[16%]">
+                <tr className="bg-white/[0.02] text-[13px] text-gray-400 uppercase font-bold tracking-wider border-b border-white/5">
+                  <th className="px-3 py-3 text-left w-[10%]">{t.tableSymbol}</th>
+                  <th className="px-2 py-3 text-right w-[10%]">{t.tablePrice}</th>
+                  <th className="px-2 py-3 text-right w-[10%]">{is24h ? '24h开盘价' : t.tableOpenPrice}</th>
+                  <th className="px-2 py-3 text-right w-[16%]">
                     <div className="flex items-center justify-end gap-1">
                       <span>{t.tableExtremes}</span>
                       <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-purple-500/20 text-purple-300">
@@ -1162,8 +1202,8 @@ export default function MonitoringAssistant({
                       </span>
                     </div>
                   </th>
-                  <th className="px-3 py-3 text-center w-[13%]">{t.tableFundingCycle}</th>
-                  <th className="px-3 py-3 text-right w-[13%]">
+                  <th className="px-2 py-3 text-center w-[11%]">{t.tableFundingCycle}</th>
+                  <th className="px-2 py-3 text-right w-[13%]">
                     <div className="flex items-center justify-end gap-1" title={is24h ? '24小时总成交额' : `当前未完结15m成交额 / 前${volumeKCount}根完整K线最低成交额比值`}>
                       <span>{is24h ? '24h成交额' : t.table15mVol}</span>
                       {!is24h && (
@@ -1173,7 +1213,15 @@ export default function MonitoringAssistant({
                       )}
                     </div>
                   </th>
-                  <th className="px-4 py-3 text-right w-[14%]">
+                  <th className="px-2 py-3 text-right w-[9%]">
+                    <div className="flex items-center justify-end gap-1 cursor-help" title="收位：当前价在整根当前未完结K线高低区间的百分位置&#10;公式：(当前价 - 最低价) ÷ (最高价 - 最低价) × 100%">
+                      <span>收位</span>
+                      <span className="text-[10px] font-normal px-1 py-0.5 rounded bg-sky-500/20 text-sky-300 font-mono">
+                        K线位
+                      </span>
+                    </div>
+                  </th>
+                  <th className="px-3 py-3 text-right w-[21%]">
                     <div className="flex items-center justify-end gap-1 flex-wrap">
                       <span>
                         {valueType === 'amplitude'
@@ -1247,7 +1295,7 @@ export default function MonitoringAssistant({
                         onClick={() => handleRowClick(item.symbol)}
                       >
                         {/* 1. 币种 */}
-                        <td className="px-4 py-3 text-left">
+                        <td className="px-3 py-3 text-left">
                           <div className="flex items-center">
                             <span className={`font-bold text-[18px] sm:text-[20px] ${
                               isHolding 
@@ -1257,25 +1305,25 @@ export default function MonitoringAssistant({
                               {item.symbol.replace('USDT', '')}
                             </span>
                             {isHolding && (
-                              <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
-                                持仓中
+                              <span className="ml-1.5 text-[10px] font-bold px-1.5 py-0.5 bg-[#d946ef]/20 text-[#d946ef] border border-[#d946ef]/40 rounded shadow-sm shrink-0 whitespace-nowrap">
+                                持仓
                               </span>
                             )}
                           </div>
                         </td>
 
                         {/* 2. 推送当前价 */}
-                        <td className="px-3 py-3 text-right font-mono text-[15px] sm:text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
+                        <td className="px-2 py-3 text-right font-mono text-[15px] sm:text-[16px] font-bold text-zinc-100 group-hover:text-white transition-colors">
                           {formatPriceVal(data.currentPrice)}
                         </td>
 
                         {/* 3. 周期开盘价 */}
-                        <td className="px-3 py-3 text-right font-mono text-[14px] sm:text-[15px] font-medium text-zinc-400">
+                        <td className="px-2 py-3 text-right font-mono text-[14px] sm:text-[15px] font-medium text-zinc-400">
                           {formatPriceVal(data.openPrice)}
                         </td>
 
                         {/* 4. 上线开盘 / 历史最高 / 历史最低 与 后出极值标记 */}
-                        <td className="px-3 py-2 text-right">
+                        <td className="px-2 py-2 text-right">
                           <div className="flex flex-col items-end gap-0.5 font-mono text-[12px] sm:text-[13px] leading-tight">
                             <div className="flex items-center gap-1.5 justify-end" title="币对上线首根K线开盘价">
                               <span className="text-[10px] text-zinc-500 font-sans font-medium">上线开盘</span>
@@ -1319,7 +1367,7 @@ export default function MonitoringAssistant({
                         </td>
 
                         {/* 5. 资金费率 (周期) */}
-                        <td className="px-3 py-3 text-center">
+                        <td className="px-2 py-3 text-center">
                           <div className="inline-flex items-center gap-1 font-mono text-[13px] sm:text-[14px]">
                             <span className={`font-bold ${data.fundingRate > 0 ? 'text-amber-300' : data.fundingRate < 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
                               {data.fundingRate > 0 ? '+' : ''}{data.fundingRate.toFixed(4)}%
@@ -1331,7 +1379,7 @@ export default function MonitoringAssistant({
                         </td>
 
                         {/* 6. 成交额 & 量比 */}
-                        <td className={`px-3 py-3 text-right font-mono ${shouldHighlight ? 'text-emerald-300' : 'text-emerald-400'}`}>
+                        <td className={`px-2 py-3 text-right font-mono ${shouldHighlight ? 'text-emerald-300' : 'text-emerald-400'}`}>
                           <div className="text-[14px] sm:text-[16px] font-bold leading-tight">
                             {formatVolume(is24h ? (item.volume24h || 0) : data.currentVolume)}
                           </div>
@@ -1356,8 +1404,23 @@ export default function MonitoringAssistant({
                           )}
                         </td>
 
-                        {/* 7. 涨跌幅 / 振幅 & 前K最大涨幅 */}
-                        <td className="px-4 py-3 text-right">
+                        {/* 7. 收位 (方案 A: 纯数值 + 状态色) */}
+                        <td className="px-2 py-3 text-right font-mono">
+                          <div 
+                            className="flex flex-col items-end justify-center cursor-help"
+                            title={`当前价在K线中的位置 (收位)\n当前价: ${formatPriceVal(data.currentPrice)}\n最高价: ${formatPriceVal(data.high)}\n最低价: ${formatPriceVal(data.low)}\n收位: ${data.closePos.toFixed(2)}% (${data.closePos >= 80 ? '高位极强' : data.closePos >= 60 ? '偏强多头' : data.closePos >= 40 ? '中位均衡' : data.closePos >= 20 ? '偏弱下探' : '低位探底'})\n计算公式: (现价 - 最低) ÷ (最高 - 最低) × 100%`}
+                          >
+                            <span className={`text-[15px] sm:text-[16px] leading-tight ${getClosePosStyle(data.closePos)}`}>
+                              {data.closePos.toFixed(1)}%
+                            </span>
+                            <span className="text-[10px] text-zinc-500 font-sans leading-none mt-0.5">
+                              {getClosePosTag(data.closePos)}
+                            </span>
+                          </div>
+                        </td>
+
+                        {/* 8. 涨跌幅 / 振幅 & 前K最大涨幅 */}
+                        <td className="px-3 py-3 text-right">
                           <div className="flex flex-col items-end">
                             <div className={`flex items-center justify-end gap-1 ${mainValueColor} font-bold text-[18px] sm:text-[20px] font-mono leading-tight`}>
                               {mainValueText}
@@ -1386,7 +1449,7 @@ export default function MonitoringAssistant({
                 </AnimatePresence>
                 {(!dataList || dataList.length === 0) && (
                   <tr>
-                    <td colSpan={7} className="px-4 py-12 text-center text-gray-600 italic text-[16px] font-medium">
+                    <td colSpan={8} className="px-4 py-12 text-center text-gray-600 italic text-[16px] font-medium">
                       {t.waitingScan}
                     </td>
                   </tr>

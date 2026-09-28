@@ -805,6 +805,15 @@ try {
   }
 } catch (e) {}
 
+// Helper to calculate close position (收位: percentage within current incomplete candle high-low range)
+const calcClosePos = (price: number, high: number, low: number): number => {
+  if (high > low && price > 0) {
+    const pos = ((price - low) / (high - low)) * 100;
+    return Math.min(100, Math.max(0, pos));
+  }
+  return 50.0;
+};
+
 // 依据最新实时行情，对 15m 在榜币对的成交额、涨跌幅、振幅、24h成交额等实时数据动态更新
 const getLiveEnrichedScanResults15m = () => {
   let baseResults = scanResults;
@@ -888,6 +897,9 @@ const getLiveEnrichedScanResults15m = () => {
     const openPrice = kline ? kline.open : item.openPrice;
     const change = kline ? kline.change : item.change;
     const highChange = (price > 0 && openPrice > 0) ? ((price - openPrice) / price) * 100 : (kline ? kline.highChange : (item.highChange || change));
+    const currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
+    const currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
+    const closePos = calcClosePos(price, currentHigh, currentLow);
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
@@ -898,6 +910,9 @@ const getLiveEnrichedScanResults15m = () => {
       highChange,
       change24h: chg24h !== 0 ? chg24h : item.change24h,
       amplitude: kline ? kline.amplitude : item.amplitude,
+      high: currentHigh,
+      low: currentLow,
+      closePos,
       fundingRate: fundingInfo?.fundingRate ?? item.fundingRate,
       settlementCycle: fundingInfo?.settlementCycle ?? item.settlementCycle,
       listingOpen: extremes.listingOpen,
@@ -923,6 +938,9 @@ const getLiveEnrichedScanResults15m = () => {
     const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
     const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
     const kline = marketDataManager.getSymbol15mKline(item.symbol, config.volumeKCount || 12, config.gainKCount || 6);
+    const currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
+    const currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
+    const closePos = calcClosePos(price, currentHigh, currentLow);
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
@@ -933,6 +951,9 @@ const getLiveEnrichedScanResults15m = () => {
       highChange: (price > 0 && kline && kline.open > 0) ? ((price - kline.open) / price) * 100 : (kline ? kline.highChange : (item.highChange || item.change)),
       change24h: chg24h !== 0 ? chg24h : item.change24h,
       amplitude: kline ? kline.amplitude : item.amplitude,
+      high: currentHigh,
+      low: currentLow,
+      closePos,
       fundingRate: fundingInfo?.fundingRate ?? item.fundingRate,
       settlementCycle: fundingInfo?.settlementCycle ?? item.settlementCycle,
       listingOpen: extremes.listingOpen,
@@ -1101,16 +1122,19 @@ const getFullResults4h = () => {
     let amplitude = kline ? kline.amplitude : item.amplitude;
     let openPrice = kline ? kline.open : item.openPrice;
     let vol4h = kline ? kline.volume : item.volume15m;
+    let currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
+    let currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
 
     if (kline && kline.open > 0 && price > 0) {
       change = ((price - kline.open) / kline.open) * 100;
-      const currentHigh = Math.max(kline.high, price);
-      const currentLow = Math.min(kline.low, price);
+      currentHigh = Math.max(kline.high, price);
+      currentLow = kline.low > 0 ? Math.min(kline.low, price) : price;
       if (currentLow > 0) {
         amplitude = ((currentHigh - currentLow) / currentLow) * 100;
       }
     }
 
+    const closePos = calcClosePos(price, currentHigh, currentLow);
     const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : change;
     const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
 
@@ -1127,6 +1151,9 @@ const getFullResults4h = () => {
       highChange: highChange,
       change24h: chg24h !== 0 ? chg24h : item.change24h,
       amplitude: amplitude,
+      high: currentHigh,
+      low: currentLow,
+      closePos,
       fundingRate: fundingInfo.fundingRate,
       fundingIntervalHours: fundingInfo.fundingIntervalHours,
       settlementCycle: fundingInfo.settlementCycle,
@@ -1155,6 +1182,9 @@ const getFullResults4h = () => {
     const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
     const openPrice = kline ? kline.open : (item.openPrice || 0);
     const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : (spike ? spike.change1h : item.change);
+    const currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
+    const currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
+    const closePos = calcClosePos(price, currentHigh, currentLow);
     return {
       ...item,
       ratio: spike ? spike.ratio : item.ratio,
@@ -1164,6 +1194,9 @@ const getFullResults4h = () => {
       highChange,
       openPrice,
       lastPrice: price,
+      high: currentHigh,
+      low: currentLow,
+      closePos,
       fundingRate: fundingInfo.fundingRate,
       fundingIntervalHours: fundingInfo.fundingIntervalHours,
       settlementCycle: fundingInfo.settlementCycle,
@@ -1188,6 +1221,9 @@ const getFullResults4h = () => {
     const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
     const openPrice = kline ? kline.open : (item.openPrice || 0);
     const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : chg24h;
+    const currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
+    const currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
+    const closePos = calcClosePos(price, currentHigh, currentLow);
     return {
       ...item,
       volume24h: vol24h > 0 ? vol24h : item.volume24h,
@@ -1195,6 +1231,9 @@ const getFullResults4h = () => {
       lastPrice: price > 0 ? price : item.lastPrice,
       change24h: chg24h !== 0 ? chg24h : item.change24h,
       highChange,
+      high: currentHigh,
+      low: currentLow,
+      closePos,
       fundingRate: fundingInfo.fundingRate,
       fundingIntervalHours: fundingInfo.fundingIntervalHours,
       settlementCycle: fundingInfo.settlementCycle,
