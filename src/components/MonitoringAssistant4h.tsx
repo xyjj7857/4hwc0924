@@ -174,6 +174,7 @@ interface MonitoringAssistant4hProps {
   onSwitchToTrade: () => void;
   isMuted?: boolean;
   positions?: Position[];
+  exchangeInfo?: any;
 }
 
 const TRANSLATIONS = {
@@ -271,7 +272,8 @@ export default function MonitoringAssistant4h({
   addLog,
   onSwitchToTrade,
   isMuted = false,
-  positions = []
+  positions = [],
+  exchangeInfo
 }: MonitoringAssistant4hProps) {
   const t = TRANSLATIONS;
   const { 
@@ -307,6 +309,16 @@ export default function MonitoringAssistant4h({
     gainKCount: 6,
   });
 
+  const saveDbSettings = useCallback((patch: Record<string, any>) => {
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    }).catch(err => {
+      console.warn('Failed to sync 4H settings to SQLite database:', err);
+    });
+  }, []);
+
   // 自定义 量k 数量 (默认 12 条，即当前未完结4H K线前的12根完整K线最低成交额)
   const [volumeKCount, setVolumeKCount] = useState<number>(() => {
     try {
@@ -331,13 +343,14 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.setItem('monitor_4h_volume_k_count', String(clamped));
     } catch {}
+    saveDbSettings({ monitor_4h_volume_k_count: clamped });
     setConfig(prev => ({ ...prev, volumeKCount: clamped }));
     fetch("/api/monitoring-4h/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ volumeKCount: clamped })
     }).catch(() => {});
-  }, []);
+  }, [saveDbSettings]);
 
   const handleUpdateGainKCount = useCallback((val: number) => {
     const clamped = Math.max(1, Math.min(30, val));
@@ -345,13 +358,14 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.setItem('monitor_4h_gain_k_count', String(clamped));
     } catch {}
+    saveDbSettings({ monitor_4h_gain_k_count: clamped });
     setConfig(prev => ({ ...prev, gainKCount: clamped }));
     fetch("/api/monitoring-4h/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ gainKCount: clamped })
     }).catch(() => {});
-  }, []);
+  }, [saveDbSettings]);
 
   const [fourHourBoards, setFourHourBoards] = useState<FourHourBoards>({
     gainers: [],
@@ -420,16 +434,82 @@ export default function MonitoringAssistant4h({
     }
   });
 
+  // 从本地数据库 (SQLite settings 表) 初始化恢复所有 4H 相关参数配置
+  useEffect(() => {
+    let active = true;
+    fetch('/api/settings')
+      .then(res => res.ok ? res.json() : null)
+      .then((settings: Record<string, any> | null) => {
+        if (!active || !settings) return;
+        if (settings.monitoring4h_filter_settings && typeof settings.monitoring4h_filter_settings === 'object') {
+          setFilterSettings(settings.monitoring4h_filter_settings);
+          try { localStorage.setItem('monitoring4h_filter_settings', JSON.stringify(settings.monitoring4h_filter_settings)); } catch {}
+        }
+        if (settings.monitoring4h_order_settings && typeof settings.monitoring4h_order_settings === 'object') {
+          setOrderSettings({
+            ...DEFAULT_ORDER_SETTINGS_4H,
+            ...settings.monitoring4h_order_settings,
+            maxPositionCount: settings.monitoring4h_order_settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
+          });
+          try { localStorage.setItem('monitoring4h_order_settings', JSON.stringify(settings.monitoring4h_order_settings)); } catch {}
+        }
+        if (settings.monitoring4h_auto_trading !== undefined) {
+          const autoState = Boolean(settings.monitoring4h_auto_trading);
+          setIsAutoTradingActive(autoState);
+          try { localStorage.setItem('monitoring4h_auto_trading', String(autoState)); } catch {}
+        }
+        if (typeof settings.monitor_4h_volume_k_count === 'number') {
+          const val = Math.max(1, Math.min(30, settings.monitor_4h_volume_k_count));
+          setVolumeKCount(val);
+          try { localStorage.setItem('monitor_4h_volume_k_count', String(val)); } catch {}
+        }
+        if (typeof settings.monitor_4h_gain_k_count === 'number') {
+          const val = Math.max(1, Math.min(30, settings.monitor_4h_gain_k_count));
+          setGainKCount(val);
+          try { localStorage.setItem('monitor_4h_gain_k_count', String(val)); } catch {}
+        }
+        if (settings.monitor_4h_gain_mode === 'standard' || settings.monitor_4h_gain_mode === 'high') {
+          setGainMode(settings.monitor_4h_gain_mode);
+          try { localStorage.setItem('monitor_4h_gain_mode', settings.monitor_4h_gain_mode); } catch {}
+        }
+        if (settings.monitor_4h_sort_scheme === 'fixed' || settings.monitor_4h_sort_scheme === 'dynamic') {
+          setSortScheme(settings.monitor_4h_sort_scheme);
+          try { localStorage.setItem('monitor_4h_sort_scheme', settings.monitor_4h_sort_scheme); } catch {}
+        }
+        if (settings.area1_collapsed_4h !== undefined) {
+          const a1Col = Boolean(settings.area1_collapsed_4h);
+          setIsArea1Collapsed(a1Col);
+          try { localStorage.setItem('area1_collapsed_4h', String(a1Col)); } catch {}
+        }
+        if (settings.area2_collapsed_modules_4h && typeof settings.area2_collapsed_modules_4h === 'object') {
+          setCollapsedModules(settings.area2_collapsed_modules_4h);
+          try { localStorage.setItem('area2_collapsed_modules_4h', JSON.stringify(settings.area2_collapsed_modules_4h)); } catch {}
+        }
+        if (settings.monitoring4h_filtered_board_collapsed !== undefined) {
+          const fbCol = Boolean(settings.monitoring4h_filtered_board_collapsed);
+          setIsFilteredBoardCollapsed(fbCol);
+          try { localStorage.setItem('monitoring4h_filtered_board_collapsed', String(fbCol)); } catch {}
+        }
+      })
+      .catch(err => {
+        console.warn('Failed to load 4H settings from DB:', err);
+      });
+    return () => { active = false; };
+  }, []);
+
   const handleToggleAutoTrading = () => {
     setIsAutoTradingActive(prev => {
       const next = !prev;
       try {
         localStorage.setItem('monitoring4h_auto_trading', String(next));
       } catch {}
+      saveDbSettings({ monitoring4h_auto_trading: next });
       if (next) {
-        addLog?.('[自动交易] 已启动 4H 自动交易监控，交易规则就绪后将全自动执行', 'SUCCESS');
+        const sm = filterSettings.scanMoment || { hour: 3, minute: 58, second: 30 };
+        const maxPos = orderSettings.maxPositionCount?.enabled !== false ? (orderSettings.maxPositionCount?.value || '10') : '10';
+        addLog?.(`[4H自动策略] 🚀 4H 自动交易策略已启动！将在周期绝对时刻 (${sm.hour}h ${sm.minute}m ${sm.second}s) 自动执行筛选建仓 (最大持仓限制: ${maxPos}) 并已存入本地数据库`, 'SUCCESS');
       } else {
-        addLog?.('[自动交易] 已停止 4H 自动交易监控', 'INFO');
+        addLog?.('[4H自动策略] ⏸️ 4H 自动交易策略已停止，不再执行自动开单 (状态已存入本地数据库)', 'INFO');
       }
       return next;
     });
@@ -440,7 +520,8 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.setItem('monitoring4h_filter_settings', JSON.stringify(newSettings));
     } catch {}
-    addLog?.('[筛选设置] 已更新 4H 榜单筛选条件', 'INFO');
+    saveDbSettings({ monitoring4h_filter_settings: newSettings });
+    addLog?.('[筛选设置] 已更新 4H 榜单筛选条件并保存至本地数据库', 'INFO');
   };
 
   const handleSaveOrderSettings = (newSettings: OrderSettings4h) => {
@@ -448,7 +529,8 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.setItem('monitoring4h_order_settings', JSON.stringify(newSettings));
     } catch {}
-    addLog?.('[下单设置] 已更新 4H 下单配置参数', 'INFO');
+    saveDbSettings({ monitoring4h_order_settings: newSettings });
+    addLog?.('[下单设置] 已更新 4H 下单配置参数并保存至本地数据库', 'INFO');
   };
 
   // 统计是否有任何激活的过滤条件
@@ -515,7 +597,8 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.setItem('area1_collapsed_4h', String(isArea1Collapsed));
     } catch {}
-  }, [isArea1Collapsed]);
+    saveDbSettings({ area1_collapsed_4h: isArea1Collapsed });
+  }, [isArea1Collapsed, saveDbSettings]);
 
   // 区域2各模块向上折叠状态
   const [collapsedModules, setCollapsedModules] = useState<Record<string, boolean>>(() => {
@@ -543,6 +626,7 @@ export default function MonitoringAssistant4h({
       try {
         localStorage.setItem('monitoring4h_filtered_board_collapsed', String(next));
       } catch {}
+      saveDbSettings({ monitoring4h_filtered_board_collapsed: next });
       return next;
     });
   };
@@ -553,6 +637,7 @@ export default function MonitoringAssistant4h({
       try {
         localStorage.setItem('area2_collapsed_modules_4h', JSON.stringify(updated));
       } catch {}
+      saveDbSettings({ area2_collapsed_modules_4h: updated });
       return updated;
     });
   };
@@ -570,6 +655,7 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.setItem('area2_collapsed_modules_4h', JSON.stringify(all));
     } catch {}
+    saveDbSettings({ area2_collapsed_modules_4h: all });
   };
 
   const expandAllModules = () => {
@@ -577,6 +663,7 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.removeItem('area2_collapsed_modules_4h');
     } catch {}
+    saveDbSettings({ area2_collapsed_modules_4h: {} });
   };
 
   // 涨跌幅计算模式：'standard' (常规模式：基准为4H开盘价) 或 'high' (高涨幅模式：基准为当前价)
@@ -596,7 +683,8 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.setItem('monitor_4h_gain_mode', mode);
     } catch {}
-  }, []);
+    saveDbSettings({ monitor_4h_gain_mode: mode });
+  }, [saveDbSettings]);
 
   // 排序方案状态：方案1、固定（默认，排序不发生变化） | 方案2、排序（随涨跌幅实时重排序）
   const [sortScheme, setSortScheme] = useState<'fixed' | 'dynamic'>(() => {
@@ -612,7 +700,8 @@ export default function MonitoringAssistant4h({
     try {
       localStorage.setItem('monitor_4h_sort_scheme', scheme);
     } catch {}
-  }, []);
+    saveDbSettings({ monitor_4h_sort_scheme: scheme });
+  }, [saveDbSettings]);
 
   // 价格通用格式化辅助函数
   const formatPriceVal = useCallback((price?: number | null) => {
@@ -988,6 +1077,421 @@ export default function MonitoringAssistant4h({
     });
   }, [allCandidateSymbols4h, hasActiveFilters, checkItemMatchesFilters, getSymbolDisplayData]);
 
+  // --- 4H 自动交易策略执行引擎 ---
+  const [localExchangeInfo, setLocalExchangeInfo] = useState<any>(null);
+  useEffect(() => {
+    if (!exchangeInfo || !exchangeInfo.symbols) {
+      fetch('/api/binance-proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          endpoint: '/fapi/v1/exchangeInfo',
+          apiKey: apiConfig.apiKey,
+          apiSecret: apiConfig.apiSecret
+        })
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.symbols) {
+          setLocalExchangeInfo(data);
+        }
+      })
+      .catch(() => {});
+    }
+  }, [exchangeInfo, apiConfig.apiKey, apiConfig.apiSecret]);
+
+  const activeExchangeInfo = exchangeInfo?.symbols ? exchangeInfo : localExchangeInfo;
+
+  const getSymbolExchangeInfo = useCallback((sym: string) => {
+    if (!activeExchangeInfo || !activeExchangeInfo.symbols) return null;
+    return activeExchangeInfo.symbols.find((s: any) => s.symbol === sym || s.symbol === sym.toUpperCase());
+  }, [activeExchangeInfo]);
+
+  const formatPriceForSymbol = useCallback((sym: string, price: number) => {
+    if (price == null || isNaN(price)) return '0';
+    const info = getSymbolExchangeInfo(sym);
+    if (!info) return price.toFixed(4);
+
+    const priceFilter = info.filters?.find((f: any) => f.filterType === 'PRICE_FILTER');
+    if (priceFilter && parseFloat(priceFilter.tickSize) > 0) {
+      const tickSize = parseFloat(priceFilter.tickSize);
+      const roundedPrice = Math.round(price / tickSize) * tickSize;
+      return roundedPrice.toFixed(info.pricePrecision || 4);
+    }
+    return price.toFixed(info.pricePrecision || 4);
+  }, [getSymbolExchangeInfo]);
+
+  const formatQtyForSymbol = useCallback((sym: string, qty: number) => {
+    if (qty == null || isNaN(qty)) return '0';
+    const info = getSymbolExchangeInfo(sym);
+    if (!info) return qty.toFixed(2);
+
+    const lotSize = info.filters?.find((f: any) => f.filterType === 'LOT_SIZE');
+    if (lotSize && parseFloat(lotSize.stepSize) > 0) {
+      const stepSize = parseFloat(lotSize.stepSize);
+      const roundedQty = Math.floor(qty / stepSize) * stepSize;
+      return roundedQty.toFixed(info.quantityPrecision || 2);
+    }
+    return qty.toFixed(info.quantityPrecision || 2);
+  }, [getSymbolExchangeInfo]);
+
+  const positionsRef = useRef<Position[]>(positions || []);
+  useEffect(() => {
+    positionsRef.current = positions || [];
+  }, [positions]);
+
+  const orderSettingsRef = useRef<OrderSettings4h>(orderSettings);
+  useEffect(() => {
+    orderSettingsRef.current = orderSettings;
+  }, [orderSettings]);
+
+  const filterSettingsRef = useRef<FilterSettings4h>(filterSettings);
+  useEffect(() => {
+    filterSettingsRef.current = filterSettings;
+  }, [filterSettings]);
+
+  const allCandidateSymbols4hRef = useRef<SymbolData[]>(allCandidateSymbols4h);
+  useEffect(() => {
+    allCandidateSymbols4hRef.current = allCandidateSymbols4h;
+  }, [allCandidateSymbols4h]);
+
+  const checkItemMatchesFiltersRef = useRef(checkItemMatchesFilters);
+  useEffect(() => {
+    checkItemMatchesFiltersRef.current = checkItemMatchesFilters;
+  }, [checkItemMatchesFilters]);
+
+  const getSymbolDisplayDataRef = useRef(getSymbolDisplayData);
+  useEffect(() => {
+    getSymbolDisplayDataRef.current = getSymbolDisplayData;
+  }, [getSymbolDisplayData]);
+
+  const lastAutoExecutedCycleRef = useRef<number>(-1);
+  const isExecutingAutoTradingRef = useRef<boolean>(false);
+
+  const executeAutoTradingBatch = useCallback(async () => {
+    if (isExecutingAutoTradingRef.current) return;
+    if (!isConnected || !apiConfig?.apiKey || !apiConfig?.apiSecret) {
+      addLog?.('[4H自动策略] ⚠️ 触发自动交易，但当前未连接币安 API，已跳过执行', 'WARN');
+      return;
+    }
+
+    isExecutingAutoTradingRef.current = true;
+    const currentOrderSettings = orderSettingsRef.current;
+    const currentPositions = positionsRef.current || [];
+
+    addLog?.('[4H自动策略] 🚀 4H 绝对周期时刻触发，开始执行自动筛选与建仓策略...', 'INFO');
+
+    try {
+      // 第一步：按照筛选设置中4小时绝对周期扫描时刻扫描出满足条件的币对
+      const candidatesPool = allCandidateSymbols4hRef.current || [];
+      const matchedCandidates = candidatesPool
+        .filter(item => checkItemMatchesFiltersRef.current(item))
+        .sort((a, b) => {
+          const changeA = getSymbolDisplayDataRef.current(a).effectiveChange;
+          const changeB = getSymbolDisplayDataRef.current(b).effectiveChange;
+          return changeB - changeA;
+        });
+
+      addLog?.(
+        `[4H自动策略] 第一步：共筛选出 ${matchedCandidates.length} 个达标币对${
+          matchedCandidates.length > 0 ? ': ' + matchedCandidates.map(c => c.symbol).join(', ') : ' (无满足筛选条件的币对)'
+        }`,
+        matchedCandidates.length > 0 ? 'SUCCESS' : 'INFO'
+      );
+
+      if (matchedCandidates.length === 0) {
+        addLog?.('[4H自动策略] 本周期无满足筛选条件的币对，本次策略执行完毕', 'INFO');
+        return;
+      }
+
+      // 第二步：判断仓单是否达到下单设置中的最大持仓单数量？如果达到，则不开单。如果未达到则判断最多可以开几个。
+      const maxPositionsLimit = currentOrderSettings.maxPositionCount?.enabled !== false
+        ? (parseInt(currentOrderSettings.maxPositionCount?.value || '10', 10) || 10)
+        : 10;
+      
+      const currentActiveCount = currentPositions.filter(p => p.amount > 0).length;
+
+      if (currentActiveCount >= maxPositionsLimit) {
+        addLog?.(
+          `[4H自动策略] 第二步：当前持仓单数 (${currentActiveCount}) 已达到下单设置中最大持仓单数量上限 (${maxPositionsLimit})，本次不开单`,
+          'WARN'
+        );
+        return;
+      }
+
+      const availableSlots = maxPositionsLimit - currentActiveCount;
+      addLog?.(
+        `[4H自动策略] 第二步：当前持仓 ${currentActiveCount}/${maxPositionsLimit}，本次最多可开 ${availableSlots} 个新仓位`,
+        'INFO'
+      );
+
+      // 第三步：逐一对于满足筛选条件的币对还要判断是否已经有持仓单，如果有则不开单
+      let openedCount = 0;
+
+      for (const item of matchedCandidates) {
+        if (openedCount >= availableSlots) {
+          addLog?.(`[4H自动策略] 本次新开仓配额 (${availableSlots}) 已用完，停止后续开单`, 'INFO');
+          break;
+        }
+
+        const sym = item.symbol;
+        const alreadyHolding = currentPositions.some(p => p.symbol === sym && p.amount > 0);
+        if (alreadyHolding) {
+          addLog?.(`[4H自动策略] 币对 ${sym} 已经在持仓单中，跳过不开单`, 'INFO');
+          continue;
+        }
+
+        // 获取该币对当前价与 4H 开盘价
+        const displayData = getSymbolDisplayDataRef.current(item);
+        const currentPrice = displayData.currentPrice || item.lastPrice;
+        if (!currentPrice || currentPrice <= 0) {
+          addLog?.(`[4H自动策略] ${sym} 未获取到有效当前价格，跳过`, 'WARN');
+          continue;
+        }
+
+        const base4hOpenPrice = item.openPrice > 0 ? item.openPrice : currentPrice;
+
+        // 1. 设置杠杆
+        const leverage = currentOrderSettings.leverage.enabled 
+          ? (parseInt(currentOrderSettings.leverage.value, 10) || 10)
+          : 10;
+
+        if (currentOrderSettings.leverage.enabled) {
+          try {
+            await fetch('/api/binance-proxy', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                method: 'POST',
+                endpoint: '/fapi/v1/leverage',
+                params: { symbol: sym, leverage },
+                apiKey: apiConfig.apiKey,
+                apiSecret: apiConfig.apiSecret
+              })
+            });
+          } catch (e) {}
+        }
+
+        // 2. 计算下单金额 (USDT)
+        let targetUsdt = 30;
+        if (currentOrderSettings.fixedOrderAmount.enabled) {
+          targetUsdt = parseFloat(currentOrderSettings.fixedOrderAmount.value) || 30;
+        } else if (currentOrderSettings.minOrderAmount.enabled) {
+          targetUsdt = parseFloat(currentOrderSettings.minOrderAmount.value) || 20;
+        }
+        if (currentOrderSettings.minOrderAmount.enabled) {
+          const minVal = parseFloat(currentOrderSettings.minOrderAmount.value) || 0;
+          if (targetUsdt < minVal) targetUsdt = minVal;
+        }
+
+        // 3. 计算下单合约数量并规整 stepSize 精度
+        const rawQty = (targetUsdt * leverage) / currentPrice;
+        const formattedQty = formatQtyForSymbol(sym, rawQty);
+        if (parseFloat(formattedQty) <= 0) {
+          addLog?.(`[4H自动策略] ${sym} 计算下单数量为 0，跳过`, 'WARN');
+          continue;
+        }
+
+        addLog?.(
+          `[4H自动策略] 正在向币安发送市价开仓单: ${sym} 数量: ${formattedQty} (约 ${targetUsdt} USDT, 杠杆: ${leverage}x)...`,
+          'TRADE'
+        );
+
+        let orderData: any = null;
+        let successfulPositionSide = 'BOTH';
+
+        try {
+          const orderRes = await fetch('/api/binance-proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              method: 'POST',
+              endpoint: '/fapi/v1/order',
+              params: {
+                symbol: sym,
+                side: 'BUY',
+                type: 'MARKET',
+                quantity: formattedQty,
+                positionSide: 'BOTH'
+              },
+              apiKey: apiConfig.apiKey,
+              apiSecret: apiConfig.apiSecret
+            })
+          });
+          orderData = await orderRes.json();
+          if (!orderRes.ok) {
+            // 如果 BOTH 报 position side 不匹配，切换为 LONG
+            if (String(orderData?.msg || '').includes('position side')) {
+              const retryRes = await fetch('/api/binance-proxy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  method: 'POST',
+                  endpoint: '/fapi/v1/order',
+                  params: {
+                    symbol: sym,
+                    side: 'BUY',
+                    type: 'MARKET',
+                    quantity: formattedQty,
+                    positionSide: 'LONG'
+                  },
+                  apiKey: apiConfig.apiKey,
+                  apiSecret: apiConfig.apiSecret
+                })
+              });
+              orderData = await retryRes.json();
+              if (retryRes.ok) {
+                successfulPositionSide = 'LONG';
+              }
+            }
+          }
+        } catch (err: any) {
+          addLog?.(`[4H自动策略] ${sym} 开仓网络异常: ${err?.message || err}`, 'ERROR');
+          continue;
+        }
+
+        if (!orderData || (!orderData.orderId && !orderData.clientOrderId)) {
+          addLog?.(`[4H自动策略] ${sym} 开仓失败: ${orderData?.msg || '未知错误'}`, 'ERROR');
+          continue;
+        }
+
+        // 开仓单完全成交后的合约数量
+        const executedQty = parseFloat(orderData.executedQty || formattedQty);
+        const finalQtyStr = formatQtyForSymbol(sym, executedQty);
+        const avgPrice = parseFloat(orderData.avgPrice || currentPrice);
+        addLog?.(
+          `[4H自动策略] ✅ ${sym} 开仓单完全成交成功！数量: ${finalQtyStr} @ ${avgPrice || '市价'}，3秒后自动挂止损与止盈单...`,
+          'SUCCESS'
+        );
+        openedCount++;
+
+        // 开仓单完全成交后 3 秒挂 algo 止损单与 limit 止盈单
+        const slEnabled = currentOrderSettings.stopLossMultiplier.enabled;
+        const tpEnabled = currentOrderSettings.takeProfitMultiplier.enabled;
+        const slMultiplier = parseFloat(currentOrderSettings.stopLossMultiplier.value) || 0.985;
+        const tpMultiplier = parseFloat(currentOrderSettings.takeProfitMultiplier.value) || 1.05;
+
+        setTimeout(async () => {
+          try {
+            // 止损单：algo 止损单（只减仓 reduceOnly: 'true'，满足 tickSize 与 价格精度）
+            if (slEnabled && slMultiplier > 0) {
+              const calculatedSlPrice = base4hOpenPrice * slMultiplier;
+              const finalSlPrice = formatPriceForSymbol(sym, calculatedSlPrice);
+
+              addLog?.(`[4H自动策略-延时3s] 正在提交 ${sym} 算法止损单 (触发价: ${finalSlPrice}, 数量: ${finalQtyStr})...`, 'TRADE');
+
+              const algoRes = await fetch('/api/binance-proxy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  method: 'POST',
+                  endpoint: '/fapi/v1/algoOrder',
+                  params: {
+                    symbol: sym,
+                    side: 'SELL',
+                    positionSide: successfulPositionSide,
+                    quantity: finalQtyStr,
+                    workingType: 'MARK_PRICE',
+                    stopPrice: finalSlPrice,
+                    triggerPrice: finalSlPrice,
+                    algoType: 'CONDITIONAL',
+                    type: 'STOP_MARKET',
+                    reduceOnly: 'true'
+                  },
+                  apiKey: apiConfig.apiKey,
+                  apiSecret: apiConfig.apiSecret
+                })
+              });
+              const algoData = await algoRes.json();
+              if (algoRes.ok && (algoData.algoId || algoData.orderId || algoData.clientAlgoId)) {
+                addLog?.(`[4H自动策略] ✅ ${sym} 算法止损单挂单成功！触发价: ${finalSlPrice} (数量: ${finalQtyStr})`, 'SUCCESS');
+              } else {
+                // 降级为标准 STOP_MARKET
+                const fallbackRes = await fetch('/api/binance-proxy', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    method: 'POST',
+                    endpoint: '/fapi/v1/order',
+                    params: {
+                      symbol: sym,
+                      side: 'SELL',
+                      positionSide: successfulPositionSide,
+                      type: 'STOP_MARKET',
+                      stopPrice: finalSlPrice,
+                      quantity: finalQtyStr,
+                      workingType: 'MARK_PRICE',
+                      reduceOnly: 'true'
+                    },
+                    apiKey: apiConfig.apiKey,
+                    apiSecret: apiConfig.apiSecret
+                  })
+                });
+                const fallbackData = await fallbackRes.json();
+                if (fallbackRes.ok && fallbackData.orderId) {
+                  addLog?.(`[4H自动策略] ✅ ${sym} 标准止损单挂单成功！触发价: ${finalSlPrice} (数量: ${finalQtyStr})`, 'SUCCESS');
+                } else {
+                  addLog?.(`[4H自动策略] ⚠️ ${sym} 止损单挂单反馈: ${fallbackData.msg || algoData.msg || '未知错误'}`, 'ERROR');
+                }
+              }
+            }
+
+            // 止盈单：limit 止盈单（只减仓 reduceOnly: 'true'，满足 tickSize 与 价格精度）
+            if (tpEnabled && tpMultiplier > 0) {
+              const calculatedTpPrice = base4hOpenPrice * tpMultiplier;
+              const finalTpPrice = formatPriceForSymbol(sym, calculatedTpPrice);
+
+              addLog?.(`[4H自动策略-延时3s] 正在提交 ${sym} limit 止盈单 (限价: ${finalTpPrice}, 数量: ${finalQtyStr})...`, 'TRADE');
+
+              const tpRes = await fetch('/api/binance-proxy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  method: 'POST',
+                  endpoint: '/fapi/v1/order',
+                  params: {
+                    symbol: sym,
+                    side: 'SELL',
+                    positionSide: successfulPositionSide,
+                    type: 'LIMIT',
+                    timeInForce: 'GTC',
+                    price: finalTpPrice,
+                    quantity: finalQtyStr,
+                    reduceOnly: 'true'
+                  },
+                  apiKey: apiConfig.apiKey,
+                  apiSecret: apiConfig.apiSecret
+                })
+              });
+              const tpData = await tpRes.json();
+              if (tpRes.ok && tpData.orderId) {
+                addLog?.(`[4H自动策略] ✅ ${sym} limit 止盈单挂单成功！限价: ${finalTpPrice} (数量: ${finalQtyStr})`, 'SUCCESS');
+              } else {
+                addLog?.(`[4H自动策略] ⚠️ ${sym} limit 止盈挂单反馈: ${tpData.msg || '未知错误'}`, 'ERROR');
+              }
+            }
+          } catch (delayErr: any) {
+            addLog?.(`[4H自动策略] 3秒延时挂单异常: ${delayErr?.message || delayErr}`, 'ERROR');
+          }
+        }, 3000);
+      }
+    } finally {
+      isExecutingAutoTradingRef.current = false;
+    }
+  }, [
+    isConnected,
+    apiConfig,
+    formatPriceForSymbol,
+    formatQtyForSymbol,
+    addLog
+  ]);
+
+  const executeAutoTradingBatchRef = useRef(executeAutoTradingBatch);
+  useEffect(() => {
+    executeAutoTradingBatchRef.current = executeAutoTradingBatch;
+    (window as any).runAutoTrading4h = executeAutoTradingBatch;
+  }, [executeAutoTradingBatch]);
+
   // Audio state
   const [audioFiles, setAudioFiles] = useState<{ gain: string | null; loss: string | null; amp: string | null; spike: string | null }>({
     gain: null,
@@ -1348,12 +1852,24 @@ export default function MonitoringAssistant4h({
       const m = Math.floor((diff % 3600) / 60);
       const s = diff % 60;
       setCycleCountdown(`${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`);
+
+      // 4H 自动交易定时触发检测（当开启自动后，在筛选设置的绝对时刻自动执行）
+      if (isAutoTradingActive) {
+        const sm = filterSettings.scanMoment || { hour: 3, minute: 58, second: 30 };
+        const scanTargetSec = (sm.hour * 3600) + (sm.minute * 60) + sm.second;
+        const cycleId = Math.floor(now.getTime() / (4 * 3600 * 1000));
+
+        if (totalSecondsInCycle === scanTargetSec && lastAutoExecutedCycleRef.current !== cycleId) {
+          lastAutoExecutedCycleRef.current = cycleId;
+          executeAutoTradingBatchRef.current?.();
+        }
+      }
     };
 
     updateTick();
     const clockInterval = setInterval(updateTick, 1000);
     return () => clearInterval(clockInterval);
-  }, [config.yMin, config.ySec, config.settleMin, config.settleSec]);
+  }, [config.yMin, config.ySec, config.settleMin, config.settleSec, isAutoTradingActive, filterSettings.scanMoment]);
 
   const lastAlert4hTime = useRef<number>(-1);
   const lastAlertSpikeTime = useRef<number>(-1);
@@ -2873,7 +3389,9 @@ export default function MonitoringAssistant4h({
                         ? 'bg-emerald-500/20 border-emerald-500/60 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.35)] hover:bg-emerald-500/30'
                         : 'bg-white/5 border-white/10 text-zinc-400 hover:text-zinc-200 hover:bg-white/10'
                     }`}
-                    title={isAutoTradingActive ? "自动交易监控运行中，点击停止" : "点击启动自动交易（交易规则后续再定）"}
+                    title={isAutoTradingActive 
+                      ? `4H自动建仓策略运行中 (周期扫描时刻: ${filterSettings.scanMoment?.hour ?? 3}h ${filterSettings.scanMoment?.minute ?? 58}m ${filterSettings.scanMoment?.second ?? 30}s, 最大持仓上限: ${orderSettings.maxPositionCount?.value || '10'})，点击停止` 
+                      : "点击启动4H自动交易策略（在周期扫描时刻自动筛选、建仓并挂止盈止损）"}
                   >
                     <span className={`w-2 h-2 rounded-full ${isAutoTradingActive ? 'bg-emerald-400 animate-ping' : 'bg-zinc-600'}`} />
                     <span>{isAutoTradingActive ? '自动: 运行中' : '自动'}</span>

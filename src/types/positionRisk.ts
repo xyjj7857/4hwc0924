@@ -1,3 +1,5 @@
+import { Position, OpenOrder } from '../types';
+
 export interface PositionRiskConfig {
   positionId: string;
   symbol: string;
@@ -41,26 +43,157 @@ export interface PositionRiskConfig {
   };
 }
 
-export type RiskButtonDisplay = '条件风控' | '时间风控' | '死斗';
+export interface PositionTpSlResult {
+  hasTp: boolean;
+  hasSl: boolean;
+  tpOrder?: OpenOrder;
+  slOrder?: OpenOrder;
+  tpPrice?: number;
+  slPrice?: number;
+}
 
 /**
- * 规则5：当用户设置完风控条件后，永续合约持仓表对应的风控列信息组件界面展示规则为：
- * 当a、b、c都设置并勾选的情况下，展示优先级为：“条件风控”＞“时间风控”＞“死斗”，默认状态下展示“死斗”；
+ * 精准检测该币对是否有对应的止盈单或止损单
+ * 1. 对应止盈单：挂单为平仓方向，类型为 TAKE_PROFIT、TAKE_PROFIT_MARKET、优于开仓价的限价卖/买单，或风控配置已勾选生效
+ * 2. 对应止损单：挂单为平仓方向，类型为 STOP_MARKET、STOP、算法条件止损单、带有劣于开仓价触发价的条件单，或风控配置已勾选生效
  */
-export function getRiskButtonDisplay(config?: PositionRiskConfig): RiskButtonDisplay {
-  if (!config) return '死斗';
+export function detectPositionTpSl(
+  position: Position,
+  openOrders: OpenOrder[] = [],
+  config?: PositionRiskConfig
+): PositionTpSlResult {
+  const isLong = position.side === 'BUY';
+  const closingSide = isLong ? 'SELL' : 'BUY';
+  const posSide = position.positionSide || 'BOTH';
 
-  // 优先级 1: 条件风控
-  if (config.conditionControl && config.conditionControl.enabled) {
+  // 筛选该币对属于当前平仓方向的挂单
+  const symbolOrders = openOrders.filter(o => {
+    if (o.symbol.toUpperCase() !== position.symbol.toUpperCase()) return false;
+    // 双向持仓模式下严格匹配持仓方向
+    if (posSide !== 'BOTH' && o.positionSide && o.positionSide !== 'BOTH') {
+      if (o.positionSide !== posSide) return false;
+    }
+    // 必须是平仓方向 (多单平仓为 SELL，空单平仓为 BUY)
+    return o.side === closingSide;
+  });
+
+  let foundTpOrder: OpenOrder | undefined = undefined;
+  let foundSlOrder: OpenOrder | undefined = undefined;
+
+  for (const order of symbolOrders) {
+    const oType = (order.type || '').toUpperCase();
+    const price = Number(order.price) || 0;
+    const stopPrice = Number(order.stopPrice) || 0;
+
+    // 1. 判断止盈挂单
+    const isExplicitTp = oType.includes('TAKE_PROFIT');
+    const isRecordedTp = Boolean(
+      config?.tpSlControl?.submittedOrders?.tpOrderId && 
+      order.id === config.tpSlControl.submittedOrders.tpOrderId
+    );
+    // 普通限价挂单：做多平仓卖出价高于开仓价，或做空平仓买入价低于开仓价，视为止盈单
+    const isLimitTp = !order.isAlgo && oType === 'LIMIT' && (
+      isLong ? (price > position.entryPrice) : (price < position.entryPrice)
+    );
+
+    if (isExplicitTp || isRecordedTp || isLimitTp) {
+      if (!foundTpOrder) {
+        foundTpOrder = order;
+      }
+    }
+
+    // 2. 判断止损挂单
+    const isExplicitSl = oType.includes('STOP') || oType.includes('CONDITIONAL');
+    const isRecordedSl = Boolean(
+      (config?.tpSlControl?.submittedOrders?.slAlgoId && order.id === config.tpSlControl.submittedOrders.slAlgoId) ||
+      (config?.tpSlControl?.submittedOrders?.slOrderId && order.id === config.tpSlControl.submittedOrders.slOrderId)
+    );
+    // 币安算法委托单（STOP_MARKET/CONDITIONAL）统一视为止损单
+    const isAlgoSl = order.isAlgo && (stopPrice > 0 || isExplicitSl);
+    // 带触发价且符合止损方向的条件挂单
+    const isTriggerSl = stopPrice > 0 && (
+      isLong ? (stopPrice <= position.entryPrice * 1.01) : (stopPrice >= position.entryPrice * 0.99)
+    );
+
+    if (isExplicitSl || isRecordedSl || isAlgoSl || isTriggerSl) {
+      if (!foundSlOrder) {
+        foundSlOrder = order;
+      }
+    }
+  }
+
+  // 结合该持仓专属配置的启用状态进行精准兜底
+  const hasTp = Boolean(foundTpOrder || config?.tpSlControl?.tpEnabled);
+  const hasSl = Boolean(foundSlOrder || config?.tpSlControl?.slEnabled);
+
+  // 提取对应止盈价
+  let tpPrice: number | undefined = undefined;
+  if (foundTpOrder) {
+    tpPrice = (foundTpOrder.price > 0 ? foundTpOrder.price : foundTpOrder.stopPrice) || undefined;
+  }
+  if (!tpPrice && config?.tpSlControl?.tpEnabled && config.tpSlControl.tpPrice > 0) {
+    tpPrice = config.tpSlControl.tpPrice;
+  }
+
+  // 提取对应止损价
+  let slPrice: number | undefined = undefined;
+  if (foundSlOrder) {
+    slPrice = (foundSlOrder.stopPrice && foundSlOrder.stopPrice > 0 ? foundSlOrder.stopPrice : foundSlOrder.price) || undefined;
+  }
+  if (!slPrice && config?.tpSlControl?.slEnabled && config.tpSlControl.slPrice > 0) {
+    slPrice = config.tpSlControl.slPrice;
+  }
+
+  return {
+    hasTp,
+    hasSl,
+    tpOrder: foundTpOrder,
+    slOrder: foundSlOrder,
+    tpPrice,
+    slPrice
+  };
+}
+
+export type RiskButtonDisplay = '止盈 / 止损' | '止盈' | '止损' | '条件风控' | '时间风控' | '死斗';
+
+/**
+ * 永续合约持仓表对应的风控列展示规则：
+ * 1. 优先展示止盈与止损：
+ *    - 若同时存在止盈单与止损单，则展示“止盈 / 止损”
+ *    - 若仅有止盈单，则展示“止盈”
+ *    - 若仅有止损单，则展示“止损”
+ * 2. 若两者均无，保持其他核心逻辑不变：
+ *    - “条件风控” ＞ “时间风控” ＞ “死斗” (默认展示“死斗”)
+ */
+export function getRiskButtonDisplay(
+  config?: PositionRiskConfig,
+  openOrders: OpenOrder[] = [],
+  position?: Position
+): RiskButtonDisplay {
+  if (position) {
+    const { hasTp, hasSl } = detectPositionTpSl(position, openOrders, config);
+    if (hasTp && hasSl) return '止盈 / 止损';
+    if (hasTp) return '止盈';
+    if (hasSl) return '止损';
+  } else if (config?.tpSlControl) {
+    const hasTp = Boolean(config.tpSlControl.tpEnabled);
+    const hasSl = Boolean(config.tpSlControl.slEnabled);
+    if (hasTp && hasSl) return '止盈 / 止损';
+    if (hasTp) return '止盈';
+    if (hasSl) return '止损';
+  }
+
+  // 优先级: 条件风控
+  if (config?.conditionControl && config.conditionControl.enabled) {
     return '条件风控';
   }
 
-  // 优先级 2: 时间风控
-  if (config.timeControl && config.timeControl.enabled) {
+  // 优先级: 时间风控
+  if (config?.timeControl && config.timeControl.enabled) {
     return '时间风控';
   }
 
-  // 优先级 3 / 默认: 死斗
+  // 默认: 死斗
   return '死斗';
 }
 

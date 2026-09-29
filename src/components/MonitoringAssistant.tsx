@@ -353,12 +353,23 @@ export default function MonitoringAssistant({
     return 12;
   });
 
+  const saveDbSettings = useCallback((patch: Record<string, any>) => {
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    }).catch(err => {
+      console.warn('Failed to sync 15m settings to SQLite database:', err);
+    });
+  }, []);
+
   const handleUpdateVolumeKCount = useCallback(async (val: number) => {
     const clamped = Math.max(1, Math.min(30, val));
     setVolumeKCount(clamped);
     try {
       localStorage.setItem('monitor_15m_volume_k_count', String(clamped));
     } catch {}
+    saveDbSettings({ monitor_15m_volume_k_count: clamped });
     try {
       await fetch('/api/monitoring/config', {
         method: 'POST',
@@ -368,7 +379,7 @@ export default function MonitoringAssistant({
     } catch (err) {
       console.error('Failed to sync volumeKCount to server:', err);
     }
-  }, []);
+  }, [saveDbSettings]);
 
   // --- 自定义 涨跌k 数量 (默认 6 条，取当前未完结 15m 前 M 根完结 K 线的最大涨幅) ---
   const [gainKCount, setGainKCount] = useState<number>(() => {
@@ -388,6 +399,7 @@ export default function MonitoringAssistant({
     try {
       localStorage.setItem('monitor_15m_gain_k_count', String(clamped));
     } catch {}
+    saveDbSettings({ monitor_15m_gain_k_count: clamped });
     try {
       await fetch('/api/monitoring/config', {
         method: 'POST',
@@ -397,7 +409,7 @@ export default function MonitoringAssistant({
     } catch (err) {
       console.error('Failed to sync gainKCount to server:', err);
     }
-  }, []);
+  }, [saveDbSettings]);
 
   // --- 涨跌幅计算模式：'standard' (常规模式：基准为15m开盘价) 或 'high' (高涨幅模式：基准为当前价) ---
   const [gainMode, setGainMode] = useState<'standard' | 'high'>(() => {
@@ -413,7 +425,8 @@ export default function MonitoringAssistant({
     try {
       localStorage.setItem('monitor_15m_gain_mode', mode);
     } catch {}
-  }, []);
+    saveDbSettings({ monitor_15m_gain_mode: mode });
+  }, [saveDbSettings]);
 
   // --- 排序方案状态：方案1、固定（默认，排序不发生变化） | 方案2、排序（随涨跌幅实时重排序） ---
   const [sortScheme, setSortScheme] = useState<'fixed' | 'dynamic'>(() => {
@@ -429,6 +442,39 @@ export default function MonitoringAssistant({
     try {
       localStorage.setItem('monitor_15m_sort_scheme', scheme);
     } catch {}
+    saveDbSettings({ monitor_15m_sort_scheme: scheme });
+  }, [saveDbSettings]);
+
+  // 从本地数据库 (SQLite settings 表) 初始化恢复 15M 相关参数配置
+  useEffect(() => {
+    let active = true;
+    fetch('/api/settings')
+      .then(res => res.ok ? res.json() : null)
+      .then((settings: Record<string, any> | null) => {
+        if (!active || !settings) return;
+        if (typeof settings.monitor_15m_volume_k_count === 'number') {
+          const val = Math.max(1, Math.min(30, settings.monitor_15m_volume_k_count));
+          setVolumeKCount(val);
+          try { localStorage.setItem('monitor_15m_volume_k_count', String(val)); } catch {}
+        }
+        if (typeof settings.monitor_15m_gain_k_count === 'number') {
+          const val = Math.max(1, Math.min(30, settings.monitor_15m_gain_k_count));
+          setGainKCount(val);
+          try { localStorage.setItem('monitor_15m_gain_k_count', String(val)); } catch {}
+        }
+        if (settings.monitor_15m_gain_mode === 'standard' || settings.monitor_15m_gain_mode === 'high') {
+          setGainMode(settings.monitor_15m_gain_mode);
+          try { localStorage.setItem('monitor_15m_gain_mode', settings.monitor_15m_gain_mode); } catch {}
+        }
+        if (settings.monitor_15m_sort_scheme === 'fixed' || settings.monitor_15m_sort_scheme === 'dynamic') {
+          setSortScheme(settings.monitor_15m_sort_scheme);
+          try { localStorage.setItem('monitor_15m_sort_scheme', settings.monitor_15m_sort_scheme); } catch {}
+        }
+      })
+      .catch(err => {
+        console.warn('Failed to load 15m settings from DB:', err);
+      });
+    return () => { active = false; };
   }, []);
 
   // 价格通用格式化辅助函数

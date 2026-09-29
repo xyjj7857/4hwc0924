@@ -438,18 +438,23 @@ export default function App() {
   const [ringingAlarm, setRingingAlarm] = useState<AlarmItem | null>(null);
   const lastTriggeredMinuteRef = useRef<string>('');
 
+  // 统一服务端 SQLite settings 数据库持久化工具函数
+  const saveDbSettings = useCallback((patch: Record<string, any>) => {
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    }).catch(err => {
+      console.warn('Failed to sync settings to SQLite database:', err);
+    });
+  }, []);
+
   // 永久保存入场验证黑名单设置（本地缓存 + 服务端 SQLite settings 双重保障）
   const handleUpdateVerificationList = useCallback((newList: string[]) => {
     setVerificationList(newList);
     setLocalVerificationList(newList);
-    fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entryVerificationList: newList })
-    }).catch(err => {
-      console.error('Failed to save entry verification list to DB:', err);
-    });
-  }, []);
+    saveDbSettings({ entryVerificationList: newList });
+  }, [saveDbSettings]);
 
   // 永续合约持仓专属风控配置（时间风控、止盈/止损、条件风控）- 绑定账号维度持久化隔离
   const allAccountRiskConfigsRef = useRef<Record<string, Record<string, PositionRiskConfig>>>(getAllLocalPositionRiskConfigs());
@@ -495,14 +500,16 @@ export default function App() {
     }, 50);
   }, []);
 
-  // Persist alarm settings on every change (永久生效)
+  // Persist alarm settings on every change (永久生效，本地缓存 + SQLite数据库双重备份)
   useEffect(() => {
+    if (!isInitialLoadCompletedRef.current) return;
     try {
       localStorage.setItem('trading_terminal_alarm_settings', JSON.stringify(alarmSettings));
     } catch (e) {
       console.warn('Failed to persist alarm settings:', e);
     }
-  }, [alarmSettings]);
+    saveDbSettings({ trading_terminal_alarm_settings: alarmSettings, alarmSettings });
+  }, [alarmSettings, saveDbSettings]);
 
   // One-click toggle alarm master switch
   const handleToggleAlarmGlobal = () => {
@@ -617,6 +624,19 @@ export default function App() {
   const [positionFundingFees, setPositionFundingFees] = useState<Record<string, number>>({});
   const positionFundingFeesRef = useRef<Record<string, number>>({});
   const fetchActiveFundingFeesRef = useRef<(currentPositions?: Position[]) => Promise<void>>(async () => {});
+  const fetchSnapshotRef = useRef<() => void>(() => {});
+
+  // 永续合约持仓 N值映射表（方案A：标记价相对开仓价的最大向下取整倍数，多单=标记/开仓，空单=开仓/标记，只增不减）
+  const [positionNValues, setPositionNValues] = useState<Record<string, number>>(() => {
+    try {
+      const raw = localStorage.getItem('binance_position_high_water_n_values');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const positionNValuesRef = useRef<Record<string, number>>(positionNValues);
+  positionNValuesRef.current = positionNValues;
 
   const formatFundingFee = useCallback((val: number | undefined) => {
     if (val === undefined || isNaN(val) || val === 0) return '0.0000';
@@ -686,6 +706,43 @@ export default function App() {
     }
   }, [positions, fetchFundingCycles]);
 
+  // 实时监测与更新永续合约持仓的 N值（方案A：标记价相对开仓价的最大向下取整倍数，多单=标记/开仓，空单=开仓/标记，只增不减高水位记录）
+  useEffect(() => {
+    if (!positions || positions.length === 0) return;
+
+    let hasUpdates = false;
+    const currentMap = { ...positionNValuesRef.current };
+
+    for (const pos of positions) {
+      const liveInfo = livePrices[pos.symbol] || livePrices[pos.symbol.toUpperCase()];
+      const currentPrice = (liveInfo?.lastPrice || liveInfo?.markPrice) || pos.markPrice || pos.entryPrice;
+      if (!currentPrice || currentPrice <= 0 || !pos.entryPrice || pos.entryPrice <= 0) continue;
+
+      const isLong = pos.side === 'BUY';
+      const instantRatio = isLong 
+        ? (currentPrice / pos.entryPrice) 
+        : (pos.entryPrice / currentPrice);
+      const instantFloor = Math.floor(instantRatio);
+
+      const posKey = pos.id;
+      const prevN = currentMap[posKey] || 0;
+
+      if (instantFloor > prevN) {
+        currentMap[posKey] = instantFloor;
+        hasUpdates = true;
+      }
+    }
+
+    if (hasUpdates) {
+      positionNValuesRef.current = currentMap;
+      setPositionNValues(currentMap);
+      try {
+        localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(currentMap));
+      } catch {}
+      saveDbSettings({ binance_position_high_water_n_values: currentMap });
+    }
+  }, [positions, livePrices, saveDbSettings]);
+
   // 实时行情价格引擎：对活跃持仓币对及当前下单币对进行极速刷新 (500ms 轮询本地后端内存)
   useEffect(() => {
     let timer: any = null;
@@ -746,12 +803,32 @@ export default function App() {
   });
 
   useEffect(() => {
-    localStorage.setItem('auto_clean_logs_enabled', String(isAutoCleanLogs));
-  }, [isAutoCleanLogs]);
+    try { localStorage.setItem('auto_clean_logs_enabled', String(isAutoCleanLogs)); } catch {}
+    if (isInitialLoadCompletedRef.current) {
+      saveDbSettings({ auto_clean_logs_enabled: isAutoCleanLogs });
+    }
+  }, [isAutoCleanLogs, saveDbSettings]);
 
   useEffect(() => {
-    localStorage.setItem('auto_clean_logs_hours', String(autoCleanHours));
-  }, [autoCleanHours]);
+    try { localStorage.setItem('auto_clean_logs_hours', String(autoCleanHours)); } catch {}
+    if (isInitialLoadCompletedRef.current) {
+      saveDbSettings({ auto_clean_logs_hours: autoCleanHours });
+    }
+  }, [autoCleanHours, saveDbSettings]);
+
+  useEffect(() => {
+    try { localStorage.setItem('app_active_main_tab', activeMainTab); } catch {}
+    if (isInitialLoadCompletedRef.current) {
+      saveDbSettings({ app_active_main_tab: activeMainTab });
+    }
+  }, [activeMainTab, saveDbSettings]);
+
+  useEffect(() => {
+    try { localStorage.setItem('app_active_contract_tab', activeContractTab); } catch {}
+    if (isInitialLoadCompletedRef.current) {
+      saveDbSettings({ app_active_contract_tab: activeContractTab });
+    }
+  }, [activeContractTab, saveDbSettings]);
 
   // Binance WebSocket User Data Stream connection state
   const [userStreamStatus, setUserStreamStatus] = useState<'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'RECONNECTING'>('DISCONNECTED');
@@ -769,9 +846,10 @@ export default function App() {
     setIsSidebarCollapsed(prev => {
       const next = !prev;
       try { localStorage.setItem('app_trade_sidebar_collapsed', String(next)); } catch {}
+      saveDbSettings({ app_trade_sidebar_collapsed: next });
       return next;
     });
-  }, []);
+  }, [saveDbSettings]);
 
   // 左侧栏宽度左右可拖拽调节
   const [tradeSidebarWidth, setTradeSidebarWidth] = useState<number>(() => {
@@ -812,6 +890,7 @@ export default function App() {
       try {
         localStorage.setItem('app_trade_sidebar_width', finalWidth.toString());
       } catch {}
+      saveDbSettings({ app_trade_sidebar_width: finalWidth });
     };
 
     document.addEventListener('mousemove', handleMouseMove);
@@ -1687,6 +1766,69 @@ export default function App() {
             setLocalVerificationList(settings.entryVerificationList);
             addLog(`从本地数据库 [settings 表] 成功同步了 ${settings.entryVerificationList.length} 个入场验证名单标的`, 'INFO');
           }
+          if (settings.app_user_leverage !== undefined) {
+            const lev = Number(settings.app_user_leverage);
+            setLeverage(lev);
+            try { localStorage.setItem('app_user_leverage', String(lev)); } catch {}
+          }
+          if (settings.app_order_ratio_percent !== undefined) {
+            const pct = Number(settings.app_order_ratio_percent);
+            setOrderRatioPercent(pct);
+            try { localStorage.setItem('app_order_ratio_percent', String(pct)); } catch {}
+          }
+          if (settings.app_is_custom_ratio !== undefined) {
+            const isCust = Boolean(settings.app_is_custom_ratio);
+            setIsCustomRatio(isCust);
+            try { localStorage.setItem('app_is_custom_ratio', String(isCust)); } catch {}
+          }
+          if (settings.app_custom_ratio_value !== undefined) {
+            const custVal = String(settings.app_custom_ratio_value);
+            setCustomRatioInput(custVal);
+            try { localStorage.setItem('app_custom_ratio_value', custVal); } catch {}
+          }
+          if (settings.auto_clean_logs_enabled !== undefined) {
+            const autoClean = Boolean(settings.auto_clean_logs_enabled);
+            setIsAutoCleanLogs(autoClean);
+            try { localStorage.setItem('auto_clean_logs_enabled', String(autoClean)); } catch {}
+          }
+          if (settings.auto_clean_logs_hours !== undefined) {
+            const hours = Number(settings.auto_clean_logs_hours);
+            setAutoCleanHours(hours);
+            try { localStorage.setItem('auto_clean_logs_hours', String(hours)); } catch {}
+          }
+          if (settings.app_trade_sidebar_collapsed !== undefined) {
+            const collapsed = Boolean(settings.app_trade_sidebar_collapsed);
+            setIsSidebarCollapsed(collapsed);
+            try { localStorage.setItem('app_trade_sidebar_collapsed', String(collapsed)); } catch {}
+          }
+          if (settings.app_trade_sidebar_width !== undefined) {
+            const width = Number(settings.app_trade_sidebar_width);
+            setTradeSidebarWidth(width);
+            try { localStorage.setItem('app_trade_sidebar_width', String(width)); } catch {}
+          }
+          if (settings.app_active_main_tab) {
+            setActiveMainTab(settings.app_active_main_tab);
+            try { localStorage.setItem('app_active_main_tab', settings.app_active_main_tab); } catch {}
+          }
+          if (settings.app_active_contract_tab) {
+            setActiveContractTab(settings.app_active_contract_tab);
+            try { localStorage.setItem('app_active_contract_tab', settings.app_active_contract_tab); } catch {}
+          }
+          if (settings.global_mute_state !== undefined) {
+            const muted = Boolean(settings.global_mute_state);
+            setIsMuted(muted);
+            try { localStorage.setItem('global_mute_state', String(muted)); } catch {}
+          }
+          if (settings.trading_terminal_alarm_settings || settings.alarmSettings) {
+            const alarmConfig = settings.trading_terminal_alarm_settings || settings.alarmSettings;
+            setAlarmSettings(alarmConfig);
+            try { localStorage.setItem('trading_terminal_alarm_settings', JSON.stringify(alarmConfig)); } catch {}
+          }
+          if (settings.binance_position_high_water_n_values && typeof settings.binance_position_high_water_n_values === 'object') {
+            setPositionNValues(settings.binance_position_high_water_n_values);
+            positionNValuesRef.current = settings.binance_position_high_water_n_values;
+            try { localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(settings.binance_position_high_water_n_values)); } catch {}
+          }
         }
         
         // 2. Fetch position history database
@@ -1739,7 +1881,20 @@ export default function App() {
           zValue,
           entryEntity,
           entryEntityRatio,
-          entryVerificationList: verificationList
+          entryVerificationList: verificationList,
+          app_user_leverage: leverage,
+          app_order_ratio_percent: orderRatioPercent,
+          app_is_custom_ratio: isCustomRatio,
+          app_custom_ratio_value: customRatioInput,
+          auto_clean_logs_enabled: isAutoCleanLogs,
+          auto_clean_logs_hours: autoCleanHours,
+          app_trade_sidebar_collapsed: isSidebarCollapsed,
+          app_trade_sidebar_width: tradeSidebarWidth,
+          app_active_main_tab: activeMainTab,
+          app_active_contract_tab: activeContractTab,
+          global_mute_state: isMuted,
+          trading_terminal_alarm_settings: alarmSettings,
+          binance_position_high_water_n_values: positionNValues
         })
       })
       .then(res => {
@@ -1748,10 +1903,16 @@ export default function App() {
       .catch(err => {
         console.error('Failed to autosave settings to database:', err);
       });
-    }, 1500); // 1.5s debounce to group setting adjustments
+    }, 1000); // 1s debounce to group setting adjustments
     
     return () => clearTimeout(timer);
-  }, [apiConfig, activeRisk, rateLimitDelay, leverage, futuresRatio, turnoverCoef, kValue, zValue, entryEntity, entryEntityRatio, verificationList]);
+  }, [
+    apiConfig, activeRisk, rateLimitDelay, leverage, futuresRatio, turnoverCoef,
+    kValue, zValue, entryEntity, entryEntityRatio, verificationList,
+    orderRatioPercent, isCustomRatio, customRatioInput, isAutoCleanLogs,
+    autoCleanHours, isSidebarCollapsed, tradeSidebarWidth, activeMainTab,
+    activeContractTab, isMuted, alarmSettings, positionNValues
+  ]);
 
   // API Verification
   const handleVerifyConnection = async () => {
@@ -2292,10 +2453,29 @@ export default function App() {
             delete positionOpenTimesRef.current[id];
           }
         });
+
+        // 同步清理已平仓持仓的 N值记录
+        let nCleaned = false;
+        const nMap = { ...positionNValuesRef.current };
+        Object.keys(nMap).forEach(id => {
+          if (!currentIds.has(id)) {
+            delete nMap[id];
+            nCleaned = true;
+          }
+        });
+        if (nCleaned) {
+          positionNValuesRef.current = nMap;
+          setPositionNValues(nMap);
+          try {
+            localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(nMap));
+          } catch {}
+          saveDbSettings({ binance_position_high_water_n_values: nMap });
+        }
       } catch (error) {
         // Silent fail for background calibration
       }
     };
+    fetchSnapshotRef.current = fetchSnapshot;
 
     // 2. Delta Event Handlers for WebSocket Stream
     const handleAccountDeltaUpdate = (accountData: any) => {
@@ -2582,6 +2762,10 @@ export default function App() {
       const data = await response.json();
       if (response.ok) {
         addLog(`委托已撤销: ${order.symbol} ${order.id}`, 'SUCCESS');
+        setOpenOrders(prev => prev.filter(o => o.id !== order.id));
+        setTimeout(() => {
+          fetchSnapshotRef.current?.();
+        }, 800);
       } else {
         addLog(`撤销失败: ${data.msg || '未知错误'}`, 'ERROR');
       }
@@ -2593,8 +2777,9 @@ export default function App() {
   // 1号区域: 杠杆倍数选择处理器 (1X, 2X, 3X, 5X, 10X)
   const handleSelectLeverage = (lev: number) => {
     setLeverage(lev);
-    localStorage.setItem('app_user_leverage', lev.toString());
-    addLog(`合约开单杠杆倍数已设置为: ${lev}X (后期下单将统一使用该杠杆倍数)`, 'INFO');
+    try { localStorage.setItem('app_user_leverage', lev.toString()); } catch {}
+    saveDbSettings({ app_user_leverage: lev });
+    addLog(`合约开单杠杆倍数已设置为: ${lev}X (后期下单将统一使用该杠杆倍数，已存入本地数据库)`, 'INFO');
   };
 
   // 2号区域: 合约比例选择处理器 (3%, 5%, 10%, 20%)
@@ -2602,22 +2787,26 @@ export default function App() {
     setIsCustomRatio(false);
     setOrderRatioPercent(pct);
     setFuturesRatio(pct);
-    localStorage.setItem('app_order_ratio_percent', pct.toString());
-    localStorage.setItem('app_is_custom_ratio', 'false');
+    try {
+      localStorage.setItem('app_order_ratio_percent', pct.toString());
+      localStorage.setItem('app_is_custom_ratio', 'false');
+    } catch {}
+    saveDbSettings({ app_order_ratio_percent: pct, app_is_custom_ratio: false, futuresRatio: pct });
 
     const fb = balance.futuresBalance || 0;
     const calcAmount = parseFloat((fb * (pct / 100)).toFixed(2));
     setOrderForm(prev => ({ ...prev, amount: calcAmount }));
-    addLog(`合约开单比例已选择: ${pct}% (计算方式: 合约余额 ${fb.toFixed(2)} USDT × ${pct}% = ${calcAmount} USDT，后续下单将统一按此比例计算)`, 'INFO');
+    addLog(`合约开单比例已选择: ${pct}% (计算方式: 合约余额 ${fb.toFixed(2)} USDT × ${pct}% = ${calcAmount} USDT，后续下单将统一按此比例计算，已存入本地数据库)`, 'INFO');
   };
 
   // 2号区域: 自定义比例应用处理器 (<= 100)
   const handleApplyCustomRatio = (rawVal: string) => {
     setIsCustomRatio(true);
-    localStorage.setItem('app_is_custom_ratio', 'true');
+    try { localStorage.setItem('app_is_custom_ratio', 'true'); } catch {}
 
     if (rawVal === '') {
       setCustomRatioInput('');
+      saveDbSettings({ app_is_custom_ratio: true, app_custom_ratio_value: '' });
       return;
     }
 
@@ -2630,13 +2819,21 @@ export default function App() {
     setCustomRatioInput(valStr);
     setOrderRatioPercent(val);
     setFuturesRatio(val);
-    localStorage.setItem('app_custom_ratio_value', valStr);
-    localStorage.setItem('app_order_ratio_percent', val.toString());
+    try {
+      localStorage.setItem('app_custom_ratio_value', valStr);
+      localStorage.setItem('app_order_ratio_percent', val.toString());
+    } catch {}
+    saveDbSettings({
+      app_is_custom_ratio: true,
+      app_custom_ratio_value: valStr,
+      app_order_ratio_percent: val,
+      futuresRatio: val
+    });
 
     const fb = balance.futuresBalance || 0;
     const calcAmount = parseFloat((fb * (val / 100)).toFixed(2));
     setOrderForm(prev => ({ ...prev, amount: calcAmount }));
-    addLog(`合约开单自定义比例已设置为: ${val}% (计算方式: 合约余额 ${fb.toFixed(2)} USDT × ${val}% = ${calcAmount} USDT，后续下单将统一按此比例计算)`, 'INFO');
+    addLog(`合约开单自定义比例已设置为: ${val}% (计算方式: 合约余额 ${fb.toFixed(2)} USDT × ${val}% = ${calcAmount} USDT，后续下单将统一按此比例计算，已存入本地数据库)`, 'INFO');
   };
 
   // 当合约账户余额发生变化时，如果已选择比例，保持下单数量动态刷新
@@ -3050,6 +3247,19 @@ export default function App() {
             [`positionRiskConfigs_${currentAccount}`]: next
           })
         }).catch(() => {});
+        return next;
+      });
+
+      // 移除该持仓的 N值高水位记录
+      setPositionNValues(prev => {
+        if (!prev[pos.id]) return prev;
+        const next = { ...prev };
+        delete next[pos.id];
+        positionNValuesRef.current = next;
+        try {
+          localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(next));
+        } catch {}
+        saveDbSettings({ binance_position_high_water_n_values: next });
         return next;
       });
 
@@ -4774,8 +4984,9 @@ export default function App() {
             onClick={() => {
               const newState = !isMuted;
               setIsMuted(newState);
-              localStorage.setItem('global_mute_state', String(newState));
-              addLog(`[系统] 一键静音已${newState ? '开启，全局警报处于静音状态' : '关闭，警报声音已恢复'}`, newState ? 'INFO' : 'SUCCESS');
+              try { localStorage.setItem('global_mute_state', String(newState)); } catch {}
+              saveDbSettings({ global_mute_state: newState });
+              addLog(`[系统] 一键静音已${newState ? '开启，全局警报处于静音状态' : '关闭，警报声音已恢复'} (已保存至本地数据库)`, newState ? 'INFO' : 'SUCCESS');
             }}
             id="btn-global-mute-toggle"
             className={`flex items-center gap-1.5 px-2.5 py-1.5 border rounded-md transition-all active:scale-[0.97] ${
@@ -5842,6 +6053,7 @@ export default function App() {
                       <th className="px-5 py-2 font-medium text-center">合约 / 方向</th>
                       <th className="px-5 py-2 font-medium text-center">开仓时间</th>
                       <th className="px-5 py-2 font-medium text-center">开仓 / 标记</th>
+                      <th className="px-5 py-2 font-medium text-center">N值</th>
                       <th className="px-5 py-2 font-medium text-center">持仓量 / 市值</th>
                       <th className="px-5 py-2 font-medium text-center">未实现盈亏 (ROE%)</th>
                       <th className="px-5 py-2 font-medium text-center">累计资金费</th>
@@ -5853,7 +6065,7 @@ export default function App() {
                     <AnimatePresence initial={false}>
                       {sortedPositions.length === 0 ? (
                         <tr>
-                          <td colSpan={8} className="px-5 py-6 text-center text-zinc-600 italic text-xs">
+                          <td colSpan={9} className="px-5 py-6 text-center text-zinc-600 italic text-xs">
                             暂无合约持仓。
                           </td>
                         </tr>
@@ -5878,6 +6090,14 @@ export default function App() {
                           const liveMarketValue = currentPrice > 0 
                             ? (isLong ? currentPrice * pos.amount : (pos.entryPrice * pos.amount + livePnl)) 
                             : (notional + pos.pnl);
+
+                          // N值计算（方案A：做多=标记/开仓，做空=开仓/标记，向下取整，只增不减高水位记录）
+                          const instantRatio = (pos.entryPrice > 0 && currentPrice > 0)
+                            ? (isLong ? currentPrice / pos.entryPrice : pos.entryPrice / currentPrice)
+                            : 1;
+                          const instantFloor = Math.floor(instantRatio);
+                          const recordedN = positionNValues[pos.id] || 0;
+                          const currentN = Math.max(recordedN, instantFloor);
 
                           return (
                             <motion.tr 
@@ -5912,6 +6132,25 @@ export default function App() {
                                   <div className="text-[11px] text-zinc-400 font-medium mt-0.5">
                                     标记: <span className="text-zinc-200">{formatPrice(pos.symbol, currentPrice)}</span>
                                   </div>
+                                )}
+                              </td>
+                              <td className="px-5 py-2 font-mono text-center whitespace-nowrap">
+                                {currentN >= 2 ? (
+                                  <div className="flex items-center justify-center">
+                                    <span 
+                                      className="font-bold text-[17px] text-amber-400 font-mono px-2.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 shadow-xs inline-block min-w-[32px] text-center"
+                                      title={`【N值】开仓后最高记录: ${currentN} 倍\n当前实时: ${instantRatio.toFixed(2)} 倍 (向下取整: ${instantFloor})\n机制: 只增不减 (棘轮)`}
+                                    >
+                                      {currentN}
+                                    </span>
+                                  </div>
+                                ) : (
+                                  <span 
+                                    className="text-zinc-500 font-bold text-[16.5px] inline-block select-none"
+                                    title={`当前实时: ${instantRatio.toFixed(2)} 倍 (未达 2 倍显示 -)`}
+                                  >
+                                    -
+                                  </span>
                                 )}
                               </td>
                               <td className="px-5 py-2 font-mono text-xs text-center whitespace-nowrap">
@@ -5965,6 +6204,8 @@ export default function App() {
                                   <PositionRiskButton 
                                     position={pos}
                                     config={positionRiskConfigs[pos.id]}
+                                    openOrders={openOrders}
+                                    formatPrice={formatPrice}
                                     onClick={() => {
                                       setSelectedRiskPosition(pos);
                                       setIsPositionRiskModalOpen(true);
@@ -6110,6 +6351,7 @@ export default function App() {
           onSwitchToTrade={() => setActiveMainTab('TRADE')}
           isMuted={isMuted}
           positions={positions}
+          exchangeInfo={exchangeInfo}
         />
       </div>
 
@@ -6282,6 +6524,8 @@ export default function App() {
           addLog={addLog}
           formatPrice={formatPrice}
           formatQty={formatQty}
+          openOrders={openOrders}
+          onRefreshOrders={() => fetchSnapshotRef.current?.()}
         />
       )}
 

@@ -29,6 +29,7 @@ export interface Position {
   accumulatedFundingFee?: number;
   fundingIntervalHours?: number;
   settlementCycle?: string;
+  nValue?: number;
 }
 
 export interface PositionHistory {

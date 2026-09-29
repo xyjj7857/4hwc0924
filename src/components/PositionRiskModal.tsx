@@ -15,9 +15,10 @@ import {
   AlertTriangle,
   Info,
   Swords,
-  Flame
+  Flame,
+  Target
 } from 'lucide-react';
-import { Position, ApiConfig } from '../types';
+import { Position, ApiConfig, OpenOrder } from '../types';
 import { PositionRiskConfig, getDefaultPositionRiskConfig, getRiskButtonDisplay } from '../types/positionRisk';
 
 interface PositionRiskModalProps {
@@ -31,6 +32,8 @@ interface PositionRiskModalProps {
   addLog: (msg: string, type?: 'INFO' | 'TRADE' | 'ERROR' | 'SUCCESS' | 'WARN') => void;
   formatPrice: (symbol: string, price: number) => string;
   formatQty: (symbol: string, qty: number) => string;
+  openOrders?: OpenOrder[];
+  onRefreshOrders?: () => void;
 }
 
 export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
@@ -43,7 +46,9 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
   isConnected,
   addLog,
   formatPrice,
-  formatQty
+  formatQty,
+  openOrders = [],
+  onRefreshOrders
 }) => {
   const isLong = position ? position.side === 'BUY' : true;
   const entryPrice = position?.entryPrice || 0;
@@ -315,7 +320,8 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
           stopPrice: finalSlPrice,
           triggerPrice: finalSlPrice,
           algoType: 'CONDITIONAL',
-          type: 'STOP_MARKET'
+          type: 'STOP_MARKET',
+          reduceOnly: 'true'
         };
 
         addLog(`[专属风控] 正在提交 ${position.symbol} 算法止损单 (触发价: ${finalSlPrice})...`, 'TRADE');
@@ -393,6 +399,7 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
 
       setCurrentConfig(updatedConfig);
       onSaveConfig(updatedConfig);
+      onRefreshOrders?.();
 
       const statusSummary = [];
       if (currentConfig.tpSlControl.tpEnabled) statusSummary.push(tpSuccess ? '止盈挂单成功' : '止盈挂单失败');
@@ -428,6 +435,7 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
     };
 
     onSaveConfig(finalConfig);
+    onRefreshOrders?.();
 
     if (isTimeControlActive) {
       addLog(`[时间风控] 已为持仓 ${position.symbol} 激活最大持仓时间风控 (${currentConfig.timeControl.maxHoldMinutes} 分钟)，倒计时现已启动`, 'SUCCESS');
@@ -440,7 +448,7 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
   };
 
   // 当前风控优先级展示预览
-  const previewDisplay = getRiskButtonDisplay(currentConfig);
+  const previewDisplay = getRiskButtonDisplay(currentConfig, openOrders, position || undefined);
 
   if (!isOpen || !position) return null;
 
@@ -988,18 +996,30 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
             <div className="flex items-center gap-2 text-xs">
               <span className="text-zinc-400">当前风控状态将展示为:</span>
               <div className={`px-2.5 py-1 rounded text-xs font-bold flex items-center gap-1.5 ${
-                previewDisplay === '条件风控'
+                previewDisplay === '止盈 / 止损' || previewDisplay === '止盈'
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50'
+                  : previewDisplay === '止损'
+                  ? 'bg-rose-500/20 text-rose-300 border border-rose-500/50'
+                  : previewDisplay === '条件风控'
                   ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50'
                   : previewDisplay === '时间风控'
                   ? 'bg-amber-500/20 text-amber-300 border border-amber-500/50'
                   : 'bg-red-950/40 text-red-300 border border-red-600/50'
               }`}>
-                {previewDisplay === '死斗' ? <Swords size={13} className="text-red-400" /> : <ShieldAlert size={13} />}
+                {previewDisplay === '止盈 / 止损' || previewDisplay === '止盈' ? (
+                  <Target size={13} className="text-emerald-400" />
+                ) : previewDisplay === '止损' ? (
+                  <ShieldAlert size={13} className="text-rose-400" />
+                ) : previewDisplay === '死斗' ? (
+                  <Swords size={13} className="text-red-400" />
+                ) : (
+                  <ShieldAlert size={13} />
+                )}
                 <span>{previewDisplay}</span>
               </div>
             </div>
             <span className="text-[10px] text-zinc-500 font-mono">
-              展示优先级: 条件风控 ＞ 时间风控 ＞ 死斗
+              展示规则: 止盈/止损 ＞ 条件风控 ＞ 时间风控 ＞ 死斗
             </span>
           </div>
 
