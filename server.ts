@@ -80,6 +80,31 @@ db.exec(`
     size INTEGER,
     updated_at INTEGER
   );
+
+  CREATE TABLE IF NOT EXISTS screening_records (
+    id TEXT PRIMARY KEY,
+    scan_time INTEGER,
+    scan_time_str TEXT,
+    cycle_str TEXT,
+    symbol TEXT,
+    current_price REAL,
+    open_4h REAL,
+    change_percent REAL,
+    close_pos REAL,
+    volume_4h REAL,
+    volume_24h REAL,
+    volume_ratio REAL,
+    max_gain_past_k REAL,
+    funding_rate REAL,
+    settlement_cycle TEXT,
+    filter_summary TEXT,
+    is_ordered INTEGER,
+    order_status TEXT,
+    order_reason TEXT,
+    order_id TEXT,
+    created_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_screening_records_scan_time ON screening_records(scan_time DESC);
 `);
 
 // Encryption Helper Functions
@@ -2316,6 +2341,94 @@ async function startServer() {
     }
     broadcastSSE({ type: 'FUNDING_RATES', data: fundingRates });
     res.json({ status: "success", fundingRates });
+  });
+
+  // 4H 周期筛选扫描历史记录 API (支持存储、查询、清空与单条删除)
+  app.get("/api/screening-records", (req, res) => {
+    try {
+      const limit = parseInt(req.query.limit as string, 10) || 1000;
+      const records = db.prepare("SELECT * FROM screening_records ORDER BY scan_time DESC, created_at DESC LIMIT ?").all(limit);
+      res.json(records);
+    } catch (e: any) {
+      console.error("Failed to fetch screening_records:", e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/screening-records", (req, res) => {
+    try {
+      const body = req.body;
+      const recordsToInsert = Array.isArray(body?.records) ? body.records : (Array.isArray(body) ? body : [body]);
+      
+      const insertStmt = db.prepare(`
+        INSERT OR REPLACE INTO screening_records (
+          id, scan_time, scan_time_str, cycle_str, symbol,
+          current_price, open_4h, change_percent, close_pos,
+          volume_4h, volume_24h, volume_ratio, max_gain_past_k,
+          funding_rate, settlement_cycle, filter_summary,
+          is_ordered, order_status, order_reason, order_id, created_at
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?, ?
+        )
+      `);
+
+      const insertMany = db.transaction((records: any[]) => {
+        for (const r of records) {
+          if (!r || !r.symbol) continue;
+          insertStmt.run(
+            r.id || `sr_${Date.now()}_${r.symbol}_${Math.random().toString(36).substring(2, 6)}`,
+            r.scan_time || r.scanTime || Date.now(),
+            r.scan_time_str || r.scanTimeStr || new Date().toISOString().replace('T', ' ').slice(0, 19),
+            r.cycle_str || r.cycleStr || '',
+            (r.symbol || '').toUpperCase(),
+            r.current_price ?? r.currentPrice ?? 0,
+            r.open_4h ?? r.open4h ?? 0,
+            r.change_percent ?? r.changePercent ?? 0,
+            r.close_pos ?? r.closePos ?? 0,
+            r.volume_4h ?? r.volume4h ?? 0,
+            r.volume_24h ?? r.volume24h ?? 0,
+            r.volume_ratio ?? r.volumeRatio ?? 0,
+            r.max_gain_past_k ?? r.maxGainPastK ?? 0,
+            r.funding_rate ?? r.fundingRate ?? 0,
+            r.settlement_cycle || r.settlementCycle || '8h',
+            r.filter_summary || r.filterSummary || '',
+            r.is_ordered ? 1 : (r.isOrdered ? 1 : 0),
+            r.order_status || r.orderStatus || 'NOT_ORDERED',
+            r.order_reason || r.orderReason || '',
+            r.order_id || r.orderId || '',
+            r.created_at || Date.now()
+          );
+        }
+      });
+
+      insertMany(recordsToInsert);
+      res.json({ success: true, count: recordsToInsert.length });
+    } catch (e: any) {
+      console.error("Failed to insert screening_records:", e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/screening-records", (req, res) => {
+    try {
+      db.prepare("DELETE FROM screening_records").run();
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/screening-records/:id", (req, res) => {
+    try {
+      db.prepare("DELETE FROM screening_records WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // Save/update specialized api-credentials (stores account name and api info to local database)

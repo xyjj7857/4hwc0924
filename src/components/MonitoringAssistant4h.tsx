@@ -32,13 +32,15 @@ import {
   ListOrdered,
   BarChart2,
   Filter,
-  Settings2
+  Settings2,
+  FileSpreadsheet
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TradeLog, Position } from '../types';
 import BoardRecordModal from './BoardRecordModal';
 import FilterSettingsModal4h, { FilterSettings4h, DEFAULT_FILTER_SETTINGS_4H } from './FilterSettingsModal4h';
 import OrderSettingsModal4h, { OrderSettings4h, DEFAULT_ORDER_SETTINGS_4H } from './OrderSettingsModal4h';
+import { ScreeningRecordsModal, ScreeningRecord } from './ScreeningRecordsModal';
 import { matchSymbolWithPositions } from '../utils/entryVerification';
 import { useMarketPrices } from '../context/MarketPriceContext';
 
@@ -433,6 +435,121 @@ export default function MonitoringAssistant4h({
       return false;
     }
   });
+
+  // 4H 筛选扫描历史记录状态与弹窗
+  const [isScreeningRecordsModalOpen, setIsScreeningRecordsModalOpen] = useState(false);
+  const [screeningRecords, setScreeningRecords] = useState<ScreeningRecord[]>(() => {
+    try {
+      const saved = localStorage.getItem('monitoring4h_screening_records');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return [];
+  });
+
+  // 从本地数据库加载 4H 筛选历史记录 (限制最多 1000 条)
+  useEffect(() => {
+    fetch('/api/screening-records?limit=1000')
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) {
+          const mapped: ScreeningRecord[] = data.map((d: any) => ({
+            id: d.id,
+            scanTime: d.scan_time || d.scanTime,
+            scanTimeStr: d.scan_time_str || d.scanTimeStr,
+            cycleStr: d.cycle_str || d.cycleStr || '',
+            symbol: d.symbol,
+            currentPrice: d.current_price ?? d.currentPrice ?? 0,
+            open4h: d.open_4h ?? d.open4h ?? 0,
+            changePercent: d.change_percent ?? d.changePercent ?? 0,
+            closePos: d.close_pos ?? d.closePos ?? 0,
+            volume4h: d.volume_4h ?? d.volume4h ?? 0,
+            volume24h: d.volume_24h ?? d.volume24h ?? 0,
+            volumeRatio: d.volume_ratio ?? d.volumeRatio ?? 0,
+            maxGainPastK: d.max_gain_past_k ?? d.maxGainPastK ?? 0,
+            fundingRate: d.funding_rate ?? d.fundingRate ?? 0,
+            settlementCycle: d.settlement_cycle || d.settlementCycle || '8h',
+            filterSummary: d.filter_summary || d.filterSummary || '',
+            isOrdered: Boolean(d.is_ordered ?? d.isOrdered),
+            orderStatus: d.order_status || d.orderStatus || 'NOT_ORDERED',
+            orderReason: d.order_reason || d.orderReason || '',
+            orderId: d.order_id || d.orderId
+          }));
+          setScreeningRecords(mapped);
+          try {
+            localStorage.setItem('monitoring4h_screening_records', JSON.stringify(mapped.slice(0, 500)));
+          } catch {}
+        }
+      })
+      .catch(e => console.warn('Failed to load screening records from DB:', e));
+  }, []);
+
+  // 保存筛选记录辅助函数 (双重持久化: 状态 + 本地数据库 + localStorage)
+  const saveScreeningRecords = useCallback((newRecords: ScreeningRecord[]) => {
+    if (newRecords.length === 0) return;
+    setScreeningRecords(prev => {
+      const updated = [...newRecords, ...prev].slice(0, 1000);
+      try {
+        localStorage.setItem('monitoring4h_screening_records', JSON.stringify(updated.slice(0, 500)));
+      } catch {}
+      return updated;
+    });
+
+    fetch('/api/screening-records', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ records: newRecords })
+    }).catch(err => console.warn('Failed to save screening records to backend DB:', err));
+  }, []);
+
+  // 清空筛选记录
+  const handleClearScreeningRecords = useCallback(async () => {
+    try {
+      await fetch('/api/screening-records', { method: 'DELETE' });
+    } catch (e) {}
+    setScreeningRecords([]);
+    try {
+      localStorage.removeItem('monitoring4h_screening_records');
+    } catch {}
+    addLog?.('[4H筛选记录] 🗑️ 已清空全部 4H 筛选历史记录', 'INFO');
+  }, [addLog]);
+
+  // 刷新筛选记录
+  const handleRefreshScreeningRecords = useCallback(async () => {
+    try {
+      const res = await fetch('/api/screening-records?limit=1000');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          const mapped: ScreeningRecord[] = data.map((d: any) => ({
+            id: d.id,
+            scanTime: d.scan_time || d.scanTime,
+            scanTimeStr: d.scan_time_str || d.scanTimeStr,
+            cycleStr: d.cycle_str || d.cycleStr || '',
+            symbol: d.symbol,
+            currentPrice: d.current_price ?? d.currentPrice ?? 0,
+            open4h: d.open_4h ?? d.open4h ?? 0,
+            changePercent: d.change_percent ?? d.changePercent ?? 0,
+            closePos: d.close_pos ?? d.closePos ?? 0,
+            volume4h: d.volume_4h ?? d.volume4h ?? 0,
+            volume24h: d.volume_24h ?? d.volume24h ?? 0,
+            volumeRatio: d.volume_ratio ?? d.volumeRatio ?? 0,
+            maxGainPastK: d.max_gain_past_k ?? d.maxGainPastK ?? 0,
+            fundingRate: d.funding_rate ?? d.fundingRate ?? 0,
+            settlementCycle: d.settlement_cycle || d.settlementCycle || '8h',
+            filterSummary: d.filter_summary || d.filterSummary || '',
+            isOrdered: Boolean(d.is_ordered ?? d.isOrdered),
+            orderStatus: d.order_status || d.orderStatus || 'NOT_ORDERED',
+            orderReason: d.order_reason || d.orderReason || '',
+            orderId: d.order_id || d.orderId
+          }));
+          setScreeningRecords(mapped);
+          addLog?.(`[4H筛选记录] 🔄 成功刷新筛选历史记录，当前共 ${mapped.length} 条`, 'INFO');
+        }
+      }
+    } catch (e) {
+      addLog?.('[4H筛选记录] 刷新筛选历史记录遇到异常', 'WARN');
+    }
+  }, [addLog]);
 
   // 从本地数据库 (SQLite settings 表) 初始化恢复所有 4H 相关参数配置
   useEffect(() => {
@@ -1167,22 +1284,46 @@ export default function MonitoringAssistant4h({
 
   const lastAutoExecutedCycleRef = useRef<number>(-1);
   const isExecutingAutoTradingRef = useRef<boolean>(false);
+  const isAutoTradingActiveRef = useRef<boolean>(isAutoTradingActive);
+  useEffect(() => {
+    isAutoTradingActiveRef.current = isAutoTradingActive;
+  }, [isAutoTradingActive]);
 
-  const executeAutoTradingBatch = useCallback(async () => {
+  const executeCycleScreeningAndAutoTrading = useCallback(async (cycleId?: number, isManual: boolean = false) => {
     if (isExecutingAutoTradingRef.current) return;
-    if (!isConnected || !apiConfig?.apiKey || !apiConfig?.apiSecret) {
-      addLog?.('[4H自动策略] ⚠️ 触发自动交易，但当前未连接币安 API，已跳过执行', 'WARN');
-      return;
-    }
-
     isExecutingAutoTradingRef.current = true;
-    const currentOrderSettings = orderSettingsRef.current;
-    const currentPositions = positionsRef.current || [];
 
-    addLog?.('[4H自动策略] 🚀 4H 绝对周期时刻触发，开始执行自动筛选与建仓策略...', 'INFO');
+    const now = new Date();
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    const scanTimeStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    
+    // 4H 周期字符串 (如 "04:00~08:00 (4H)")
+    const localH = now.getHours();
+    const cycleStart = Math.floor(localH / 4) * 4;
+    const cycleEnd = (cycleStart + 4) % 24;
+    const cycleStr = `${pad(cycleStart)}:00~${pad(cycleEnd)}:00 (4H)`;
+
+    const currentOrderSettings = orderSettingsRef.current;
+    const currentFilterSettings = filterSettingsRef.current;
+    const currentPositions = positionsRef.current || [];
+    const isAutoActive = isAutoTradingActiveRef.current;
+
+    // 筛选门槛摘要文本快照
+    const fsSummaryParts: string[] = [];
+    if (currentFilterSettings.changePercent?.enabled) fsSummaryParts.push(`4H涨跌[${currentFilterSettings.changePercent.min ?? '-'}, ${currentFilterSettings.changePercent.max ?? '-'}]%`);
+    if (currentFilterSettings.closePos?.enabled) fsSummaryParts.push(`收位[${currentFilterSettings.closePos.min ?? '-'}, ${currentFilterSettings.closePos.max ?? '-'}]%`);
+    if (currentFilterSettings.volumeRatio?.enabled) fsSummaryParts.push(`量比>=${currentFilterSettings.volumeRatio.value ?? '-'}`);
+    if (currentFilterSettings.maxGainPastK?.enabled) fsSummaryParts.push(`前K高<=${currentFilterSettings.maxGainPastK.value ?? '-'}`);
+    if (currentFilterSettings.volume4h?.enabled) fsSummaryParts.push(`4H额>=${currentFilterSettings.volume4h.value ?? '-'}万`);
+    if (currentFilterSettings.volume24h?.enabled) fsSummaryParts.push(`24H额>=${currentFilterSettings.volume24h.value ?? '-'}万`);
+    if (currentFilterSettings.fundingRate?.enabled) fsSummaryParts.push(`费率[${currentFilterSettings.fundingRate.min ?? '-'}, ${currentFilterSettings.fundingRate.max ?? '-'}]%`);
+    if (currentFilterSettings.settlementCycle?.enabled) fsSummaryParts.push(`周期=${currentFilterSettings.settlementCycle.value ?? '-'}`);
+    const filterSummary = fsSummaryParts.join('; ') || '全量无额外条件';
+
+    addLog?.(`[4H筛选${isManual ? '-手动即时' : ''}] ⏱️ 扫描时刻触发，正在全量扫描候选池并生成筛选记录...`, 'INFO');
 
     try {
-      // 第一步：按照筛选设置中4小时绝对周期扫描时刻扫描出满足条件的币对
+      // 第一步：按照筛选设置中 4 小时周期扫描出满足条件的币对
       const candidatesPool = allCandidateSymbols4hRef.current || [];
       const matchedCandidates = candidatesPool
         .filter(item => checkItemMatchesFiltersRef.current(item))
@@ -1193,14 +1334,79 @@ export default function MonitoringAssistant4h({
         });
 
       addLog?.(
-        `[4H自动策略] 第一步：共筛选出 ${matchedCandidates.length} 个达标币对${
+        `[4H筛选] 第一步：共筛选出 ${matchedCandidates.length} 个达标币对${
           matchedCandidates.length > 0 ? ': ' + matchedCandidates.map(c => c.symbol).join(', ') : ' (无满足筛选条件的币对)'
         }`,
         matchedCandidates.length > 0 ? 'SUCCESS' : 'INFO'
       );
 
       if (matchedCandidates.length === 0) {
-        addLog?.('[4H自动策略] 本周期无满足筛选条件的币对，本次策略执行完毕', 'INFO');
+        addLog?.('[4H筛选] 本周期无满足筛选条件的币对，本次筛选扫描完毕', 'INFO');
+        return;
+      }
+
+      // 情况 A: 未开启“自动”交易时（用户要求：在不开启“自动”时也必须完整留存筛选记录及各类参数）
+      if (!isAutoActive) {
+        const recordsToSave: ScreeningRecord[] = matchedCandidates.map(item => {
+          const displayData = getSymbolDisplayDataRef.current(item);
+          const currentPrice = displayData.currentPrice || item.lastPrice || 0;
+          return {
+            id: `${Date.now()}_${item.symbol}_${Math.random().toString(36).substring(2, 7)}`,
+            scanTime: Date.now(),
+            scanTimeStr,
+            cycleStr,
+            symbol: item.symbol,
+            currentPrice,
+            open4h: item.openPrice > 0 ? item.openPrice : currentPrice,
+            changePercent: displayData.effectiveChange,
+            closePos: displayData.closePos,
+            volume4h: displayData.currentVolume,
+            volume24h: item.volume24h || 0,
+            volumeRatio: displayData.volumeRatioPastK,
+            maxGainPastK: displayData.maxGainPastK,
+            fundingRate: displayData.fundingRate,
+            settlementCycle: displayData.settlementCycle,
+            filterSummary,
+            isOrdered: false,
+            orderStatus: 'NOT_ORDERED',
+            orderReason: isManual ? '手动即时扫描（未开启“自动”交易）' : '扫描时刻达标入库（未开启“自动”交易）'
+          };
+        });
+
+        saveScreeningRecords(recordsToSave);
+        addLog?.(`[4H筛选记录] 💾 已将 ${recordsToSave.length} 条达标币对参数记录保存至历史数据库`, 'SUCCESS');
+        return;
+      }
+
+      // 情况 B: 已开启“自动”交易，但未配置或未连接币安 API
+      if (!isConnected || !apiConfig?.apiKey || !apiConfig?.apiSecret) {
+        addLog?.('[4H自动策略] ⚠️ 触发自动交易，但当前未连接币安 API，已跳过下单并留存记录', 'WARN');
+        const recordsToSave: ScreeningRecord[] = matchedCandidates.map(item => {
+          const displayData = getSymbolDisplayDataRef.current(item);
+          const currentPrice = displayData.currentPrice || item.lastPrice || 0;
+          return {
+            id: `${Date.now()}_${item.symbol}_${Math.random().toString(36).substring(2, 7)}`,
+            scanTime: Date.now(),
+            scanTimeStr,
+            cycleStr,
+            symbol: item.symbol,
+            currentPrice,
+            open4h: item.openPrice > 0 ? item.openPrice : currentPrice,
+            changePercent: displayData.effectiveChange,
+            closePos: displayData.closePos,
+            volume4h: displayData.currentVolume,
+            volume24h: item.volume24h || 0,
+            volumeRatio: displayData.volumeRatioPastK,
+            maxGainPastK: displayData.maxGainPastK,
+            fundingRate: displayData.fundingRate,
+            settlementCycle: displayData.settlementCycle,
+            filterSummary,
+            isOrdered: false,
+            orderStatus: 'FAILED',
+            orderReason: '已开启自动交易但未连接币安 API'
+          };
+        });
+        saveScreeningRecords(recordsToSave);
         return;
       }
 
@@ -1216,6 +1422,32 @@ export default function MonitoringAssistant4h({
           `[4H自动策略] 第二步：当前持仓单数 (${currentActiveCount}) 已达到下单设置中最大持仓单数量上限 (${maxPositionsLimit})，本次不开单`,
           'WARN'
         );
+        const recordsToSave: ScreeningRecord[] = matchedCandidates.map(item => {
+          const displayData = getSymbolDisplayDataRef.current(item);
+          const currentPrice = displayData.currentPrice || item.lastPrice || 0;
+          return {
+            id: `${Date.now()}_${item.symbol}_${Math.random().toString(36).substring(2, 7)}`,
+            scanTime: Date.now(),
+            scanTimeStr,
+            cycleStr,
+            symbol: item.symbol,
+            currentPrice,
+            open4h: item.openPrice > 0 ? item.openPrice : currentPrice,
+            changePercent: displayData.effectiveChange,
+            closePos: displayData.closePos,
+            volume4h: displayData.currentVolume,
+            volume24h: item.volume24h || 0,
+            volumeRatio: displayData.volumeRatioPastK,
+            maxGainPastK: displayData.maxGainPastK,
+            fundingRate: displayData.fundingRate,
+            settlementCycle: displayData.settlementCycle,
+            filterSummary,
+            isOrdered: false,
+            orderStatus: 'SKIPPED',
+            orderReason: `持仓单数 (${currentActiveCount}) 已达到上限 (${maxPositionsLimit})`
+          };
+        });
+        saveScreeningRecords(recordsToSave);
         return;
       }
 
@@ -1227,29 +1459,66 @@ export default function MonitoringAssistant4h({
 
       // 第三步：逐一对于满足筛选条件的币对还要判断是否已经有持仓单，如果有则不开单
       let openedCount = 0;
+      const recordsToSave: ScreeningRecord[] = [];
 
       for (const item of matchedCandidates) {
+        const sym = item.symbol;
+        const displayData = getSymbolDisplayDataRef.current(item);
+        const currentPrice = displayData.currentPrice || item.lastPrice || 0;
+        const base4hOpenPrice = item.openPrice > 0 ? item.openPrice : currentPrice;
+
+        const baseRecord: Omit<ScreeningRecord, 'isOrdered' | 'orderStatus' | 'orderReason' | 'orderId'> = {
+          id: `${Date.now()}_${sym}_${Math.random().toString(36).substring(2, 7)}`,
+          scanTime: Date.now(),
+          scanTimeStr,
+          cycleStr,
+          symbol: sym,
+          currentPrice,
+          open4h: base4hOpenPrice,
+          changePercent: displayData.effectiveChange,
+          closePos: displayData.closePos,
+          volume4h: displayData.currentVolume,
+          volume24h: item.volume24h || 0,
+          volumeRatio: displayData.volumeRatioPastK,
+          maxGainPastK: displayData.maxGainPastK,
+          fundingRate: displayData.fundingRate,
+          settlementCycle: displayData.settlementCycle,
+          filterSummary
+        };
+
         if (openedCount >= availableSlots) {
-          addLog?.(`[4H自动策略] 本次新开仓配额 (${availableSlots}) 已用完，停止后续开单`, 'INFO');
-          break;
+          addLog?.(`[4H自动策略] 本次新开仓配额 (${availableSlots}) 已用完，跳过 ${sym}`, 'INFO');
+          recordsToSave.push({
+            ...baseRecord,
+            isOrdered: false,
+            orderStatus: 'SKIPPED',
+            orderReason: `本次新开仓配额 (${availableSlots}) 已用完`
+          });
+          continue;
         }
 
-        const sym = item.symbol;
         const alreadyHolding = currentPositions.some(p => p.symbol === sym && p.amount > 0);
         if (alreadyHolding) {
           addLog?.(`[4H自动策略] 币对 ${sym} 已经在持仓单中，跳过不开单`, 'INFO');
+          recordsToSave.push({
+            ...baseRecord,
+            isOrdered: false,
+            orderStatus: 'SKIPPED',
+            orderReason: '已有该币对有效持仓单'
+          });
           continue;
         }
 
-        // 获取该币对当前价与 4H 开盘价
-        const displayData = getSymbolDisplayDataRef.current(item);
-        const currentPrice = displayData.currentPrice || item.lastPrice;
         if (!currentPrice || currentPrice <= 0) {
           addLog?.(`[4H自动策略] ${sym} 未获取到有效当前价格，跳过`, 'WARN');
+          recordsToSave.push({
+            ...baseRecord,
+            isOrdered: false,
+            orderStatus: 'FAILED',
+            orderReason: '未获取到有效当前价格'
+          });
           continue;
         }
-
-        const base4hOpenPrice = item.openPrice > 0 ? item.openPrice : currentPrice;
 
         // 1. 设置杠杆
         const leverage = currentOrderSettings.leverage.enabled 
@@ -1289,6 +1558,12 @@ export default function MonitoringAssistant4h({
         const formattedQty = formatQtyForSymbol(sym, rawQty);
         if (parseFloat(formattedQty) <= 0) {
           addLog?.(`[4H自动策略] ${sym} 计算下单数量为 0，跳过`, 'WARN');
+          recordsToSave.push({
+            ...baseRecord,
+            isOrdered: false,
+            orderStatus: 'FAILED',
+            orderReason: '计算下单数量小于币安最小步长精度'
+          });
           continue;
         }
 
@@ -1347,11 +1622,23 @@ export default function MonitoringAssistant4h({
           }
         } catch (err: any) {
           addLog?.(`[4H自动策略] ${sym} 开仓网络异常: ${err?.message || err}`, 'ERROR');
+          recordsToSave.push({
+            ...baseRecord,
+            isOrdered: false,
+            orderStatus: 'FAILED',
+            orderReason: `开仓网络异常: ${err?.message || err}`
+          });
           continue;
         }
 
         if (!orderData || (!orderData.orderId && !orderData.clientOrderId)) {
           addLog?.(`[4H自动策略] ${sym} 开仓失败: ${orderData?.msg || '未知错误'}`, 'ERROR');
+          recordsToSave.push({
+            ...baseRecord,
+            isOrdered: false,
+            orderStatus: 'FAILED',
+            orderReason: `下单失败: ${orderData?.msg || '未知错误'}`
+          });
           continue;
         }
 
@@ -1363,6 +1650,14 @@ export default function MonitoringAssistant4h({
           `[4H自动策略] ✅ ${sym} 开仓单完全成交成功！数量: ${finalQtyStr} @ ${avgPrice || '市价'}，3秒后自动挂止损与止盈单...`,
           'SUCCESS'
         );
+
+        recordsToSave.push({
+          ...baseRecord,
+          isOrdered: true,
+          orderStatus: 'ORDERED',
+          orderReason: `已下单成功 (市价买入数量: ${finalQtyStr}, 均价: ${avgPrice || currentPrice})`,
+          orderId: String(orderData.orderId || orderData.clientOrderId || '')
+        });
         openedCount++;
 
         // 开仓单完全成交后 3 秒挂 algo 止损单与 limit 止盈单
@@ -1475,6 +1770,12 @@ export default function MonitoringAssistant4h({
           }
         }, 3000);
       }
+
+      // 保存完整的筛选记录（无论下单成功与否）
+      if (recordsToSave.length > 0) {
+        saveScreeningRecords(recordsToSave);
+        addLog?.(`[4H筛选记录] 💾 已将本次 ${recordsToSave.length} 条达标币对与下单详情存入筛选历史`, 'SUCCESS');
+      }
     } finally {
       isExecutingAutoTradingRef.current = false;
     }
@@ -1483,14 +1784,29 @@ export default function MonitoringAssistant4h({
     apiConfig,
     formatPriceForSymbol,
     formatQtyForSymbol,
+    saveScreeningRecords,
     addLog
   ]);
+
+  const executeCycleScreeningAndAutoTradingRef = useRef(executeCycleScreeningAndAutoTrading);
+  useEffect(() => {
+    executeCycleScreeningAndAutoTradingRef.current = executeCycleScreeningAndAutoTrading;
+  }, [executeCycleScreeningAndAutoTrading]);
+
+  const executeAutoTradingBatch = useCallback(async () => {
+    await executeCycleScreeningAndAutoTrading(undefined, false);
+  }, [executeCycleScreeningAndAutoTrading]);
 
   const executeAutoTradingBatchRef = useRef(executeAutoTradingBatch);
   useEffect(() => {
     executeAutoTradingBatchRef.current = executeAutoTradingBatch;
     (window as any).runAutoTrading4h = executeAutoTradingBatch;
   }, [executeAutoTradingBatch]);
+
+  const handleManualTriggerScan = useCallback(async () => {
+    addLog?.('[4H筛选] 🔍 正在执行手动即时筛选扫描...', 'INFO');
+    await executeCycleScreeningAndAutoTrading(undefined, true);
+  }, [executeCycleScreeningAndAutoTrading, addLog]);
 
   // Audio state
   const [audioFiles, setAudioFiles] = useState<{ gain: string | null; loss: string | null; amp: string | null; spike: string | null }>({
@@ -1853,16 +2169,14 @@ export default function MonitoringAssistant4h({
       const s = diff % 60;
       setCycleCountdown(`${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`);
 
-      // 4H 自动交易定时触发检测（当开启自动后，在筛选设置的绝对时刻自动执行）
-      if (isAutoTradingActive) {
-        const sm = filterSettings.scanMoment || { hour: 3, minute: 58, second: 30 };
-        const scanTargetSec = (sm.hour * 3600) + (sm.minute * 60) + sm.second;
-        const cycleId = Math.floor(now.getTime() / (4 * 3600 * 1000));
+      // 4H 周期筛选扫描时刻定时触发检测（关键规约：无论是否开启自动交易，均在该时刻执行筛选并留存“筛选记录”）
+      const sm = filterSettings.scanMoment || { hour: 3, minute: 58, second: 30 };
+      const scanTargetSec = (sm.hour * 3600) + (sm.minute * 60) + sm.second;
+      const cycleId = Math.floor(now.getTime() / (4 * 3600 * 1000));
 
-        if (totalSecondsInCycle === scanTargetSec && lastAutoExecutedCycleRef.current !== cycleId) {
-          lastAutoExecutedCycleRef.current = cycleId;
-          executeAutoTradingBatchRef.current?.();
-        }
+      if (totalSecondsInCycle === scanTargetSec && lastAutoExecutedCycleRef.current !== cycleId) {
+        lastAutoExecutedCycleRef.current = cycleId;
+        executeCycleScreeningAndAutoTradingRef.current?.(cycleId, false);
       }
     };
 
@@ -3331,6 +3645,25 @@ export default function MonitoringAssistant4h({
                 </div>
 
                 <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
+                  {/* 筛选记录 按钮 (在未开启“自动”时亦完整记录每个扫描时刻满足条件的币对，支持导出下载) */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setIsScreeningRecordsModalOpen(true);
+                    }}
+                    className="px-2.5 py-1.5 rounded-xl border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 hover:border-amber-500/60 text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer select-none active:scale-95 shadow-sm shadow-amber-500/10"
+                    title="点击打开筛选记录：记录每个筛选扫描时刻满足条件的币对详情、参数快照及下单状态，支持导出下载"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-amber-400" />
+                    <span>筛选记录</span>
+                    {screeningRecords.length > 0 && (
+                      <span className="px-1.5 py-0.2 rounded-full bg-amber-500/30 text-amber-200 text-[10px] font-mono font-bold">
+                        {screeningRecords.length}
+                      </span>
+                    )}
+                  </button>
+
                   {/* 筛选设置 按钮 */}
                   <button
                     type="button"
@@ -5214,6 +5547,17 @@ export default function MonitoringAssistant4h({
         onClose={() => setIsOrderSettingsModalOpen(false)}
         settings={orderSettings}
         onSave={handleSaveOrderSettings}
+      />
+
+      {/* 4H 周期筛选扫描历史记录弹窗 (支持查询与下载导出) */}
+      <ScreeningRecordsModal
+        isOpen={isScreeningRecordsModalOpen}
+        onClose={() => setIsScreeningRecordsModalOpen(false)}
+        records={screeningRecords}
+        onClearRecords={handleClearScreeningRecords}
+        onRefreshRecords={handleRefreshScreeningRecords}
+        onManualTriggerScan={handleManualTriggerScan}
+        formatPrice={formatPriceForSymbol}
       />
     </div>
   );
