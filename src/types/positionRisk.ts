@@ -68,13 +68,14 @@ export function detectPositionTpSl(
 
   // 筛选该币对属于当前平仓方向的挂单
   const symbolOrders = openOrders.filter(o => {
-    if (o.symbol.toUpperCase() !== position.symbol.toUpperCase()) return false;
+    if (!o.symbol || o.symbol.toUpperCase() !== position.symbol.toUpperCase()) return false;
     // 双向持仓模式下严格匹配持仓方向
     if (posSide !== 'BOTH' && o.positionSide && o.positionSide !== 'BOTH') {
-      if (o.positionSide !== posSide) return false;
+      if (o.positionSide.toUpperCase() !== posSide.toUpperCase()) return false;
     }
     // 必须是平仓方向 (多单平仓为 SELL，空单平仓为 BUY)
-    return o.side === closingSide;
+    if (o.side && o.side.toUpperCase() !== closingSide) return false;
+    return true;
   });
 
   let foundTpOrder: OpenOrder | undefined = undefined;

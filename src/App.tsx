@@ -57,7 +57,8 @@ import {
   getLocalPositionRiskConfigs, 
   saveLocalPositionRiskConfigs,
   getAllLocalPositionRiskConfigs,
-  saveAllLocalPositionRiskConfigs 
+  saveAllLocalPositionRiskConfigs,
+  detectPositionTpSl
 } from './types/positionRisk';
 import { 
   matchSymbolWithVerificationList, 
@@ -6122,6 +6123,7 @@ export default function App() {
                   <thead className="sticky top-0 bg-[#141416] z-10">
                     <tr className="text-[15px] uppercase tracking-wider text-zinc-300 border-b border-[#232326]">
                       <th className="px-5 py-2 font-medium text-center">合约 / 方向</th>
+                      <th className="px-5 py-2 font-medium text-center">止盈 / 止损</th>
                       <th className="px-5 py-2 font-medium text-center">开仓时间</th>
                       <th className="px-5 py-2 font-medium text-center">开仓 / 标记</th>
                       <th className="px-5 py-2 font-medium text-center">N值</th>
@@ -6136,7 +6138,7 @@ export default function App() {
                     <AnimatePresence initial={false}>
                       {sortedPositions.length === 0 ? (
                         <tr>
-                          <td colSpan={9} className="px-5 py-6 text-center text-zinc-600 italic text-xs">
+                          <td colSpan={10} className="px-5 py-6 text-center text-zinc-600 italic text-xs">
                             暂无合约持仓。
                           </td>
                         </tr>
@@ -6193,6 +6195,50 @@ export default function App() {
                                     周期 {settlementCycle}
                                   </span>
                                 </div>
+                              </td>
+                              <td className="px-4 py-2 text-center whitespace-nowrap">
+                                {(() => {
+                                  const { hasTp, hasSl, tpPrice, slPrice } = detectPositionTpSl(
+                                    pos, 
+                                    openOrders, 
+                                    positionRiskConfigs[pos.id]
+                                  );
+                                  const tpPriceStr = tpPrice && tpPrice > 0 ? formatPrice(pos.symbol, tpPrice) : '';
+                                  const slPriceStr = slPrice && slPrice > 0 ? formatPrice(pos.symbol, slPrice) : '';
+
+                                  if (hasTp && hasSl) {
+                                    return (
+                                      <span 
+                                        className="font-bold text-[14px] px-2.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 inline-flex items-center gap-1 shadow-xs"
+                                        title={`🎯 止盈: ${tpPriceStr || '已挂单'}\n🛡️ 止损: ${slPriceStr || '已挂单'}`}
+                                      >
+                                        <span className="text-emerald-400 font-bold">止盈</span>
+                                        <span className="text-rose-400 font-bold">止损</span>
+                                      </span>
+                                    );
+                                  }
+                                  if (hasTp) {
+                                    return (
+                                      <span 
+                                        className="font-bold text-[14px] px-2.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-xs inline-block"
+                                        title={tpPriceStr ? `止盈价: ${tpPriceStr}` : '止盈委托已挂单'}
+                                      >
+                                        止盈
+                                      </span>
+                                    );
+                                  }
+                                  if (hasSl) {
+                                    return (
+                                      <span 
+                                        className="font-bold text-[14px] px-2.5 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 shadow-xs inline-block"
+                                        title={slPriceStr ? `止损价: ${slPriceStr}` : '止损委托已挂单'}
+                                      >
+                                        止损
+                                      </span>
+                                    );
+                                  }
+                                  return null;
+                                })()}
                               </td>
                               <td className="px-5 py-2 font-mono text-[16.5px] font-bold text-emerald-300 whitespace-nowrap text-center">
                                 {formatDateTime(pos.openTime || pos.timestamp)}
