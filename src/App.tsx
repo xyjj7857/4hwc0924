@@ -2220,6 +2220,7 @@ export default function App() {
   const recentlyClosedPosIdsRef = useRef<Map<string, number>>(new Map());
 
   const positionsRef = useRef<Position[]>(positions);
+  const openOrdersRef = useRef<OpenOrder[]>(openOrders);
   const positionRiskConfigsRef = useRef<Record<string, PositionRiskConfig>>(positionRiskConfigs);
   const isConnectedRef = useRef<boolean>(isConnected);
   const apiConfigRef = useRef<ApiConfig>(apiConfig);
@@ -2227,6 +2228,7 @@ export default function App() {
 
   useEffect(() => {
     positionsRef.current = positions;
+    openOrdersRef.current = openOrders;
     positionRiskConfigsRef.current = positionRiskConfigs;
     isConnectedRef.current = isConnected;
     apiConfigRef.current = apiConfig;
@@ -2361,14 +2363,24 @@ export default function App() {
                 addLog(`[REST轮询兜底] 检测到外部新开仓单同步: ${newPositions.map(p => `${p.symbol} (${p.side === 'BUY' ? '多' : '空'} 数量: ${p.amount})`).join(', ')}，已同步渲染至持仓列表`, 'SUCCESS');
               }
 
-              // 检测已平仓单并自动清理挂单
+              // 检测已平仓单并精准清理对应币对的挂单（不影响其它币对）
               const closedPositions = prevPositions.filter(p => !currentIds.has(p.id));
               if (closedPositions.length > 0) {
-                const closedSymbols = Array.from(new Set(closedPositions.map(p => p.symbol)));
-                addLog(`[REST轮询自愈] 检测到持仓单平仓完成（商品: ${closedPositions.map(p => `${p.symbol} ${p.side === 'BUY' ? '多' : '空'}`).join(', ')}），正在精准清理对应币对 [${closedSymbols.join(', ')}] 的遗留挂单(包括算法单与普通单)...`, 'SUCCESS');
-                for (const sym of closedSymbols) {
-                  handleCancelOrdersBySymbolRef.current(sym);
+                const closedSymbols: string[] = Array.from(new Set(closedPositions.map(p => p.symbol)));
+                // 确保该币对在当前持仓中没有任何剩余仓位（完全平仓）
+                const activeSymbols = new Set(mappedPositions.map(p => p.symbol));
+                const symbolsFullyClosed: string[] = closedSymbols.filter((sym: string) => !activeSymbols.has(sym));
+
+                if (symbolsFullyClosed.length > 0) {
+                  addLog(`[REST轮询自愈] 检测到持仓单平仓完成（商品: ${closedPositions.map(p => `${p.symbol} ${p.side === 'BUY' ? '多' : '空'}`).join(', ')}），正在精准清理对应币对 [${symbolsFullyClosed.join(', ')}] 的所有遗留挂单(包括算法单与普通单)，其他币对挂单完好保留...`, 'SUCCESS');
+                  for (const sym of symbolsFullyClosed) {
+                    recentlyClosedPosIdsRef.current.set(sym, Date.now());
+                    handleCancelOrdersBySymbolRef.current(sym);
+                  }
+                  // 立即在前端委托列表中剔除已平仓币对的挂单，严格保持其它币对挂单完整不变
+                  setOpenOrders(prev => prev.filter(o => !symbolsFullyClosed.includes(o.symbol)));
                 }
+
                 // 同步清理已平仓持仓专属风控配置
                 setPositionRiskConfigs(prev => {
                   let changed = false;
@@ -2443,7 +2455,18 @@ export default function App() {
           }
         }
 
-        const sortedOrders = combinedOrders.sort((a, b) => b.time - a.time);
+        // 关键过滤：若某个币对在 mappedPositions 中已无任何持仓，且刚刚平仓归零，
+        // 则在 combinedOrders 中剔除该已平仓币对的旧委托单，防止交易所 REST 缓存延迟重新带回已撤销挂单，
+        // 同时确保其他仍然有持仓的币对的委托单完好保留、正常展示
+        const activeSymbols = new Set(mappedPositions.map(p => p.symbol));
+        const filteredOrders = combinedOrders.filter(o => {
+          if (!activeSymbols.has(o.symbol) && recentlyClosedPosIdsRef.current.has(o.symbol)) {
+            return false;
+          }
+          return true;
+        });
+
+        const sortedOrders = filteredOrders.sort((a, b) => b.time - a.time);
         setOpenOrders(sortedOrders);
 
         // Always clean up refs for closed positions
@@ -2540,8 +2563,15 @@ export default function App() {
               currentList.splice(existingIndex, 1);
               hasChanges = true;
 
-              addLog(`[WS私有流推流⚡] 检测到持仓单平仓归零: ${closedPos.symbol} (${closedPos.side === 'BUY' ? '多' : '空'})，立即执行挂单精准清扫自愈...`, 'SUCCESS');
-              handleCancelOrdersBySymbolRef.current(closedPos.symbol);
+              // 检查该币对是否还有其他活跃持仓（例如单向持仓已无任何仓位，或双向持仓仍保留另一侧仓位）
+              const hasRemainingPositionForSymbol = currentList.some(item => item.symbol === symbol && item.amount > 0);
+              if (!hasRemainingPositionForSymbol) {
+                addLog(`[WS私有流推流⚡] 检测到持仓单平仓归零: ${closedPos.symbol} (${closedPos.side === 'BUY' ? '多' : '空'})，该币对已无任何持仓，立即执行对应挂单精准撤销清理，其他币对挂单不受任何影响...`, 'SUCCESS');
+                handleCancelOrdersBySymbolRef.current(closedPos.symbol);
+                setOpenOrders(prev => prev.filter(o => o.symbol !== closedPos.symbol));
+              } else {
+                addLog(`[WS私有流推流⚡] 检测到持仓单平仓归零: ${closedPos.symbol} (${closedPos.side === 'BUY' ? '多' : '空'})，但该币对仍有反向持仓，保留其余挂单`, 'INFO');
+              }
 
               // Remove position risk config
               setPositionRiskConfigs(prev => {
@@ -3227,6 +3257,12 @@ export default function App() {
         await handleCancelOrdersBySymbolRef.current(pos.symbol);
       } catch (e) {}
 
+      // 立即在前端精准移除该持仓及对应币对的挂单，确保其他币对挂单与持仓完好无损
+      setPositions(prev => prev.filter(p => p.id !== id));
+      setOpenOrders(prev => prev.filter(o => o.symbol !== pos.symbol));
+      recentlyClosedPosIdsRef.current.set(id, Date.now());
+      recentlyClosedPosIdsRef.current.set(pos.symbol, Date.now());
+
       // 移除该持仓的风控配置（按当前登录账号持久化隔离更新）
       const currentAccount = apiConfigRef.current.accountName || 'default';
       setPositionRiskConfigs(prev => {
@@ -3378,14 +3414,23 @@ export default function App() {
     return () => clearInterval(interval);
   }, [checkPositionsRisk]);
 
-  // 针对特定币对进行精准遗留挂单清理（自愈风控，防止幽灵仓单且不影响其它币对）
+  // 针对特定币对进行精准遗留挂单清理（自愈风控，防止幽灵仓单且绝对不影响其它币对）
   const handleCancelOrdersBySymbol = async (targetSymbol: string) => {
-    if (!isConnected || !targetSymbol) return;
+    if (!isConnectedRef.current || !targetSymbol) return;
 
-    addLog(`[自愈风控] 开始对币对 [${targetSymbol}] 执行遗留挂单精准清理...`, 'INFO');
+    addLogRef.current(`[精准撤单风控] 开始对币对 [${targetSymbol}] 执行遗留挂单精准清理，其他币对挂单保持不变...`, 'INFO');
 
     try {
-      // 第一步：查找并撤销该币对的普通挂单
+      const currentApiKey = apiConfigRef.current.apiKey;
+      const currentApiSecret = apiConfigRef.current.apiSecret;
+      const currentBaseUrl = apiConfigRef.current.baseUrl || "https://fapi.binance.com";
+
+      if (!currentApiKey || !currentApiSecret) {
+        addLogRef.current(`[精准撤单风控] [${targetSymbol}] 缺少 API 凭证，跳过挂单撤销`, 'WARN');
+        return;
+      }
+
+      // 第一步：查找并撤销该币对的普通挂单 (DELETE /fapi/v1/allOpenOrders)
       try {
         const cancelResponse = await fetch('/api/binance-proxy', {
           method: 'POST',
@@ -3394,18 +3439,19 @@ export default function App() {
             method: 'DELETE',
             endpoint: '/fapi/v1/allOpenOrders',
             params: { symbol: targetSymbol },
-            apiKey: apiConfig.apiKey,
-            apiSecret: apiConfig.apiSecret
+            baseUrl: currentBaseUrl,
+            apiKey: currentApiKey,
+            apiSecret: currentApiSecret
           })
         });
         const cancelData = await cancelResponse.json();
         if (cancelResponse.ok) {
-          addLog(`[自愈风控] [${targetSymbol}] 普通遗留挂单已全部撤销`, 'SUCCESS');
+          addLogRef.current(`[精准撤单风控] [${targetSymbol}] 普通遗留挂单已全部成功撤销`, 'SUCCESS');
         } else {
-          addLog(`[自愈风控] [${targetSymbol}] 普通挂单撤销反馈: ${cancelData.msg || '无普通挂单或已清理'}`, 'INFO');
+          addLogRef.current(`[精准撤单风控] [${targetSymbol}] 普通挂单撤销反馈: ${cancelData.msg || '无普通挂单或已清理'}`, 'INFO');
         }
       } catch (e: any) {
-        addLog(`[自愈风控] [${targetSymbol}] 撤销普通挂单网络异常: ${e.message}`, 'ERROR');
+        addLogRef.current(`[精准撤单风控] [${targetSymbol}] 撤销普通挂单网络异常: ${e.message}`, 'ERROR');
       }
 
       // 第二步：查询并撤销该币对的算法委托单（止盈止损条件单）
@@ -3417,9 +3463,9 @@ export default function App() {
             method: 'GET',
             endpoint: '/fapi/v1/openAlgoOrders',
             params: { symbol: targetSymbol },
-            baseUrl: apiConfig.baseUrl || "https://fapi.binance.com",
-            apiKey: apiConfig.apiKey,
-            apiSecret: apiConfig.apiSecret
+            baseUrl: currentBaseUrl,
+            apiKey: currentApiKey,
+            apiSecret: currentApiSecret
           })
         });
 
@@ -3430,39 +3476,64 @@ export default function App() {
           const targetAlgoOrders = allOrders.filter((o: any) => !o.symbol || o.symbol === targetSymbol);
 
           if (targetAlgoOrders.length > 0) {
-            addLog(`[自愈风控] 发现 [${targetSymbol}] 存在 ${targetAlgoOrders.length} 个算法挂单，正在逐一撤销...`, 'INFO');
+            addLogRef.current(`[精准撤单风控] 发现 [${targetSymbol}] 存在 ${targetAlgoOrders.length} 个算法挂单，正在逐一撤销...`, 'INFO');
             for (const order of targetAlgoOrders) {
-              const delResponse = await fetch('/api/binance-proxy', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  method: 'DELETE',
-                  endpoint: '/fapi/v1/algoOrder',
-                  params: { algoId: order.algoId, symbol: targetSymbol },
-                  baseUrl: apiConfig.baseUrl || "https://fapi.binance.com",
-                  apiKey: apiConfig.apiKey,
-                  apiSecret: apiConfig.apiSecret
-                })
-              });
-              if (delResponse.ok) {
-                addLog(`[自愈风控] [${targetSymbol}] 算法单 ${order.algoId} 撤销成功`, 'SUCCESS');
-              } else {
-                const delResult = await delResponse.json();
-                addLog(`[自愈风控] [${targetSymbol}] 算法单 ${order.algoId} 撤销异常: ${delResult.msg || '未知错误'}`, 'INFO');
+              const algoId = order.algoId ?? order.clientAlgoId ?? order.id;
+              if (algoId) {
+                const delResponse = await fetch('/api/binance-proxy', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    method: 'DELETE',
+                    endpoint: '/fapi/v1/algoOrder',
+                    params: { algoId, symbol: targetSymbol },
+                    baseUrl: currentBaseUrl,
+                    apiKey: currentApiKey,
+                    apiSecret: currentApiSecret
+                  })
+                });
+                if (delResponse.ok) {
+                  addLogRef.current(`[精准撤单风控] [${targetSymbol}] 算法单 ${algoId} 撤销成功`, 'SUCCESS');
+                } else {
+                  const delResult = await delResponse.json();
+                  addLogRef.current(`[精准撤单风控] [${targetSymbol}] 算法单 ${algoId} 撤销异常: ${delResult.msg || '未知错误'}`, 'INFO');
+                }
               }
             }
-            addLog(`[自愈风控] [${targetSymbol}] 算法挂单已全部清空`, 'SUCCESS');
+            addLogRef.current(`[精准撤单风控] [${targetSymbol}] 算法挂单已全部清空`, 'SUCCESS');
           } else {
-            addLog(`[自愈风控] [${targetSymbol}] 未发现遗留算法挂单`, 'INFO');
+            addLogRef.current(`[精准撤单风控] [${targetSymbol}] 未发现遗留算法挂单`, 'INFO');
           }
         }
       } catch (e: any) {
-        addLog(`[自愈风控] [${targetSymbol}] 撤销算法单网络异常: ${e.message}`, 'ERROR');
+        addLogRef.current(`[精准撤单风控] [${targetSymbol}] 撤销算法单网络异常: ${e.message}`, 'ERROR');
       }
 
-      addLog(`[自愈风控] [${targetSymbol}] 遗留挂单精准清理完成，其它币对挂单完好保留`, 'SUCCESS');
+      // 第三步：检查本地是否有该币对的算法单（双重兜底，以防 API 汇总查询有延迟）
+      const localAlgoOrders = openOrdersRef.current.filter(o => o.symbol === targetSymbol && o.isAlgo);
+      for (const lo of localAlgoOrders) {
+        try {
+          await fetch('/api/binance-proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              method: 'DELETE',
+              endpoint: '/fapi/v1/algoOrder',
+              params: { algoId: lo.id, symbol: targetSymbol },
+              baseUrl: currentBaseUrl,
+              apiKey: currentApiKey,
+              apiSecret: currentApiSecret
+            })
+          });
+        } catch (_) {}
+      }
+
+      // 第四步：立即从前端委托列表中清除该目标币对挂单，严格保持其它币对挂单完整不变
+      setOpenOrders(prev => prev.filter(o => o.symbol !== targetSymbol));
+
+      addLogRef.current(`[精准撤单风控] [${targetSymbol}] 对应委托单已全部精准撤销清理，其他币对委托单完好保留不受影响`, 'SUCCESS');
     } catch (error) {
-      addLog(`[自愈风控] [${targetSymbol}] 精准清理流程异常: ${error instanceof Error ? error.message : '未知错误'}`, 'ERROR');
+      addLogRef.current(`[精准撤单风控] [${targetSymbol}] 精准清理流程异常: ${error instanceof Error ? error.message : '未知错误'}`, 'ERROR');
     }
   };
 
