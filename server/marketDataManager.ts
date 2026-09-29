@@ -666,80 +666,95 @@ export class MarketDataManager {
   }
 
   private async backfillSymbols(symbols: string[]): Promise<void> {
+    const GROUP_SIZE = 100;
     const BATCH_SIZE = 8;
     let loadedCount = this.historySyncProgress.loaded;
+    const total = symbols.length;
 
-    for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
-      // 若处于熔断静默期，等待解除
-      while (this.isCircuitBroken()) {
-        await new Promise(r => setTimeout(r, 2000));
-      }
+    for (let groupStart = 0; groupStart < symbols.length; groupStart += GROUP_SIZE) {
+      const groupSymbols = symbols.slice(groupStart, groupStart + GROUP_SIZE);
+      const groupIndex = Math.floor(groupStart / GROUP_SIZE) + 1;
+      const totalGroups = Math.ceil(symbols.length / GROUP_SIZE);
 
-      const batch = symbols.slice(i, i + BATCH_SIZE);
-      await Promise.all(batch.map(async (symbol) => {
-        try {
-          const rawKlines = await this.fetchBinanceBackend('/fapi/v1/klines', {
-            symbol,
-            interval: '15m',
-            limit: '500'
-          });
+      for (let i = 0; i < groupSymbols.length; i += BATCH_SIZE) {
+        // 若处于熔断静默期，等待解除
+        while (this.isCircuitBroken()) {
+          await new Promise(r => setTimeout(r, 2000));
+        }
 
-          if (Array.isArray(rawKlines) && rawKlines.length > 0) {
-            const historicalCandles: KlineCandle[] = rawKlines.map((item: any) => ({
-              openTime: Number(item[0]),
-              closeTime: Number(item[6]),
-              open: parseFloat(item[1]) || 0,
-              high: parseFloat(item[2]) || 0,
-              low: parseFloat(item[3]) || 0,
-              close: parseFloat(item[4]) || 0,
-              volume: parseFloat(item[5]) || 0,
-              quoteVolume: parseFloat(item[7]) || 0,
-              trades: Number(item[8]) || 0,
-              isClosed: true
-            }));
+        const batch = groupSymbols.slice(i, i + BATCH_SIZE);
+        await Promise.all(batch.map(async (symbol) => {
+          try {
+            const rawKlines = await this.fetchBinanceBackend('/fapi/v1/klines', {
+              symbol,
+              interval: '15m',
+              limit: '500'
+            });
 
-            let record = this.symbolsMap.get(symbol);
-            if (!record) {
-              record = {
-                symbol,
-                candles15m: historicalCandles,
-                quoteVolume24h: 0,
-                priceChangePercent24h: 0,
-                lastPrice: historicalCandles[historicalCandles.length - 1].close,
-                markPrice: historicalCandles[historicalCandles.length - 1].close,
-                fundingRate: 0,
-                nextFundingTime: 0,
-                fundingIntervalHours: 8,
-                lastUpdated: Date.now()
-              };
-              this.symbolsMap.set(symbol, record);
-            } else {
-              // 权威官方真实 K 线覆盖：若末尾有实时 WebSocket 接收到的未闭合蜡烛，平滑合并
-              const liveCandles = record.candles15m;
-              const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
-              if (lastCandle && (lastCandle as any).isLiveWs) {
-                const merged = historicalCandles.filter(c => c.openTime < lastCandle.openTime);
-                merged.push(lastCandle);
-                record.candles15m = merged.slice(-500);
+            if (Array.isArray(rawKlines) && rawKlines.length > 0) {
+              const historicalCandles: KlineCandle[] = rawKlines.map((item: any) => ({
+                openTime: Number(item[0]),
+                closeTime: Number(item[6]),
+                open: parseFloat(item[1]) || 0,
+                high: parseFloat(item[2]) || 0,
+                low: parseFloat(item[3]) || 0,
+                close: parseFloat(item[4]) || 0,
+                volume: parseFloat(item[5]) || 0,
+                quoteVolume: parseFloat(item[7]) || 0,
+                trades: Number(item[8]) || 0,
+                isClosed: true
+              }));
+
+              let record = this.symbolsMap.get(symbol);
+              if (!record) {
+                record = {
+                  symbol,
+                  candles15m: historicalCandles,
+                  quoteVolume24h: 0,
+                  priceChangePercent24h: 0,
+                  lastPrice: historicalCandles[historicalCandles.length - 1].close,
+                  markPrice: historicalCandles[historicalCandles.length - 1].close,
+                  fundingRate: 0,
+                  nextFundingTime: 0,
+                  fundingIntervalHours: 8,
+                  lastUpdated: Date.now()
+                };
+                this.symbolsMap.set(symbol, record);
               } else {
-                record.candles15m = historicalCandles.slice(-500);
+                // 权威官方真实 K 线覆盖：若末尾有实时 WebSocket 接收到的未闭合蜡烛，平滑合并
+                const liveCandles = record.candles15m;
+                const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
+                if (lastCandle && (lastCandle as any).isLiveWs) {
+                  const merged = historicalCandles.filter(c => c.openTime < lastCandle.openTime);
+                  merged.push(lastCandle);
+                  record.candles15m = merged.slice(-500);
+                } else {
+                  record.candles15m = historicalCandles.slice(-500);
+                }
               }
             }
+          } catch (e: any) {
+            // 单个币对拉取失败不中断整个流程
+          } finally {
+            loadedCount++;
           }
-        } catch (e: any) {
-          // 单个币对拉取失败不中断整个流程
-        } finally {
-          loadedCount++;
-        }
-      }));
+        }));
 
-      // 更新进度
-      const percent = Math.min(100, Math.round((loadedCount / this.historySyncProgress.total) * 100));
-      this.historySyncProgress.loaded = loadedCount;
-      this.historySyncProgress.percent = percent;
+        // 更新进度
+        const percent = Math.min(100, Math.round((loadedCount / this.historySyncProgress.total) * 100));
+        this.historySyncProgress.loaded = loadedCount;
+        this.historySyncProgress.percent = percent;
 
-      // 平滑休眠 150ms 防频控
-      await new Promise(r => setTimeout(r, 150));
+        // 平滑休眠 150ms 防频控
+        await new Promise(r => setTimeout(r, 150));
+      }
+
+      // 每拉完100个币对（且后面还有待拉取的币对组），暂停20秒再拉取下一组
+      if (groupStart + GROUP_SIZE < symbols.length) {
+        this.historySyncProgress.statusText = `已拉完第 ${groupIndex}/${totalGroups} 组（共 ${loadedCount} 币对），暂停 20 秒后拉取下一组...`;
+        this.addLog(`[行情数据源] 15m K线历史数据：已拉完第 ${groupIndex}/${totalGroups} 组（累计 ${loadedCount}/${total} 个币对），按规则暂停 20 秒再拉取下一组...`, 'INFO');
+        await new Promise(r => setTimeout(r, 20000));
+      }
     }
 
     this.historySyncProgress.isComplete = true;

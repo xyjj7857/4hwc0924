@@ -2702,8 +2702,8 @@ export default function App() {
     const startSmartCalibrationTimer = (currentStatus: string) => {
       if (calibrationInterval) clearInterval(calibrationInterval);
       
-      // 用户要求：WebSocket 正常连接时切换为 30 秒低频兜底；断连时自动提速为 3 秒应急轮询
-      const intervalMs = (currentStatus === 'CONNECTED') ? 30000 : 3000;
+      // 用户要求：WebSocket 正常连接时切换为 30 秒低频兜底；断连时自动提速为 15 秒应急轮询
+      const intervalMs = (currentStatus === 'CONNECTED') ? 30000 : 15000;
       
       calibrationInterval = setInterval(() => {
         fetchSnapshot();
@@ -2736,7 +2736,7 @@ export default function App() {
               addLog('[智能降级架构] 币安 WebSocket 实时推流已就续，自动切换为 0 权重实时推流模式 (REST 兜底调至 30 秒低频运行)', 'SUCCESS');
               fetchSnapshot();
             } else if (nextStatus === 'DISCONNECTED' || nextStatus === 'RECONNECTING') {
-              addLog('[智能降级架构] WebSocket 推送断开/重连中，已智能激活 3 秒 REST 极速轮询应急接管...', 'WARN');
+              addLog('[智能降级架构] WebSocket 推送断开/重连中，已智能激活 15 秒 REST 轮询应急接管...', 'WARN');
             }
           } else if (payload.type === 'ACCOUNT_UPDATE' && payload.data) {
             handleAccountDeltaUpdate(payload.data);
@@ -5110,7 +5110,7 @@ export default function App() {
                   userStreamStatus === 'CONNECTED' 
                     ? '币安官方 WebSocket 私有流 (wss://fstream.binance.com/private/ws) 实时推流中，享受 0 API 权重毫秒级推送 (REST 兜底设为 30 秒)' 
                     : userStreamStatus === 'RECONNECTING'
-                    ? '正在自动重连 Binance WebSocket 私有流 (已自动启动 3 秒 REST 应急轮询接管)'
+                    ? '正在自动重连 Binance WebSocket 私有流 (已自动启动 15 秒 REST 应急轮询接管)'
                     : userStreamStatus === 'CONNECTING'
                     ? '正在申请全局 ListenKey 并建立私有推流长连接...'
                     : 'WebSocket 未激活 (当前依赖 30 秒兜底轮询)'
@@ -5127,7 +5127,7 @@ export default function App() {
                   {userStreamStatus === 'CONNECTED' 
                     ? 'WS私有流 0权重⚡' 
                     : userStreamStatus === 'RECONNECTING' 
-                    ? 'WS重连中(3s轮询)' 
+                    ? 'WS重连中(15s轮询)' 
                     : userStreamStatus === 'CONNECTING' 
                     ? 'WS连接中...' 
                     : 'WS未激活(30s轮询)'}
