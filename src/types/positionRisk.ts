@@ -123,26 +123,20 @@ export function detectPositionTpSl(
     }
   }
 
-  // 结合该持仓专属配置的启用状态进行精准兜底
-  const hasTp = Boolean(foundTpOrder || config?.tpSlControl?.tpEnabled);
-  const hasSl = Boolean(foundSlOrder || config?.tpSlControl?.slEnabled);
+  // 严格以当前实际挂单委托列表（openOrders）为准：只有对应平仓委托真实存在时才判定为有效，一旦撤单立即置为 false
+  const hasTp = Boolean(foundTpOrder);
+  const hasSl = Boolean(foundSlOrder);
 
   // 提取对应止盈价
   let tpPrice: number | undefined = undefined;
   if (foundTpOrder) {
     tpPrice = (foundTpOrder.price > 0 ? foundTpOrder.price : foundTpOrder.stopPrice) || undefined;
   }
-  if (!tpPrice && config?.tpSlControl?.tpEnabled && config.tpSlControl.tpPrice > 0) {
-    tpPrice = config.tpSlControl.tpPrice;
-  }
 
   // 提取对应止损价
   let slPrice: number | undefined = undefined;
   if (foundSlOrder) {
     slPrice = (foundSlOrder.stopPrice && foundSlOrder.stopPrice > 0 ? foundSlOrder.stopPrice : foundSlOrder.price) || undefined;
-  }
-  if (!slPrice && config?.tpSlControl?.slEnabled && config.tpSlControl.slPrice > 0) {
-    slPrice = config.tpSlControl.slPrice;
   }
 
   return {

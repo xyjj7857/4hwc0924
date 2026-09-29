@@ -2670,6 +2670,35 @@ export default function App() {
       // Update openOrders state
       setOpenOrders(prev => {
         if (status === 'FILLED' || status === 'CANCELED' || status === 'EXPIRED') {
+          if (status === 'CANCELED') {
+            setPositionRiskConfigs(cfgPrev => {
+              let modified = false;
+              const next = { ...cfgPrev };
+              for (const posKey of Object.keys(next)) {
+                const cfg = next[posKey];
+                if (!cfg?.tpSlControl) continue;
+                const submitted = cfg.tpSlControl.submittedOrders;
+                const isTp = submitted?.tpOrderId === orderIdStr;
+                const isSl = submitted?.slOrderId === orderIdStr || submitted?.slAlgoId === orderIdStr;
+                if (isTp || isSl) {
+                  modified = true;
+                  next[posKey] = {
+                    ...cfg,
+                    tpSlControl: {
+                      ...cfg.tpSlControl,
+                      tpEnabled: isTp ? false : cfg.tpSlControl.tpEnabled,
+                      slEnabled: isSl ? false : cfg.tpSlControl.slEnabled,
+                    }
+                  };
+                }
+              }
+              if (modified) {
+                saveLocalPositionRiskConfigs(next, apiConfigRef.current.accountName);
+                return next;
+              }
+              return cfgPrev;
+            });
+          }
           return prev.filter(o => o.id !== orderIdStr);
         } else if (status === 'NEW' || status === 'PARTIALLY_FILLED') {
           const existingIdx = prev.findIndex(o => o.id === orderIdStr);
@@ -2794,6 +2823,36 @@ export default function App() {
       if (response.ok) {
         addLog(`委托已撤销: ${order.symbol} ${order.id}`, 'SUCCESS');
         setOpenOrders(prev => prev.filter(o => o.id !== order.id));
+
+        // 同步更新专属风控配置中对应止盈/止损的开关状态
+        setPositionRiskConfigs(prev => {
+          let modified = false;
+          const next = { ...prev };
+          for (const posKey of Object.keys(next)) {
+            const cfg = next[posKey];
+            if (!cfg?.tpSlControl) continue;
+            const submitted = cfg.tpSlControl.submittedOrders;
+            const isTp = submitted?.tpOrderId === order.id;
+            const isSl = submitted?.slOrderId === order.id || submitted?.slAlgoId === order.id;
+            if (isTp || isSl) {
+              modified = true;
+              next[posKey] = {
+                ...cfg,
+                tpSlControl: {
+                  ...cfg.tpSlControl,
+                  tpEnabled: isTp ? false : cfg.tpSlControl.tpEnabled,
+                  slEnabled: isSl ? false : cfg.tpSlControl.slEnabled,
+                }
+              };
+            }
+          }
+          if (modified) {
+            saveLocalPositionRiskConfigs(next, apiConfigRef.current.accountName);
+            return next;
+          }
+          return prev;
+        });
+
         setTimeout(() => {
           fetchSnapshotRef.current?.();
         }, 800);
