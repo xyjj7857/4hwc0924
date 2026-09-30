@@ -802,6 +802,7 @@ let fourHourResults4h = {
   gainers: [] as any[],
   losers: [] as any[],
   amplitude15m: [] as any[],
+  allPassedSymbols: [] as any[],
   updatedAt: 0
 };
 
@@ -1058,6 +1059,7 @@ const getFullResults4h = () => {
         gainers,
         losers,
         amplitude15m,
+        allPassedSymbols: finalResults,
         updatedAt: Date.now()
       };
     }
@@ -1279,6 +1281,7 @@ const getFullResults4h = () => {
     gainers: (fourHourResults4h.gainers || []).map(enrichItem4h),
     losers: (fourHourResults4h.losers || []).map(enrichItem4h),
     amplitude15m: (fourHourResults4h.amplitude15m || []).map(enrichItem4h),
+    allPassedSymbols: (fourHourResults4h.allPassedSymbols || []).map(enrichItem4h),
     fourHourUpdatedAt: fourHourResults4h.updatedAt || 0,
 
     volumeSpike: (volumeSpikeAnd24hResults4h.volumeSpike || []).map(enrichItemSpike),
@@ -1419,6 +1422,7 @@ const runCycleScan4h = async (isScheduledOrManual: boolean = true) => {
       gainers,
       losers,
       amplitude15m,
+      allPassedSymbols: finalResults,
       updatedAt: now
     };
 
@@ -1506,6 +1510,7 @@ const runCycleScan4h = async (isScheduledOrManual: boolean = true) => {
           gainers: enriched.gainers,
           losers: enriched.losers,
           amplitude15m: enriched.amplitude15m,
+          allPassedSymbols: enriched.allPassedSymbols,
           updatedAt: enriched.fourHourUpdatedAt
         },
         spikeAnd24hBoards: {
@@ -1607,6 +1612,7 @@ const runVolumeSpikeScanBackend4h = async () => {
           gainers: enrichedSpike.gainers,
           losers: enrichedSpike.losers,
           amplitude15m: enrichedSpike.amplitude15m,
+          allPassedSymbols: enrichedSpike.allPassedSymbols,
           updatedAt: enrichedSpike.fourHourUpdatedAt
         },
         spikeAnd24hBoards: {
@@ -1759,6 +1765,7 @@ setInterval(() => {
         gainers: enriched4h.gainers,
         losers: enriched4h.losers,
         amplitude15m: enriched4h.amplitude15m,
+        allPassedSymbols: enriched4h.allPassedSymbols,
         updatedAt: enriched4h.fourHourUpdatedAt
       },
       spikeAnd24hBoards: {
@@ -2028,6 +2035,7 @@ async function startServer() {
           gainers: enrichedInitial4h.gainers,
           losers: enrichedInitial4h.losers,
           amplitude15m: enrichedInitial4h.amplitude15m,
+          allPassedSymbols: enrichedInitial4h.allPassedSymbols,
           updatedAt: enrichedInitial4h.fourHourUpdatedAt
         },
         spikeAnd24hBoards: {
@@ -2171,6 +2179,7 @@ async function startServer() {
         gainers: currentResults.gainers,
         losers: currentResults.losers,
         amplitude15m: currentResults.amplitude15m,
+        allPassedSymbols: currentResults.allPassedSymbols,
         updatedAt: currentResults.fourHourUpdatedAt
       },
       spikeAnd24hBoards: {
@@ -2224,6 +2233,7 @@ async function startServer() {
           gainers: currentResults.gainers,
           losers: currentResults.losers,
           amplitude15m: currentResults.amplitude15m,
+          allPassedSymbols: currentResults.allPassedSymbols,
           updatedAt: currentResults.fourHourUpdatedAt
         },
         spikeAnd24hBoards: {
@@ -2248,6 +2258,7 @@ async function startServer() {
         gainers: currentResults.gainers,
         losers: currentResults.losers,
         amplitude15m: currentResults.amplitude15m,
+        allPassedSymbols: currentResults.allPassedSymbols,
         updatedAt: currentResults.fourHourUpdatedAt
       },
       spikeAnd24hBoards: {
@@ -2311,6 +2322,7 @@ async function startServer() {
         gainers: currentResults.gainers,
         losers: currentResults.losers,
         amplitude15m: currentResults.amplitude15m,
+        allPassedSymbols: currentResults.allPassedSymbols,
         updatedAt: currentResults.fourHourUpdatedAt
       },
       spikeAnd24hBoards: {
@@ -2336,6 +2348,7 @@ async function startServer() {
         gainers: currentResults.gainers,
         losers: currentResults.losers,
         amplitude15m: currentResults.amplitude15m,
+        allPassedSymbols: currentResults.allPassedSymbols,
         updatedAt: currentResults.fourHourUpdatedAt
       },
       spikeAnd24hBoards: {
@@ -2361,6 +2374,7 @@ async function startServer() {
         gainers: currentResults.gainers,
         losers: currentResults.losers,
         amplitude15m: currentResults.amplitude15m,
+        allPassedSymbols: currentResults.allPassedSymbols,
         updatedAt: currentResults.fourHourUpdatedAt
       },
       spikeAnd24hBoards: {

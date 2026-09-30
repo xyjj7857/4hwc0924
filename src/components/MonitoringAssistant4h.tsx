@@ -157,6 +157,7 @@ interface FourHourBoards {
   gainers: SymbolData[];
   losers: SymbolData[];
   amplitude15m: SymbolData[];
+  allPassedSymbols?: SymbolData[];
   updatedAt?: number;
 }
 
@@ -1169,8 +1170,32 @@ export default function MonitoringAssistant4h({
     });
   }, [fourHourBoards.losers, sortScheme, getSymbolDisplayData, filterSettings.filterTableRows, hasActiveFilters, checkItemMatchesFilters]);
 
-  // 汇总 4H 监控全部候选币对，供 4H 筛选榜单使用
+  // 汇总 4H 监控全部候选币对，供 4H 筛选榜单使用（方案一：优先采用后端全量达标币对池）
   const allCandidateSymbols4h = useMemo(() => {
+    const passedList = fourHourBoards.allPassedSymbols;
+    if (passedList && passedList.length > 0) {
+      const map = new Map<string, SymbolData>();
+      for (const item of passedList) {
+        if (item && item.symbol && !map.has(item.symbol)) {
+          map.set(item.symbol, item);
+        }
+      }
+      // 补充 1h 放量榜与 24h 榜单币对，确保放量异动币也不遗漏
+      const appendList = (arr?: SymbolData[] | VolumeSpikeData[]) => {
+        if (!arr) return;
+        for (const item of arr) {
+          if (item && item.symbol && !map.has(item.symbol)) {
+            map.set(item.symbol, item as SymbolData);
+          }
+        }
+      };
+      appendList(spikeAnd24hBoards.volumeSpike as any);
+      appendList(spikeAnd24hBoards.gainers24h);
+      appendList(spikeAnd24hBoards.losers24h);
+      return Array.from(map.values());
+    }
+
+    // 兜底策略：若全量达标池尚未下发，汇聚 6 个子榜单
     const map = new Map<string, SymbolData>();
     const appendList = (arr?: SymbolData[]) => {
       if (!arr) return;
@@ -2295,6 +2320,7 @@ export default function MonitoringAssistant4h({
           gainers: sse4h.results.gainers || [],
           losers: sse4h.results.losers || [],
           amplitude15m: sse4h.results.amplitude15m || [],
+          allPassedSymbols: sse4h.results.allPassedSymbols || sse4h.fourHourBoards?.allPassedSymbols || [],
           updatedAt: sse4h.results.fourHourUpdatedAt || sse4h.results.timestamp || Date.now()
         });
         setSpikeAnd24hBoards({
@@ -2340,6 +2366,7 @@ export default function MonitoringAssistant4h({
               gainers: data.results.gainers || [],
               losers: data.results.losers || [],
               amplitude15m: data.results.amplitude15m || [],
+              allPassedSymbols: data.results.allPassedSymbols || data.fourHourBoards?.allPassedSymbols || [],
               updatedAt: data.results.fourHourUpdatedAt || 0
             });
             setSpikeAnd24hBoards({
@@ -2480,6 +2507,7 @@ export default function MonitoringAssistant4h({
             gainers: resObj.gainers || data.fourHourBoards?.gainers || [],
             losers: resObj.losers || data.fourHourBoards?.losers || [],
             amplitude15m: resObj.amplitude15m || data.fourHourBoards?.amplitude15m || [],
+            allPassedSymbols: resObj.allPassedSymbols || data.fourHourBoards?.allPassedSymbols || [],
             updatedAt: resObj.fourHourUpdatedAt || data.fourHourBoards?.updatedAt || Date.now()
           });
           setSpikeAnd24hBoards({
@@ -2518,6 +2546,7 @@ export default function MonitoringAssistant4h({
           gainers: results.gainers || data.fourHourBoards?.gainers || [],
           losers: results.losers || data.fourHourBoards?.losers || [],
           amplitude15m: results.amplitude15m || data.fourHourBoards?.amplitude15m || [],
+          allPassedSymbols: results.allPassedSymbols || data.fourHourBoards?.allPassedSymbols || [],
           updatedAt: results.fourHourUpdatedAt || data.fourHourBoards?.updatedAt || Date.now()
         });
         if (results.volumeSpike || data.spikeAnd24hBoards) {
