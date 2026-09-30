@@ -771,6 +771,7 @@ interface MonitoringConfig4h extends MonitoringConfig {
   volumeSpikeMinute: number;
   volumeKCount?: number;
   gainKCount?: number;
+  gainMode?: 'standard' | 'high';
 }
 
 const DEFAULT_CONFIG_4H: MonitoringConfig4h = {
@@ -1339,20 +1340,37 @@ const addMonitorLog4h = (message: string, type: 'INFO' | 'SUCCESS' | 'ERROR' | '
 };
 addMonitorLog4hFn = addMonitorLog4h;
 
-const runCycleScan4h = async () => {
-  if (isScanning4h) return;
-  isScanning4h = true;
-  addMonitorLog4h('[4H周期结算] 启动全市场 4h 榜单量化结算与筛选 (本地聚合计算)...', 'INFO');
+const getGainMode4h = (): 'standard' | 'high' => {
+  if (config4h.gainMode === 'high' || config4h.gainMode === 'standard') {
+    return config4h.gainMode;
+  }
+  try {
+    const row = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitor_4h_gain_mode") as any;
+    if (row && row.value) {
+      const parsed = typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
+      if (parsed === 'high' || parsed === 'standard') return parsed;
+    }
+  } catch {}
+  return 'standard';
+};
+
+const runCycleScan4h = async (isScheduledOrManual: boolean = true) => {
+  if (isScanning4h && isScheduledOrManual) return;
+  if (isScheduledOrManual) {
+    isScanning4h = true;
+    addMonitorLog4h('[4H周期结算] 启动全市场 4h 榜单量化结算与筛选 (本地聚合计算)...', 'INFO');
+  }
   
   try {
     const allSymbols = marketDataManager.getAllSymbols();
     if (allSymbols.length === 0) {
-      isScanning4h = false;
+      if (isScheduledOrManual) isScanning4h = false;
       return;
     }
 
     const min24h = config4h.minVolume24h || config4h.m1 || 15000000;
     const min4h = config4h.minVolumeCycle || config4h.n1 || 10000000;
+    const currentGainMode = getGainMode4h();
 
     let passedCount = 0;
     const finalResults: any[] = [];
@@ -1364,15 +1382,17 @@ const runCycleScan4h = async () => {
       const kline = marketDataManager.getSymbol4hKline(symbol, config4h.volumeKCount || 12, config4h.gainKCount || 6);
       if (kline && kline.volume > min4h) {
         passedCount++;
-        const highChange = kline.close > 0 && kline.open > 0 ? ((kline.close - kline.open) / kline.close) * 100 : kline.change;
+        const price = marketDataManager.getSymbolPrice(symbol) || kline.close;
+        const change = kline.open > 0 ? ((price - kline.open) / kline.open) * 100 : kline.change;
+        const highChange = price > 0 && kline.open > 0 ? ((price - kline.open) / price) * 100 : change;
         const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
         finalResults.push({
           symbol,
           volume24h: vol24h,
           volume15m: kline.volume,
           openPrice: kline.open,
-          lastPrice: kline.close,
-          change: kline.change,
+          lastPrice: price,
+          change,
           highChange,
           change24h: marketDataManager.getSymbol24hChange(symbol),
           amplitude: kline.amplitude,
@@ -1389,8 +1409,9 @@ const runCycleScan4h = async () => {
       }
     }
 
-    const gainers = [...finalResults].sort((a, b) => b.change - a.change).slice(0, 5);
-    const losers = [...finalResults].sort((a, b) => a.change - b.change).slice(0, 5);
+    const sortKey = currentGainMode === 'high' ? 'highChange' : 'change';
+    const gainers = [...finalResults].sort((a, b) => b[sortKey] - a[sortKey]).slice(0, 5);
+    const losers = [...finalResults].sort((a, b) => a[sortKey] - b[sortKey]).slice(0, 5);
     const amplitude15m = [...finalResults].sort((a, b) => (b.amplitude || 0) - (a.amplitude || 0)).slice(0, 5);
 
     const now = Date.now();
@@ -1407,14 +1428,71 @@ const runCycleScan4h = async () => {
       passedCount
     };
 
-    try {
-      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(
-        "four_hour_results_4h",
-        JSON.stringify(fourHourResults4h)
-      );
-    } catch (e) {}
+    if (isScheduledOrManual) {
+      try {
+        db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(
+          "four_hour_results_4h",
+          JSON.stringify(fourHourResults4h)
+        );
+      } catch (e) {}
 
-    addMonitorLog4h(`[4H周期结算] 结算完成，共 ${passedCount} 个币对达标，已重新决出 4h 级别 Top 5 榜单（0 API消耗）。`, 'SUCCESS');
+      addMonitorLog4h(`[4H周期结算] 结算完成，共 ${passedCount} 个币对达标，已重新决出 4h 级别 Top 5 榜单（0 API消耗）。`, 'SUCCESS');
+
+      // Check for alerts
+      const maxGain = gainers.length > 0 ? (currentGainMode === 'high' ? gainers[0].highChange : gainers[0].change) : 0;
+      const maxLoss = losers.length > 0 ? Math.abs(currentGainMode === 'high' ? losers[0].highChange : losers[0].change) : 0;
+      const maxAmplitude = amplitude15m.length > 0 ? (amplitude15m[0].amplitude || 0) : 0;
+
+      if (maxGain >= config4h.gainThreshold) {
+        addMonitorLog4h(`【价格报警4h】 触发4h涨幅报警点位！当前最高涨幅: +${maxGain.toFixed(2)}% (${gainers[0].symbol})`, 'SUCCESS');
+        try {
+          const stmt = db.prepare(`
+            INSERT INTO alert_logs (trigger_time, symbol, board_name, change_val, volume_15m)
+            VALUES (?, ?, ?, ?, ?)
+          `);
+          for (const item of gainers) {
+            const chgVal = currentGainMode === 'high' ? item.highChange : item.change;
+            if (chgVal >= config4h.gainThreshold) {
+              stmt.run(now, item.symbol, "4小时涨幅榜", (chgVal >= 0 ? "+" : "") + chgVal.toFixed(2) + "%", item.volume15m);
+            }
+          }
+        } catch (e: any) {}
+        broadcastSSE({ type: 'ALERT', data: { type: 'gain', level: '4h', symbol: gainers[0].symbol, val: maxGain } });
+      }
+
+      if (maxLoss >= config4h.lossThreshold) {
+        addMonitorLog4h(`【价格报警4h】 触发4h跌幅报警点位！当前最高跌幅: -${maxLoss.toFixed(2)}% (${losers[0].symbol})`, 'SUCCESS');
+        try {
+          const stmt = db.prepare(`
+            INSERT INTO alert_logs (trigger_time, symbol, board_name, change_val, volume_15m)
+            VALUES (?, ?, ?, ?, ?)
+          `);
+          for (const item of losers) {
+            const chgVal = Math.abs(currentGainMode === 'high' ? item.highChange : item.change);
+            if (chgVal >= config4h.lossThreshold) {
+              stmt.run(now, item.symbol, "4小时跌幅榜", (item.change >= 0 ? "+" : "") + item.change.toFixed(2) + "%", item.volume15m);
+            }
+          }
+        } catch (e: any) {}
+        broadcastSSE({ type: 'ALERT', data: { type: 'loss', level: '4h', symbol: losers[0].symbol, val: maxLoss } });
+      }
+
+      if (maxAmplitude >= config4h.amplitudeThreshold) {
+        addMonitorLog4h(`【价格报警4h】 触发4h振幅报警点位！当前最高振幅: ${maxAmplitude.toFixed(2)}% (${amplitude15m[0].symbol})`, 'SUCCESS');
+        try {
+          const stmt = db.prepare(`
+            INSERT INTO alert_logs (trigger_time, symbol, board_name, change_val, volume_15m)
+            VALUES (?, ?, ?, ?, ?)
+          `);
+          for (const item of amplitude15m) {
+            if (item.amplitude >= config4h.amplitudeThreshold) {
+              stmt.run(now, item.symbol, "4小时振幅榜", item.amplitude.toFixed(2) + "%", item.volume15m);
+            }
+          }
+        } catch (e: any) {}
+        broadcastSSE({ type: 'ALERT', data: { type: 'amp', level: '4h', symbol: amplitude15m[0].symbol, val: maxAmplitude } });
+      }
+    }
 
     // Broadcast SSE
     const enriched = getFullResults4h();
@@ -1444,64 +1522,14 @@ const runCycleScan4h = async () => {
         dataEngine: marketDataManager.getEngineStatus()
       }
     });
-
-    // Check for alerts
-    const maxGain = gainers.length > 0 ? gainers[0].change : 0;
-    const maxLoss = losers.length > 0 ? Math.abs(losers[0].change) : 0;
-    const maxAmplitude = amplitude15m.length > 0 ? (amplitude15m[0].amplitude || 0) : 0;
-
-    if (maxGain >= config4h.gainThreshold) {
-      addMonitorLog4h(`【价格报警4h】 触发4h涨幅报警点位！当前最高涨幅: +${maxGain.toFixed(2)}% (${gainers[0].symbol})`, 'SUCCESS');
-      try {
-        const stmt = db.prepare(`
-          INSERT INTO alert_logs (trigger_time, symbol, board_name, change_val, volume_15m)
-          VALUES (?, ?, ?, ?, ?)
-        `);
-        for (const item of gainers) {
-          if (item.change >= config4h.gainThreshold) {
-            stmt.run(now, item.symbol, "4小时涨幅榜", "+" + item.change.toFixed(2) + "%", item.volume15m);
-          }
-        }
-      } catch (e: any) {}
-      broadcastSSE({ type: 'ALERT', data: { type: 'gain', level: '4h', symbol: gainers[0].symbol, val: maxGain } });
-    }
-
-    if (maxLoss >= config4h.lossThreshold) {
-      addMonitorLog4h(`【价格报警4h】 触发4h跌幅报警点位！当前最高跌幅: -${maxLoss.toFixed(2)}% (${losers[0].symbol})`, 'SUCCESS');
-      try {
-        const stmt = db.prepare(`
-          INSERT INTO alert_logs (trigger_time, symbol, board_name, change_val, volume_15m)
-          VALUES (?, ?, ?, ?, ?)
-        `);
-        for (const item of losers) {
-          if (Math.abs(item.change) >= config4h.lossThreshold) {
-            stmt.run(now, item.symbol, "4小时跌幅榜", (item.change >= 0 ? "+" : "") + item.change.toFixed(2) + "%", item.volume15m);
-          }
-        }
-      } catch (e: any) {}
-      broadcastSSE({ type: 'ALERT', data: { type: 'loss', level: '4h', symbol: losers[0].symbol, val: maxLoss } });
-    }
-
-    if (maxAmplitude >= config4h.amplitudeThreshold) {
-      addMonitorLog4h(`【价格报警4h】 触发4h振幅报警点位！当前最高振幅: ${maxAmplitude.toFixed(2)}% (${amplitude15m[0].symbol})`, 'SUCCESS');
-      try {
-        const stmt = db.prepare(`
-          INSERT INTO alert_logs (trigger_time, symbol, board_name, change_val, volume_15m)
-          VALUES (?, ?, ?, ?, ?)
-        `);
-        for (const item of amplitude15m) {
-          if (item.amplitude >= config4h.amplitudeThreshold) {
-            stmt.run(now, item.symbol, "4小时振幅榜", item.amplitude.toFixed(2) + "%", item.volume15m);
-          }
-        }
-      } catch (e: any) {}
-      broadcastSSE({ type: 'ALERT', data: { type: 'amp', level: '4h', symbol: amplitude15m[0].symbol, val: maxAmplitude } });
-    }
-
   } catch (error: any) {
-    addMonitorLog4h('[4H周期结算] 结算失败: ' + String(error.message || error), 'ERROR');
+    if (isScheduledOrManual) {
+      addMonitorLog4h('[4H周期结算] 结算失败: ' + String(error.message || error), 'ERROR');
+    }
   } finally {
-    isScanning4h = false;
+    if (isScheduledOrManual) {
+      isScanning4h = false;
+    }
   }
 };
 
@@ -1625,6 +1653,7 @@ const runVolumeSpikeScanBackend4h = async () => {
   }
 };
 
+let dynamicScan4hCounter = 0;
 function runBackgroundMonitor4h() {
   setInterval(async () => {
     const now = new Date();
@@ -1653,6 +1682,14 @@ function runBackgroundMonitor4h() {
     const ss = spikeDiff % 60;
     spikeCountdown1h = `${sm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`;
 
+    // 方案 A 核心：每 3 秒自动进行全市场 4H 动态出榜扫描（纯本地内存聚合，0 API 消耗），
+    // 确保右侧榜单实时反映全市场热点异动，无需用户手动点击“立即结算4H”
+    dynamicScan4hCounter++;
+    if (dynamicScan4hCounter >= 3) {
+      dynamicScan4hCounter = 0;
+      runCycleScan4h(false).catch(() => {});
+    }
+
     if (!isRunning4h) return;
     
     // Check 1h volume spike scan trigger
@@ -1664,7 +1701,7 @@ function runBackgroundMonitor4h() {
 
     if (totalSecondsInCycle >= settleTargetSeconds && last4hCycleTrigger !== currentCycleStart) {
       last4hCycleTrigger = currentCycleStart;
-      runCycleScan4h();
+      runCycleScan4h(true);
     }
   }, 1000);
 }
@@ -2239,12 +2276,16 @@ async function startServer() {
         m1: newConfig.m1 ?? newConfig.minVolume24h ?? config4h.m1,
         n1: newConfig.n1 ?? newConfig.minVolumeCycle ?? config4h.n1,
         volumeKCount: newConfig.volumeKCount ?? config4h.volumeKCount ?? 12,
-        gainKCount: newConfig.gainKCount ?? config4h.gainKCount ?? 6
+        gainKCount: newConfig.gainKCount ?? config4h.gainKCount ?? 6,
+        gainMode: (newConfig.gainMode === 'high' || newConfig.gainMode === 'standard') ? newConfig.gainMode : config4h.gainMode
       };
       try {
         db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run("monitoring_config_4h", JSON.stringify(config4h));
       } catch (e) {}
       addMonitorLog4h('[4H监控] 4H 监控配置参数已更新并成功同步到后端。', 'SUCCESS');
+      if (newConfig.gainMode) {
+        runCycleScan4h(false).catch(() => {});
+      }
     }
     res.json({ config: config4h });
   });

@@ -6528,6 +6528,7 @@ export default function App() {
           isMuted={isMuted}
           positions={positions}
           exchangeInfo={exchangeInfo}
+          balance={balance}
         />
       </div>
 
