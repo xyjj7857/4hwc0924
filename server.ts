@@ -107,6 +107,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_screening_records_scan_time ON screening_records(scan_time DESC);
 `);
 
+// Initialize weight stats persistence from database (7x24 background persistence)
+weightStatsManager.initFromDatabase(db);
+
+// Helper for Binance Signature
+const getSignature = (queryString: string, secret: string) => {
+  return CryptoJS.HmacSHA256(queryString, secret).toString(CryptoJS.enc.Hex);
+};
+
 // Encryption Helper Functions
 const ENCRYPTION_KEY = process.env.API_ENCRYPTION_KEY || "BinanceTradingS3cr3tK3y!@#";
 const encrypt = (text: string) => {
@@ -1659,6 +1667,528 @@ const runVolumeSpikeScanBackend4h = async () => {
   }
 };
 
+// ==========================================
+// 4H 服务端 7x24 常驻自动化交易与全量达标筛选引擎
+// 无论用户是否开启前端浏览器，本引擎在后台 Node 进程中自主准时运行
+// ==========================================
+let cachedBackendExchangeInfo: any = null;
+let lastBackendExchangeInfoFetch = 0;
+
+async function getBackendExchangeInfo(): Promise<any> {
+  const now = Date.now();
+  if (cachedBackendExchangeInfo && now - lastBackendExchangeInfoFetch < 3600000) {
+    return cachedBackendExchangeInfo;
+  }
+  try {
+    const res = await fetch("https://fapi.binance.com/fapi/v1/exchangeInfo");
+    if (res.ok) {
+      cachedBackendExchangeInfo = await res.json();
+      lastBackendExchangeInfoFetch = now;
+      return cachedBackendExchangeInfo;
+    }
+  } catch (e) {
+    console.warn("[BackendTradingEngine] 获取 exchangeInfo 失败:", e);
+  }
+  return cachedBackendExchangeInfo || { symbols: [] };
+}
+
+function formatQtyForBackend(sym: string, qty: number, exchangeInfo: any): string {
+  if (qty == null || isNaN(qty)) return '0';
+  const info = exchangeInfo?.symbols?.find((s: any) => s.symbol === sym);
+  if (!info) return String(qty);
+  const lotSize = info.filters?.find((f: any) => f.filterType === 'LOT_SIZE');
+  if (lotSize && parseFloat(lotSize.stepSize) > 0) {
+    const stepSize = parseFloat(lotSize.stepSize);
+    const roundedQty = Math.floor(qty / stepSize) * stepSize;
+    return roundedQty.toFixed(info.quantityPrecision !== undefined ? info.quantityPrecision : 2);
+  }
+  return qty.toFixed(info.quantityPrecision !== undefined ? info.quantityPrecision : 2);
+}
+
+function formatPriceForBackend(sym: string, price: number, exchangeInfo: any): string {
+  if (price == null || isNaN(price)) return '0';
+  const info = exchangeInfo?.symbols?.find((s: any) => s.symbol === sym);
+  if (!info) return String(price);
+  const priceFilter = info.filters?.find((f: any) => f.filterType === 'PRICE_FILTER');
+  if (priceFilter && parseFloat(priceFilter.tickSize) > 0) {
+    const tickSize = parseFloat(priceFilter.tickSize);
+    const roundedPrice = Math.round(price / tickSize) * tickSize;
+    return roundedPrice.toFixed(info.pricePrecision !== undefined ? info.pricePrecision : 4);
+  }
+  return price.toFixed(info.pricePrecision !== undefined ? info.pricePrecision : 4);
+}
+
+async function callBinanceSigned(
+  endpoint: string,
+  method: string = "GET",
+  params: Record<string, any> = {},
+  apiKey: string,
+  apiSecret: string,
+  baseUrl: string = "https://fapi.binance.com"
+): Promise<any> {
+  const timestamp = Date.now();
+  const baseParams: any = {
+    ...params,
+    timestamp: timestamp.toString()
+  };
+  const queryString = new URLSearchParams(baseParams).toString();
+  const signature = getSignature(queryString, apiSecret);
+  const safeEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+
+  let url = `${baseUrl}${safeEndpoint}`;
+  const options: any = {
+    method,
+    headers: {
+      "X-MBX-APIKEY": apiKey,
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+  };
+
+  if (method === "POST" || method === "PUT" || method === "DELETE") {
+    const bodyParams = new URLSearchParams({
+      ...baseParams,
+      signature
+    });
+    options.body = bodyParams.toString();
+    options.headers["Content-Type"] = "application/x-www-form-urlencoded";
+  } else {
+    url += `?${queryString}&signature=${signature}`;
+  }
+
+  const res = await fetch(url, options);
+  weightStatsManager.recordApiCall({
+    endpoint: safeEndpoint,
+    method,
+    queryParams: baseParams,
+    status: res.status,
+    source: "4H后台常驻自动交易",
+    headers: res.headers
+  });
+  return res.json();
+}
+
+let lastBackendAutoExecutedCycle: number = -1;
+
+async function executeAutoTradingBackend4h(cycleId: number) {
+  if (lastBackendAutoExecutedCycle === cycleId) return;
+  lastBackendAutoExecutedCycle = cycleId;
+
+  let isAutoActive = false;
+  let filterSettings: any = null;
+  let orderSettings: any = null;
+  let apiConfig: any = null;
+
+  try {
+    const autoRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_auto_trading") as any;
+    if (autoRow) isAutoActive = Boolean(JSON.parse(autoRow.value));
+
+    const fsRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_filter_settings") as any;
+    if (fsRow) filterSettings = JSON.parse(fsRow.value);
+
+    const osRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_order_settings") as any;
+    if (osRow) orderSettings = JSON.parse(osRow.value);
+
+    const apiRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("apiConfig") as any;
+    if (apiRow) apiConfig = JSON.parse(apiRow.value);
+  } catch (e) {
+    console.error("[4H自动策略-后端] 读取持久化配置失败:", e);
+  }
+
+  // 获取本次 4H 结算的全量达标币对池
+  const allPassed = (fourHourResults4h.allPassedSymbols || []) as any[];
+  if (!allPassed || allPassed.length === 0) {
+    addMonitorLog4h('[4H自动策略-后端常驻] 本周期全量达标币对池为空，无需筛选', 'INFO');
+    return;
+  }
+
+  const now = new Date();
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const scanTimeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const cycleEnd = Math.floor(now.getHours() / 4) * 4;
+  const cycleStart = (cycleEnd - 4 + 24) % 24;
+  const cycleStr = `${pad(cycleStart)}:00~${pad(cycleEnd)}:00 (4H)`;
+
+  const checkMatches = (item: any) => {
+    if (!filterSettings) return true;
+    const chg = item.highChange !== undefined ? item.highChange : item.change;
+    
+    // 涨跌幅
+    if (filterSettings.changePercent?.enabled) {
+      const min = filterSettings.changePercent.min;
+      const max = filterSettings.changePercent.max;
+      if (min !== undefined && min !== null && chg < min) return false;
+      if (max !== undefined && max !== null && chg > max) return false;
+    }
+    // 收位
+    if (filterSettings.closePos?.enabled) {
+      const min = filterSettings.closePos.min;
+      const max = filterSettings.closePos.max;
+      const closePos = item.closePos ?? 0;
+      if (min !== undefined && min !== null && closePos < min) return false;
+      if (max !== undefined && max !== null && closePos > max) return false;
+    }
+    // 量比
+    if (filterSettings.volumeRatio?.enabled) {
+      const val = filterSettings.volumeRatio.value;
+      const vRatio = item.volumeRatioPastK ?? 0;
+      if (val !== undefined && val !== null && vRatio < val) return false;
+    }
+    // 前K高
+    if (filterSettings.maxGainPastK?.enabled) {
+      const val = filterSettings.maxGainPastK.value;
+      const mGain = item.maxGainPastK_standard ?? item.maxGainPastK ?? 0;
+      if (val !== undefined && val !== null && mGain > val) return false;
+    }
+    // 4H 成交额 (万)
+    if (filterSettings.volume4h?.enabled) {
+      const val = filterSettings.volume4h.value;
+      const vol4hTenK = (item.volume15m || 0) / 10000;
+      if (val !== undefined && val !== null && vol4hTenK < val) return false;
+    }
+    // 24H 成交额 (万)
+    if (filterSettings.volume24h?.enabled) {
+      const val = filterSettings.volume24h.value;
+      const vol24hTenK = (item.volume24h || 0) / 10000;
+      if (val !== undefined && val !== null && vol24hTenK < val) return false;
+    }
+    // 资金费率
+    if (filterSettings.fundingRate?.enabled) {
+      const min = filterSettings.fundingRate.min;
+      const max = filterSettings.fundingRate.max;
+      const rate = item.fundingRate ?? 0;
+      if (min !== undefined && min !== null && rate < min) return false;
+      if (max !== undefined && max !== null && rate > max) return false;
+    }
+    // 结算周期
+    if (filterSettings.settlementCycle?.enabled) {
+      const val = filterSettings.settlementCycle.value;
+      const cycle = item.settlementCycle || '';
+      if (val && cycle !== val) return false;
+    }
+    return true;
+  };
+
+  const matched = allPassed.filter(checkMatches).sort((a, b) => {
+    const chgA = a.highChange !== undefined ? a.highChange : a.change;
+    const chgB = b.highChange !== undefined ? b.highChange : b.change;
+    return chgB - chgA;
+  });
+
+  const fsSummaryParts: string[] = [];
+  if (filterSettings?.changePercent?.enabled) fsSummaryParts.push(`4H涨跌[${filterSettings.changePercent.min ?? '-'}, ${filterSettings.changePercent.max ?? '-'}]%`);
+  if (filterSettings?.closePos?.enabled) fsSummaryParts.push(`收位[${filterSettings.closePos.min ?? '-'}, ${filterSettings.closePos.max ?? '-'}]%`);
+  if (filterSettings?.volumeRatio?.enabled) fsSummaryParts.push(`量比>=${filterSettings.volumeRatio.value ?? '-'}`);
+  if (filterSettings?.maxGainPastK?.enabled) fsSummaryParts.push(`前K高<=${filterSettings.maxGainPastK.value ?? '-'}`);
+  if (filterSettings?.volume4h?.enabled) fsSummaryParts.push(`4H额>=${filterSettings.volume4h.value ?? '-'}万`);
+  const filterSummary = fsSummaryParts.join('; ') || '全量无额外条件';
+
+  addMonitorLog4h(
+    `[4H自动策略-后端常驻] 周期结算时刻：全量筛选出 ${matched.length} 个达标币对${
+      matched.length > 0 ? ': ' + matched.map(m => m.symbol).join(', ') : ' (无符合条件的币对)'
+    }`,
+    matched.length > 0 ? 'SUCCESS' : 'INFO'
+  );
+
+  const insertStmt = db.prepare(`
+    INSERT OR REPLACE INTO screening_records (
+      id, scan_time, scan_time_str, cycle_str, symbol,
+      current_price, open_4h, change_percent, close_pos,
+      volume_4h, volume_24h, volume_ratio, max_gain_past_k,
+      funding_rate, settlement_cycle, filter_summary,
+      is_ordered, order_status, order_reason, order_id, created_at
+    ) VALUES (
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?,
+      ?, ?, ?, ?, ?
+    )
+  `);
+
+  if (!isAutoActive) {
+    for (const item of matched) {
+      const recId = `${Date.now()}_${item.symbol}_${Math.random().toString(36).substring(2, 7)}`;
+      insertStmt.run(
+        recId, Date.now(), scanTimeStr, cycleStr, item.symbol,
+        item.lastPrice || 0, item.openPrice || 0, item.highChange ?? item.change ?? 0, item.closePos || 0,
+        item.volume15m || 0, item.volume24h || 0, item.volumeRatioPastK || 0, item.maxGainPastK_standard || 0,
+        item.fundingRate || 0, item.settlementCycle || '', filterSummary,
+        0, 'NOT_ORDERED', '后台常驻扫描时刻达标入库（未开启自动交易）', '', Date.now()
+      );
+    }
+    return;
+  }
+
+  // 已开启自动交易但未配置 API Key
+  if (!apiConfig || !apiConfig.apiKey || !apiConfig.apiSecret) {
+    addMonitorLog4h('[4H自动策略-后端常驻] ⚠️ 已开启自动交易，但未在系统配置币安 API Key，无法自动下单', 'INFO');
+    for (const item of matched) {
+      const recId = `${Date.now()}_${item.symbol}_${Math.random().toString(36).substring(2, 7)}`;
+      insertStmt.run(
+        recId, Date.now(), scanTimeStr, cycleStr, item.symbol,
+        item.lastPrice || 0, item.openPrice || 0, item.highChange ?? item.change ?? 0, item.closePos || 0,
+        item.volume15m || 0, item.volume24h || 0, item.volumeRatioPastK || 0, item.maxGainPastK_standard || 0,
+        item.fundingRate || 0, item.settlementCycle || '', filterSummary,
+        0, 'FAILED', '已开启自动交易但未配置币安 API 凭据', '', Date.now()
+      );
+    }
+    return;
+  }
+
+  // 获取币安持仓信息
+  const exInfo = await getBackendExchangeInfo();
+  let currentPositions: any[] = [];
+  let futuresBalance = 0;
+
+  try {
+    const posRes = await callBinanceSigned(
+      '/fapi/v2/positionRisk',
+      'GET',
+      {},
+      apiConfig.apiKey,
+      apiConfig.apiSecret,
+      apiConfig.baseUrl
+    );
+    if (Array.isArray(posRes)) {
+      currentPositions = posRes.filter((p: any) => parseFloat(p.positionAmt) !== 0);
+    }
+  } catch (e: any) {
+    console.error('[4H自动策略-后端] 获取持仓失败:', e);
+  }
+
+  try {
+    const balRes = await callBinanceSigned(
+      '/fapi/v2/balance',
+      'GET',
+      {},
+      apiConfig.apiKey,
+      apiConfig.apiSecret,
+      apiConfig.baseUrl
+    );
+    if (Array.isArray(balRes)) {
+      const usdt = balRes.find((b: any) => b.asset === 'USDT');
+      if (usdt) {
+        futuresBalance = parseFloat(usdt.availableBalance || usdt.balance || '0');
+      }
+    }
+  } catch (e: any) {
+    console.error('[4H自动策略-后端] 获取余额失败:', e);
+  }
+
+  const maxPositionsLimit = orderSettings?.maxPositionCount?.enabled !== false
+    ? (parseInt(orderSettings?.maxPositionCount?.value || '10', 10) || 10)
+    : 10;
+  const currentActiveCount = currentPositions.length;
+
+  if (currentActiveCount >= maxPositionsLimit) {
+    addMonitorLog4h(`[4H自动策略-后端] 当前持仓单数 (${currentActiveCount}) 已达到最大持仓上限 (${maxPositionsLimit})，本次不开新仓`, 'INFO');
+    for (const item of matched) {
+      const recId = `${Date.now()}_${item.symbol}_${Math.random().toString(36).substring(2, 7)}`;
+      insertStmt.run(
+        recId, Date.now(), scanTimeStr, cycleStr, item.symbol,
+        item.lastPrice || 0, item.openPrice || 0, item.highChange ?? item.change ?? 0, item.closePos || 0,
+        item.volume15m || 0, item.volume24h || 0, item.volumeRatioPastK || 0, item.maxGainPastK_standard || 0,
+        item.fundingRate || 0, item.settlementCycle || '', filterSummary,
+        0, 'SKIPPED', `持仓单数 (${currentActiveCount}) 已达上限 (${maxPositionsLimit})`, '', Date.now()
+      );
+    }
+    return;
+  }
+
+  const availableSlots = maxPositionsLimit - currentActiveCount;
+  let openedCount = 0;
+
+  for (const item of matched) {
+    const sym = item.symbol;
+    const currentPrice = item.lastPrice || 0;
+    const recId = `${Date.now()}_${sym}_${Math.random().toString(36).substring(2, 7)}`;
+
+    if (openedCount >= availableSlots) {
+      insertStmt.run(
+        recId, Date.now(), scanTimeStr, cycleStr, sym,
+        currentPrice, item.openPrice || 0, item.highChange ?? item.change ?? 0, item.closePos || 0,
+        item.volume15m || 0, item.volume24h || 0, item.volumeRatioPastK || 0, item.maxGainPastK_standard || 0,
+        item.fundingRate || 0, item.settlementCycle || '', filterSummary,
+        0, 'SKIPPED', `本次新开仓配额 (${availableSlots}) 已用完`, '', Date.now()
+      );
+      continue;
+    }
+
+    const alreadyHolding = currentPositions.some((p: any) => p.symbol === sym && parseFloat(p.positionAmt) !== 0);
+    if (alreadyHolding) {
+      insertStmt.run(
+        recId, Date.now(), scanTimeStr, cycleStr, sym,
+        currentPrice, item.openPrice || 0, item.highChange ?? item.change ?? 0, item.closePos || 0,
+        item.volume15m || 0, item.volume24h || 0, item.volumeRatioPastK || 0, item.maxGainPastK_standard || 0,
+        item.fundingRate || 0, item.settlementCycle || '', filterSummary,
+        0, 'SKIPPED', '已有该币对有效持仓单', '', Date.now()
+      );
+      continue;
+    }
+
+    if (!currentPrice || currentPrice <= 0) {
+      insertStmt.run(
+        recId, Date.now(), scanTimeStr, cycleStr, sym,
+        currentPrice, item.openPrice || 0, item.highChange ?? item.change ?? 0, item.closePos || 0,
+        item.volume15m || 0, item.volume24h || 0, item.volumeRatioPastK || 0, item.maxGainPastK_standard || 0,
+        item.fundingRate || 0, item.settlementCycle || '', filterSummary,
+        0, 'FAILED', '未获取到有效价格', '', Date.now()
+      );
+      continue;
+    }
+
+    // 1. 设置杠杆
+    const leverage = orderSettings?.leverage ? parseInt(orderSettings.leverage, 10) || 2 : 2;
+    try {
+      await callBinanceSigned(
+        '/fapi/v1/leverage',
+        'POST',
+        { symbol: sym, leverage },
+        apiConfig.apiKey,
+        apiConfig.apiSecret,
+        apiConfig.baseUrl
+      );
+    } catch (e) {}
+
+    // 2. 计算总合约额 (USDT)
+    let targetUsdt = 30;
+    if (orderSettings?.fixedOrderAmount?.enabled) {
+      targetUsdt = parseFloat(orderSettings.fixedOrderAmount.value) || 30;
+    } else if (orderSettings?.calcQtyPercent?.enabled) {
+      const percentVal = parseFloat(orderSettings.calcQtyPercent.value) || 20;
+      const turnoverCoef = parseFloat(orderSettings.calcQtyPercent.turnoverCoef) || 1000;
+      const baseQty1 = futuresBalance * (percentVal / 100);
+      const quoteVol = item.volume15m || 0;
+      const baseQty2 = turnoverCoef > 0 ? (quoteVol / turnoverCoef) : 0;
+      const finalCalc = Math.min(baseQty1 > 0 ? baseQty1 : (baseQty2 > 0 ? baseQty2 : 30), baseQty2 > 0 ? baseQty2 : (baseQty1 > 0 ? baseQty1 : 30));
+      targetUsdt = Math.floor(finalCalc > 0 ? finalCalc : 30);
+    } else if (orderSettings?.minOrderAmount?.enabled) {
+      targetUsdt = parseFloat(orderSettings.minOrderAmount.value) || 20;
+    }
+
+    if (orderSettings?.minOrderAmount?.enabled) {
+      const minVal = parseFloat(orderSettings.minOrderAmount.value) || 0;
+      if (targetUsdt < minVal) targetUsdt = minVal;
+    }
+
+    // 3. 计算下单数量 (总合约额 / 现价，不乘杠杆！)
+    const rawQty = targetUsdt / currentPrice;
+    const formattedQty = formatQtyForBackend(sym, rawQty, exInfo);
+
+    if (parseFloat(formattedQty) <= 0) {
+      insertStmt.run(
+        recId, Date.now(), scanTimeStr, cycleStr, sym,
+        currentPrice, item.openPrice || 0, item.highChange ?? item.change ?? 0, item.closePos || 0,
+        item.volume15m || 0, item.volume24h || 0, item.volumeRatioPastK || 0, item.maxGainPastK_standard || 0,
+        item.fundingRate || 0, item.settlementCycle || '', filterSummary,
+        0, 'FAILED', '计算下单数量小于币安最小步长精度', '', Date.now()
+      );
+      continue;
+    }
+
+    addMonitorLog4h(
+      `[4H自动策略-后端常驻] 正在向币安下单: ${sym} 数量: ${formattedQty} (总合约额: ${targetUsdt} USDT, 杠杆: ${leverage}x)...`,
+      'TRADE'
+    );
+
+    let orderData: any = null;
+    let orderSuccess = false;
+    let orderReason = '';
+    let orderId = '';
+
+    try {
+      orderData = await callBinanceSigned(
+        '/fapi/v1/order',
+        'POST',
+        {
+          symbol: sym,
+          side: 'BUY',
+          type: 'MARKET',
+          quantity: formattedQty
+        },
+        apiConfig.apiKey,
+        apiConfig.apiSecret,
+        apiConfig.baseUrl
+      );
+      if (orderData && (orderData.orderId || orderData.clientOrderId)) {
+        orderSuccess = true;
+        orderId = String(orderData.orderId || orderData.clientOrderId || '');
+        openedCount++;
+        addMonitorLog4h(`[4H自动策略-后端常驻] ✅ ${sym} 市价开多单成交！订单ID: ${orderId} (数量: ${formattedQty})`, 'SUCCESS');
+      } else {
+        orderReason = orderData?.msg || '下单接口未返回有效订单ID';
+        addMonitorLog4h(`[4H自动策略-后端常驻] ❌ ${sym} 市价开多单失败: ${orderReason}`, 'ERROR');
+      }
+    } catch (orderErr: any) {
+      orderReason = orderErr?.message || String(orderErr);
+      addMonitorLog4h(`[4H自动策略-后端常驻] ❌ ${sym} 开仓异常: ${orderReason}`, 'ERROR');
+    }
+
+    insertStmt.run(
+      recId, Date.now(), scanTimeStr, cycleStr, sym,
+      currentPrice, item.openPrice || 0, item.highChange ?? item.change ?? 0, item.closePos || 0,
+      item.volume15m || 0, item.volume24h || 0, item.volumeRatioPastK || 0, item.maxGainPastK_standard || 0,
+      item.fundingRate || 0, item.settlementCycle || '', filterSummary,
+      orderSuccess ? 1 : 0, orderSuccess ? 'SUCCESS' : 'FAILED',
+      orderSuccess ? '已成功开仓市价单' : orderReason, orderId, Date.now()
+    );
+
+    // 4. 10 秒后自动挂止损
+    if (orderSuccess && orderSettings?.stopLoss?.enabled) {
+      setTimeout(async () => {
+        try {
+          const slPercent = parseFloat(orderSettings.stopLoss.value) || 5;
+          const slPriceRaw = currentPrice * (1 - slPercent / 100);
+          const finalSlPrice = formatPriceForBackend(sym, slPriceRaw, exInfo);
+          const algoParams: any = {
+            symbol: sym,
+            side: 'SELL',
+            quantity: formattedQty,
+            workingType: 'MARK_PRICE',
+            stopPrice: finalSlPrice,
+            triggerPrice: finalSlPrice,
+            algoType: 'CONDITIONAL',
+            type: 'STOP_MARKET',
+            reduceOnly: 'true'
+          };
+          addMonitorLog4h(`[4H自动策略-10秒延时挂止损] 正在为 ${sym} 挂止损单 (触发价: ${finalSlPrice}, 数量: ${formattedQty})...`, 'TRADE');
+          const slRes = await callBinanceSigned(
+            '/fapi/v1/algoOrder',
+            'POST',
+            algoParams,
+            apiConfig.apiKey,
+            apiConfig.apiSecret,
+            apiConfig.baseUrl
+          );
+          if (slRes && (slRes.algoId || slRes.orderId)) {
+            addMonitorLog4h(`[4H自动策略-后端] ✅ ${sym} 算法止损委托挂单成功！触发价: ${finalSlPrice}`, 'SUCCESS');
+          } else {
+            // 兜底 STOP_MARKET
+            await callBinanceSigned(
+              '/fapi/v1/order',
+              'POST',
+              {
+                symbol: sym,
+                side: 'SELL',
+                type: 'STOP_MARKET',
+                stopPrice: finalSlPrice,
+                quantity: formattedQty,
+                reduceOnly: 'true'
+              },
+              apiConfig.apiKey,
+              apiConfig.apiSecret,
+              apiConfig.baseUrl
+            );
+            addMonitorLog4h(`[4H自动策略-后端] ✅ ${sym} 标准止损挂单成功！触发价: ${finalSlPrice}`, 'SUCCESS');
+          }
+        } catch (e: any) {
+          console.error(`[4H自动策略-后端] ${sym} 挂止损失败:`, e);
+        }
+      }, 10000);
+    }
+  }
+}
+
 let dynamicScan4hCounter = 0;
 function runBackgroundMonitor4h() {
   setInterval(async () => {
@@ -1705,10 +2235,32 @@ function runBackgroundMonitor4h() {
       runVolumeSpikeScanBackend4h();
     }
 
+    // 周期结算点自动触发：计算榜单并执行 7x24 常驻后台自动交易与全量达标筛选
     if (totalSecondsInCycle >= settleTargetSeconds && last4hCycleTrigger !== currentCycleStart) {
       last4hCycleTrigger = currentCycleStart;
-      runCycleScan4h(true);
+      await runCycleScan4h(true);
+      executeAutoTradingBackend4h(currentCycleStart).catch(err => {
+        console.error('[4H自动策略-后端执行异常]:', err);
+      });
     }
+
+    // 检查是否有用户自定义设定的 4H 扫描时刻 (scanMoment)
+    try {
+      const fsRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_filter_settings") as any;
+      if (fsRow && fsRow.value) {
+        const fs = JSON.parse(fsRow.value);
+        if (fs.scanMoment && typeof fs.scanMoment.hour === 'number' && typeof fs.scanMoment.minute === 'number') {
+          const customSec = (fs.scanMoment.hour * 3600) + (fs.scanMoment.minute * 60) + (fs.scanMoment.second || 0);
+          if (totalSecondsInCycle === customSec && last4hCycleTrigger !== currentCycleStart) {
+            last4hCycleTrigger = currentCycleStart;
+            await runCycleScan4h(true);
+            executeAutoTradingBackend4h(currentCycleStart).catch(err => {
+              console.error('[4H自动策略-后端执行异常]:', err);
+            });
+          }
+        }
+      }
+    } catch (e) {}
   }, 1000);
 }
 runBackgroundMonitor4h();
@@ -1808,11 +2360,6 @@ async function startServer() {
 
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
-
-  // Helper for Binance Signature
-  const getSignature = (queryString: string, secret: string) => {
-    return CryptoJS.HmacSHA256(queryString, secret).toString(CryptoJS.enc.Hex);
-  };
 
   // API routes
   app.get("/api/server-info", async (req, res) => {
@@ -2360,6 +2907,16 @@ async function startServer() {
       },
       scanStats: scanStats4h
     });
+  });
+
+  app.post("/api/monitoring-4h/trigger-trading", async (req, res) => {
+    try {
+      const cycleId = Date.now();
+      await executeAutoTradingBackend4h(cycleId);
+      res.json({ success: true, message: "4H自动策略与达标筛选已在后端成功执行" });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.post("/api/monitoring-4h/scan-volume-spike", async (req, res) => {

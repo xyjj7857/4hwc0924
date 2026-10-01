@@ -145,16 +145,81 @@ class WeightStatsManager {
   private peakWeightAllTime: number = 0;
   private tickerInterval: NodeJS.Timeout | null = null;
   private lastKnownOfficialWeight: number = 0;
+  private db: any = null;
+  private lastSnapshotSaveTime: number = 0;
 
   constructor() {
-    // 默认未启动状态，满足用户规约：“该模块启动时才统计，不启动时不统计”
+    // 默认未启动状态，初始化后通过 initFromDatabase 恢复状态
+  }
+
+  public initFromDatabase(database: any): void {
+    this.db = database;
+    if (!this.db) return;
+
+    try {
+      // 1. 恢复历史快照数据（包括历史请求数、估算权重、历史峰值、最近分钟曲线）
+      const dataRow = this.db.prepare("SELECT value FROM settings WHERE key = ?").get("weight_stats_data") as any;
+      if (dataRow && dataRow.value) {
+        try {
+          const parsed = JSON.parse(dataRow.value);
+          if (parsed) {
+            if (typeof parsed.startTime === 'number') this.startTime = parsed.startTime;
+            if (typeof parsed.totalRequests === 'number') this.totalRequests = parsed.totalRequests;
+            if (typeof parsed.totalWeight === 'number') this.totalWeight = parsed.totalWeight;
+            if (typeof parsed.peakWeightAllTime === 'number') this.peakWeightAllTime = parsed.peakWeightAllTime;
+            if (Array.isArray(parsed.minuteStats)) {
+              for (const pt of parsed.minuteStats) {
+                if (pt && pt.minute) this.minuteHistory.set(pt.minute, pt);
+              }
+            }
+            if (Array.isArray(parsed.recentRecords)) {
+              this.recentRecords = parsed.recentRecords.slice(0, 300);
+            }
+          }
+        } catch (e) {}
+      }
+
+      // 2. 检查开关状态：若用户先前已开启，后端立即自动恢复运行，确保无人值守 7x24 常驻运行
+      const runRow = this.db.prepare("SELECT value FROM settings WHERE key = ?").get("weight_stats_running") as any;
+      if (runRow && runRow.value) {
+        const isSavedRunning = JSON.parse(runRow.value);
+        if (isSavedRunning) {
+          this.start(false);
+          console.log(`[WeightStatsManager] ✅ 从本地数据库恢复：权重统计先前已处于开启状态，后端已自动恢复 7x24 小时后台常驻统计`);
+        }
+      }
+    } catch (e) {
+      console.error("[WeightStatsManager] 读取权重统计持久化数据失败:", e);
+    }
+  }
+
+  private saveSnapshotToDb(): void {
+    if (!this.db || !this.isRunning) return;
+    try {
+      const now = Date.now();
+      if (now - this.lastSnapshotSaveTime < 10000) return; // 节流：至少间隔 10 秒写入一次
+      this.lastSnapshotSaveTime = now;
+
+      const snapshot = {
+        startTime: this.startTime,
+        totalRequests: this.totalRequests,
+        totalWeight: this.totalWeight,
+        peakWeightAllTime: this.peakWeightAllTime,
+        minuteStats: Array.from(this.minuteHistory.values()).slice(-120),
+        recentRecords: this.recentRecords.slice(0, 150)
+      };
+      this.db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(
+        "weight_stats_data",
+        JSON.stringify(snapshot)
+      );
+    } catch (e) {}
   }
 
   public getIsRunning(): boolean {
     return this.isRunning;
   }
 
-  public start(): void {
+  public start(persist: boolean = true): void {
     if (this.isRunning) return;
     this.isRunning = true;
     if (!this.startTime) {
@@ -169,18 +234,37 @@ class WeightStatsManager {
       this.tickerInterval = setInterval(() => {
         if (!this.isRunning) return;
         this.ensureCurrentMinutePoint();
+        this.saveSnapshotToDb();
       }, 3000);
     }
-    console.log(`[WeightStatsManager] 权重统计模块已启动，开始记录 API 调用频次与权重曲线`);
+
+    if (persist && this.db) {
+      try {
+        this.db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(
+          "weight_stats_running",
+          JSON.stringify(true)
+        );
+      } catch (e) {}
+    }
+    console.log(`[WeightStatsManager] 权重统计模块已启动，开始记录 API 调用频次与权重曲线（后台常驻）`);
   }
 
-  public stop(): void {
+  public stop(persist: boolean = true): void {
     if (!this.isRunning) return;
     this.isRunning = false;
     if (this.tickerInterval) {
       clearInterval(this.tickerInterval);
       this.tickerInterval = null;
     }
+    if (persist && this.db) {
+      try {
+        this.db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(
+          "weight_stats_running",
+          JSON.stringify(false)
+        );
+      } catch (e) {}
+    }
+    this.saveSnapshotToDb();
     console.log(`[WeightStatsManager] 权重统计模块已停止，停止记录 API 调用与权重`);
   }
 
@@ -199,6 +283,11 @@ class WeightStatsManager {
       this.ensureCurrentMinutePoint();
     } else {
       this.startTime = null;
+    }
+    if (this.db) {
+      try {
+        this.db.prepare("DELETE FROM settings WHERE key = ?").run("weight_stats_data");
+      } catch (e) {}
     }
     console.log(`[WeightStatsManager] 权重统计历史数据已清空`);
   }
