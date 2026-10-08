@@ -394,7 +394,7 @@ export const ScreeningRecordsModal: React.FC<ScreeningRecordsModalProps> = ({
             <table className="w-full text-left text-xs border-collapse">
               <thead className="sticky top-0 bg-[#16171b] border-b border-white/10 z-10 text-[11px] font-bold text-zinc-400 uppercase tracking-wider">
                 <tr>
-                  <th className="py-2.5 px-3 whitespace-nowrap">扫描时刻 / 周期</th>
+                  <th className="py-2.5 px-3 whitespace-nowrap text-amber-300/90">详细日期 / 扫描时间</th>
                   <th className="py-2.5 px-3 whitespace-nowrap">币对</th>
                   <th className="py-2.5 px-3 text-right whitespace-nowrap">当前价 / 开盘</th>
                   <th className="py-2.5 px-3 text-right whitespace-nowrap">4H涨幅</th>
@@ -418,12 +418,35 @@ export const ScreeningRecordsModal: React.FC<ScreeningRecordsModalProps> = ({
                       key={r.id}
                       className="hover:bg-white/[0.03] transition-colors"
                     >
-                      {/* 扫描时刻 / 周期 */}
+                      {/* 扫描时刻 / 详细日期 */}
                       <td className="py-2.5 px-3 whitespace-nowrap text-zinc-300">
-                        <div className="font-bold text-white text-[12px]">{r.scanTimeStr}</div>
-                        {r.cycleStr && (
-                          <div className="text-[10px] text-zinc-500 font-sans mt-0.5">{r.cycleStr}</div>
-                        )}
+                        {(() => {
+                          let datePart = '';
+                          let timePart = r.scanTimeStr;
+                          if (r.scanTimeStr.includes(' ')) {
+                            const parts = r.scanTimeStr.split(' ');
+                            datePart = parts[0];
+                            timePart = parts[1];
+                          } else if (r.scanTime && r.scanTime > 1000000000) {
+                            const d = new Date(r.scanTime);
+                            const pad = (n: number) => n.toString().padStart(2, '0');
+                            datePart = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+                            timePart = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+                          }
+                          return (
+                            <div>
+                              <div className="font-mono font-bold text-amber-300 text-[12px] flex items-center gap-1.5">
+                                {datePart && <span>{datePart}</span>}
+                                <span className={datePart ? "text-white text-[12px]" : "text-amber-300"}>{timePart}</span>
+                              </div>
+                              {r.cycleStr && (
+                                <div className="text-[10px] text-zinc-400 font-sans mt-0.5 flex items-center gap-1">
+                                  <span className="px-1.5 py-0.2 rounded bg-zinc-800 text-zinc-400 border border-white/5">{r.cycleStr}</span>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </td>
 
                       {/* 币对 */}

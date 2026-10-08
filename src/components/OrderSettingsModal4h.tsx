@@ -91,19 +91,24 @@ interface OrderSettingsModal4hProps {
   onClose: () => void;
   settings: OrderSettings4h;
   onSave: (newSettings: OrderSettings4h) => void;
+  onSaveAndApply?: (newSettings: OrderSettings4h) => Promise<void>;
+  holdingPositionsCount?: number;
 }
 
 export default function OrderSettingsModal4h({
   isOpen,
   onClose,
   settings,
-  onSave
+  onSave,
+  onSaveAndApply,
+  holdingPositionsCount = 0
 }: OrderSettingsModal4hProps) {
   const [formData, setFormData] = useState<OrderSettings4h>(() => ({
     ...DEFAULT_ORDER_SETTINGS_4H,
     ...settings,
     maxPositionCount: settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
   }));
+  const [isApplying, setIsApplying] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -127,6 +132,21 @@ export default function OrderSettingsModal4h({
   const handleSave = () => {
     onSave(formData);
     onClose();
+  };
+
+  const handleSaveAndApply = async () => {
+    onSave(formData);
+    if (onSaveAndApply) {
+      setIsApplying(true);
+      try {
+        await onSaveAndApply(formData);
+      } finally {
+        setIsApplying(false);
+        onClose();
+      }
+    } else {
+      onClose();
+    }
   };
 
   const handleReset = () => {
@@ -523,18 +543,32 @@ export default function OrderSettingsModal4h({
               <span>重置默认</span>
             </button>
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2.5">
               <button
                 type="button"
                 onClick={onClose}
-                className="px-4 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-300 text-xs font-semibold transition-colors border border-white/10"
+                className="px-3.5 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-300 text-xs font-semibold transition-colors border border-white/10"
               >
                 取消
               </button>
+
+              {onSaveAndApply && holdingPositionsCount > 0 && (
+                <button
+                  type="button"
+                  onClick={handleSaveAndApply}
+                  disabled={isApplying}
+                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-amber-500 via-orange-500 to-amber-500 hover:brightness-110 text-black text-xs font-bold flex items-center gap-1.5 shadow-[0_0_20px_rgba(245,158,11,0.35)] transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
+                  title={`保存参数并立即为当前持有的 ${holdingPositionsCount} 个仓单在币安补挂 1 张止盈单 + 1 张止损单`}
+                >
+                  <span className={isApplying ? "animate-spin" : ""}>⚡</span>
+                  <span>{isApplying ? '正在补挂委托单...' : `保存并为持仓补齐止盈止损 (${holdingPositionsCount})`}</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={handleSave}
-                className="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black text-xs font-bold flex items-center gap-1.5 shadow-[0_0_20px_rgba(245,158,11,0.4)] transition-all hover:scale-[1.02] active:scale-[0.98]"
+                className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black text-xs font-bold flex items-center gap-1.5 shadow-[0_0_20px_rgba(245,158,11,0.4)] transition-all hover:scale-[1.02] active:scale-[0.98]"
               >
                 <Check className="w-4 h-4 stroke-[2.5]" />
                 <span>保存下单设置</span>
