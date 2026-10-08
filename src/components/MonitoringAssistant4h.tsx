@@ -489,6 +489,23 @@ export default function MonitoringAssistant4h({
         }
       })
       .catch(e => console.warn('Failed to load screening records from DB:', e));
+
+    // 启动时将当前 4H 自动交易状态、筛选设置与下单设置双向持久化同步至后端 settings 表
+    try {
+      const savedAuto = localStorage.getItem('monitoring4h_auto_trading') === 'true';
+      const savedFs = localStorage.getItem('monitoring4h_filter_settings');
+      const savedOs = localStorage.getItem('monitoring4h_order_settings');
+      const syncPayload: Record<string, any> = {
+        monitoring4h_auto_trading: savedAuto
+      };
+      if (savedFs) syncPayload.monitoring4h_filter_settings = JSON.parse(savedFs);
+      if (savedOs) syncPayload.monitoring4h_order_settings = JSON.parse(savedOs);
+      fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(syncPayload)
+      }).catch(() => {});
+    } catch {}
   }, []);
 
   // 保存筛选记录辅助函数 (双重持久化: 状态 + 本地数据库 + localStorage)
@@ -1477,97 +1494,86 @@ export default function MonitoringAssistant4h({
       }
       const finalSlPrice = formatPriceForSymbol(sym, calculatedSlPrice);
 
-      addLog?.(`[4H风控挂单] 正在提交 ${sym} 止损单 (触发价: ${finalSlPrice}, 数量: ${closingQty}, 倍数: ${slMultiplier}x)...`, 'TRADE');
+      addLog?.(`[4H风控挂单] 正在向币安 Algo 算法端点提交 ${sym} 条件止损单 (触发价: ${finalSlPrice}, 数量: ${closingQty}, 倍数: ${slMultiplier}x)...`, 'TRADE');
 
       try {
-        const algoParams: any = {
-          algoType: 'CONDITIONAL',
-          symbol: sym,
-          side: closingSide,
-          positionSide: posSide,
-          quantity: closingQty,
-          workingType: 'MARK_PRICE',
-          triggerPrice: finalSlPrice,
-          type: 'STOP_MARKET'
+        const buildAlgoSlParams = (targetPosSide: string, withReduceOnly: boolean) => {
+          const p: any = {
+            algoType: 'CONDITIONAL',
+            symbol: sym,
+            side: closingSide,
+            positionSide: targetPosSide,
+            type: 'STOP_MARKET',
+            triggerPrice: finalSlPrice,
+            quantity: closingQty,
+            workingType: 'MARK_PRICE'
+          };
+          if (withReduceOnly && targetPosSide === 'BOTH') {
+            p.reduceOnly = 'true';
+          }
+          return p;
         };
-        if (posSide === 'BOTH') algoParams.reduceOnly = 'true';
 
-        const algoRes = await fetch('/api/binance-proxy', {
+        let currentPosSide = posSide || 'BOTH';
+        let slParams = buildAlgoSlParams(currentPosSide, currentPosSide === 'BOTH');
+
+        let algoRes = await fetch('/api/binance-proxy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             method: 'POST',
             endpoint: '/fapi/v1/algoOrder',
-            params: algoParams,
+            params: slParams,
             apiKey: apiConfig.apiKey,
             apiSecret: apiConfig.apiSecret
           })
         });
-        const algoData = await algoRes.json();
-        if (algoRes.ok && (algoData.algoId || algoData.orderId)) {
-          slSuccess = true;
-          addLog?.(`[4H自动策略] ✅ ${sym} 算法止损委托挂单成功！订单ID: ${algoData.algoId || algoData.orderId} (触发价: ${finalSlPrice}, 数量: ${closingQty})`, 'SUCCESS');
-        } else {
-          // 方案 2: 尝试 closePosition = true
-          const closeAllParams: any = {
-            algoType: 'CONDITIONAL',
-            symbol: sym,
-            side: closingSide,
-            positionSide: posSide,
-            type: 'STOP_MARKET',
-            triggerPrice: finalSlPrice,
-            closePosition: 'true',
-            workingType: 'MARK_PRICE'
-          };
-          const closeAllRes = await fetch('/api/binance-proxy', {
+        let algoData = await algoRes.json();
+
+        // 自愈重试 1: 若 position side 报错，自愈为另一侧重新在 algoOrder 提交
+        if (!algoRes.ok && String(algoData?.msg || '').includes('position side')) {
+          currentPosSide = currentPosSide === 'BOTH' ? 'LONG' : 'BOTH';
+          slParams = buildAlgoSlParams(currentPosSide, currentPosSide === 'BOTH');
+          algoRes = await fetch('/api/binance-proxy', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               method: 'POST',
               endpoint: '/fapi/v1/algoOrder',
-              params: closeAllParams,
+              params: slParams,
               apiKey: apiConfig.apiKey,
               apiSecret: apiConfig.apiSecret
             })
           });
-          const closeAllData = await closeAllRes.json();
-          if (closeAllRes.ok && (closeAllData.algoId || closeAllData.orderId)) {
-            slSuccess = true;
-            addLog?.(`[4H自动策略] ✅ ${sym} 算法全仓止损委托挂单成功！触发价: ${finalSlPrice}`, 'SUCCESS');
-          } else {
-            // 方案 3: 尝试标准 /fapi/v1/order 止损单
-            const orderSlParams: any = {
-              symbol: sym,
-              side: closingSide,
-              positionSide: posSide,
-              type: 'STOP_MARKET',
-              stopPrice: finalSlPrice,
-              quantity: closingQty,
-              workingType: 'MARK_PRICE'
-            };
-            if (posSide === 'BOTH') orderSlParams.reduceOnly = 'true';
-            const slRes = await fetch('/api/binance-proxy', {
+          algoData = await algoRes.json();
+        }
+
+        // 自愈重试 2: 若 reduceOnly 报错，去除 reduceOnly 重新在 algoOrder 提交
+        if (!algoRes.ok && String(algoData?.msg || '').includes('reduceOnly')) {
+          slParams = buildAlgoSlParams(currentPosSide, false);
+          algoRes = await fetch('/api/binance-proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                method: 'POST',
-                endpoint: '/fapi/v1/order',
-                params: orderSlParams,
-                apiKey: apiConfig.apiKey,
-                apiSecret: apiConfig.apiSecret
-              })
-            });
-            const slData = await slRes.json();
-            if (slRes.ok && (slData.orderId || slData.clientOrderId)) {
-              slSuccess = true;
-              addLog?.(`[4H自动策略] ✅ ${sym} 止损委托挂单成功！订单ID: ${slData.orderId} (触发价: ${finalSlPrice})`, 'SUCCESS');
-            } else {
-              addLog?.(`[4H自动策略] ⚠️ ${sym} 止损挂单反馈: ${algoData?.msg || closeAllData?.msg || slData?.msg || '未知异常'}`, 'ERROR');
-            }
-          }
+              endpoint: '/fapi/v1/algoOrder',
+              params: slParams,
+              apiKey: apiConfig.apiKey,
+              apiSecret: apiConfig.apiSecret
+            })
+          });
+          algoData = await algoRes.json();
+        }
+
+        if (algoRes.ok && (algoData.algoId || algoData.orderId || algoData.clientAlgoId)) {
+          slSuccess = true;
+          const algoId = String(algoData.algoId || algoData.orderId || algoData.clientAlgoId);
+          addLog?.(`[4H自动策略] ✅ ${sym} 算法止损委托 (AlgoOrder) 挂单成功！AlgoID: ${algoId} (触发价: ${finalSlPrice}, 数量: ${closingQty})`, 'SUCCESS');
+        } else {
+          addLog?.(`[4H自动策略] ❌ ${sym} 算法止损挂单反馈: ${algoData?.msg || '未知异常'}`, 'ERROR');
         }
       } catch (slErr: any) {
-        addLog?.(`[4H自动策略] ❌ ${sym} 止损挂单异常: ${slErr?.message || slErr}`, 'ERROR');
+        addLog?.(`[4H自动策略] ❌ ${sym} 算法止损网络异常: ${slErr?.message || slErr}`, 'ERROR');
       }
     }
 
@@ -1712,6 +1718,15 @@ export default function MonitoringAssistant4h({
         `[4H筛选] 第一步：共筛选出 ${matchedCandidates.length} 个达标币对: ${matchedCandidates.map(c => c.symbol).join(', ')}`,
         'SUCCESS'
       );
+
+      // 详细记录每个所筛选达标币对的核心指标至运行日志（严格满足用户要求：日志记录所筛选币对的信息）
+      for (const item of matchedCandidates) {
+        const displayData = getSymbolDisplayDataRef.current(item);
+        addLog?.(
+          `[4H达标币对详情] 🎯 ${item.symbol}: 4H涨跌 ${displayData.effectiveChange >= 0 ? '+' : ''}${displayData.effectiveChange.toFixed(2)}% | 收位 ${displayData.closePos?.toFixed(1) ?? '--'}% | 4H额 ${(displayData.currentVolume || 0).toFixed(0)}万 | 量比 ${(displayData.volumeRatioPastK || 0).toFixed(2)} | 前K高 ${(displayData.maxGainPastK || 0).toFixed(2)}%`,
+          'INFO'
+        );
+      }
 
       // 情况 A: 未开启“自动”交易时（用户要求：在不开启“自动”时也必须完整留存筛选记录及各类参数）
       if (!isAutoActive) {
@@ -2554,7 +2569,7 @@ export default function MonitoringAssistant4h({
       const scanTargetSec = (sm.hour * 3600) + (sm.minute * 60) + sm.second;
       const cycleId = Math.floor(now.getTime() / (4 * 3600 * 1000));
 
-      if (totalSecondsInCycle === scanTargetSec && lastAutoExecutedCycleRef.current !== cycleId) {
+      if (Math.abs(totalSecondsInCycle - scanTargetSec) <= 1 && lastAutoExecutedCycleRef.current !== cycleId) {
         lastAutoExecutedCycleRef.current = cycleId;
         executeCycleScreeningAndAutoTradingRef.current?.(cycleId, false);
       }

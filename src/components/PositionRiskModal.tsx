@@ -308,24 +308,32 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
         }
       }
 
-      // 步骤 3: 若勾选了止损，提交算法止损单（CONDITIONAL / STOP_MARKET）
+      // 步骤 3: 若勾选了止损，提交算法止损单（严格使用币安 /fapi/v1/algoOrder 算法端点）
       if (currentConfig.tpSlControl.slEnabled) {
         const finalSlPrice = formatPrice(position.symbol, calculatedSlPrice);
-        const algoParams: any = {
-          symbol: position.symbol,
-          side: closingSide,
-          positionSide: position.positionSide,
-          quantity: closingQty,
-          workingType: 'MARK_PRICE',
-          stopPrice: finalSlPrice,
-          triggerPrice: finalSlPrice,
-          algoType: 'CONDITIONAL',
-          type: 'STOP_MARKET',
-          reduceOnly: 'true'
+        const buildAlgoSlParams = (targetPosSide: string, withReduceOnly: boolean) => {
+          const p: any = {
+            symbol: position.symbol,
+            side: closingSide,
+            positionSide: targetPosSide,
+            quantity: closingQty,
+            workingType: 'MARK_PRICE',
+            triggerPrice: finalSlPrice,
+            algoType: 'CONDITIONAL',
+            type: 'STOP_MARKET'
+          };
+          if (withReduceOnly && targetPosSide === 'BOTH') {
+            p.reduceOnly = 'true';
+          }
+          return p;
         };
 
-        addLog(`[专属风控] 正在提交 ${position.symbol} 算法止损单 (触发价: ${finalSlPrice})...`, 'TRADE');
-        const slRes = await fetch('/api/binance-proxy', {
+        addLog(`[专属风控] 正在向币安 Algo 算法端点提交 ${position.symbol} 条件止损单 (触发价: ${finalSlPrice}, 数量: ${closingQty})...`, 'TRADE');
+        
+        let currentPosSide = position.positionSide || 'BOTH';
+        let algoParams = buildAlgoSlParams(currentPosSide, currentPosSide === 'BOTH');
+
+        let slRes = await fetch('/api/binance-proxy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -338,44 +346,51 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
           })
         });
 
-        const slData = await slRes.json();
-        if (slRes.ok && (slData.algoId || slData.orderId || slData.clientAlgoId)) {
-          slSuccess = true;
-          lastSlId = String(slData.algoId || slData.orderId);
-          addLog(`[专属风控] ${position.symbol} 算法止损委托挂单成功！触发价: ${finalSlPrice}`, 'SUCCESS');
-        } else {
-          // 兜底降级为普通 STOP_MARKET 或 STOP 委托
-          addLog(`[专属风控] 算法止损提交遇到提示: ${slData.msg || '切换为标准止损单'}，正在使用标准止损挂单...`, 'INFO');
-          const fallbackParams: any = {
-            symbol: position.symbol,
-            side: closingSide,
-            positionSide: position.positionSide,
-            type: 'STOP_MARKET',
-            stopPrice: finalSlPrice,
-            quantity: closingQty,
-            workingType: 'MARK_PRICE',
-          };
-          if (position.positionSide === 'BOTH') fallbackParams.reduceOnly = 'true';
+        let slData = await slRes.json();
 
-          const fallbackRes = await fetch('/api/binance-proxy', {
+        // 自愈重试 1: 若 position side 不匹配 (如单向/双向设置不一致)，自愈为另一侧重新提交
+        if (!slRes.ok && String(slData?.msg || '').includes('position side')) {
+          currentPosSide = currentPosSide === 'BOTH' ? (closingSide === 'SELL' ? 'LONG' : 'SHORT') : 'BOTH';
+          algoParams = buildAlgoSlParams(currentPosSide, currentPosSide === 'BOTH');
+          slRes = await fetch('/api/binance-proxy', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               method: 'POST',
-              endpoint: '/fapi/v1/order',
-              params: fallbackParams,
+              endpoint: '/fapi/v1/algoOrder',
+              baseUrl: apiConfig.baseUrl || "https://fapi.binance.com",
+              params: algoParams,
               apiKey: apiConfig.apiKey,
               apiSecret: apiConfig.apiSecret
             })
           });
-          const fbData = await fallbackRes.json();
-          if (fallbackRes.ok && fbData.orderId) {
-            slSuccess = true;
-            lastSlId = String(fbData.orderId);
-            addLog(`[专属风控] ${position.symbol} 标准止损单挂单成功！订单ID: ${fbData.orderId}`, 'SUCCESS');
-          } else {
-            addLog(`[专属风控] ${position.symbol} 止损挂单最终失败: ${fbData.msg || '未知错误'}`, 'ERROR');
-          }
+          slData = await slRes.json();
+        }
+
+        // 自愈重试 2: 若 reduceOnly 报错，去除 reduceOnly 重新在 algoOrder 提交
+        if (!slRes.ok && String(slData?.msg || '').includes('reduceOnly')) {
+          algoParams = buildAlgoSlParams(currentPosSide, false);
+          slRes = await fetch('/api/binance-proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              method: 'POST',
+              endpoint: '/fapi/v1/algoOrder',
+              baseUrl: apiConfig.baseUrl || "https://fapi.binance.com",
+              params: algoParams,
+              apiKey: apiConfig.apiKey,
+              apiSecret: apiConfig.apiSecret
+            })
+          });
+          slData = await slRes.json();
+        }
+
+        if (slRes.ok && (slData.algoId || slData.orderId || slData.clientAlgoId)) {
+          slSuccess = true;
+          lastSlId = String(slData.algoId || slData.orderId || slData.clientAlgoId);
+          addLog(`[专属风控] ✅ ${position.symbol} 算法止损委托 (AlgoOrder) 挂单成功！订单ID: ${lastSlId} (触发价: ${finalSlPrice})`, 'SUCCESS');
+        } else {
+          addLog(`[专属风控] ❌ ${position.symbol} 算法止损挂单失败: ${slData.msg || '未知异常'}`, 'ERROR');
         }
       }
 

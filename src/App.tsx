@@ -2446,11 +2446,11 @@ export default function App() {
               id: String(o.algoId ?? o.clientAlgoId ?? o.id ?? Math.random()),
               symbol: o.symbol,
               side: o.side,
-              type: o.algoType || o.type,
+              type: o.orderType || o.type || o.algoType || 'STOP_MARKET',
               price: parseFloat(o.price || 0),
-              stopPrice: parseFloat(o.stopPrice || o.triggerPrice || 0),
+              stopPrice: parseFloat(o.triggerPrice || o.stopPrice || 0),
               isAlgo: true,
-              time: Number(o.time || o.createTime || o.updateTime || Date.now()),
+              time: Number(o.time || o.createTime || o.updateTime || o.bookTime || Date.now()),
               positionSide: o.positionSide
             }))];
           }
