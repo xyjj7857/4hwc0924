@@ -767,7 +767,7 @@ function runBackgroundMonitor() {
 runBackgroundMonitor();
 
 
-let isRunning4h = false;
+let isRunning4h = true; // 默认开启 7x24 常驻运行，确保用户关闭网页后依然按预设参数自动运行
 
 interface MonitoringConfig4h extends MonitoringConfig {
   yMin?: number;
@@ -2057,10 +2057,35 @@ async function executeAutoTradingBackend4h(cycleId: number) {
     if (fsRow) filterSettings = JSON.parse(fsRow.value);
 
     const osRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_order_settings") as any;
-    if (osRow) orderSettings = JSON.parse(osRow.value);
+    if (osRow) {
+      orderSettings = JSON.parse(osRow.value);
+    } else {
+      orderSettings = {
+        maxPositionCount: { enabled: true, value: '10' },
+        leverage: { enabled: true, value: '10' },
+        calcQtyPercent: { enabled: true, value: '20', turnoverCoef: '1000' },
+        minOrderAmount: { enabled: true, value: '20' },
+        fixedOrderAmount: { enabled: false, value: '100' },
+        stopLossMultiplier: { enabled: true, value: '0.985' },
+        takeProfitMultiplier: { enabled: true, value: '1.05' }
+      };
+    }
 
     const apiRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("apiConfig") as any;
     if (apiRow) apiConfig = JSON.parse(apiRow.value);
+    if (!apiConfig || !apiConfig.apiKey) {
+      try {
+        const credRow = db.prepare("SELECT * FROM api_credentials ORDER BY is_active DESC, updated_at DESC LIMIT 1").get() as any;
+        if (credRow && credRow.api_key && credRow.api_secret) {
+          apiConfig = {
+            accountName: credRow.account_name,
+            apiKey: credRow.api_key,
+            apiSecret: credRow.api_secret,
+            baseUrl: credRow.base_url || 'https://fapi.binance.com'
+          };
+        }
+      } catch (e) {}
+    }
   } catch (e) {
     console.error("[4H自动策略-后端] 读取持久化配置失败:", e);
   }
@@ -2530,7 +2555,15 @@ function runBackgroundMonitor4h() {
       runCycleScan4h(false).catch(() => {});
     }
 
-    if (!isRunning4h) return;
+    // 检查 4H 监控与自动交易状态 (只要开启了 4H 监控或者开启了自动交易策略，后台均持续巡检与执行，关闭网页后不间断)
+    let isAutoTradingOn = false;
+    try {
+      const autoRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_auto_trading") as any;
+      if (autoRow) isAutoTradingOn = Boolean(JSON.parse(autoRow.value));
+    } catch (e) {}
+
+    const shouldRunCycle = isRunning4h || isAutoTradingOn;
+    if (!shouldRunCycle) return;
     
     // Check 1h volume spike scan trigger
     const currentHour = now.getHours();
