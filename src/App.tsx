@@ -2864,6 +2864,43 @@ export default function App() {
     }
   };
 
+  // 一键为当前所有活跃持仓补齐图三标准的止盈单与止损单
+  const [isApplyingTpSl, setIsApplyingTpSl] = useState(false);
+  const handleApply4hTpSlToAllPositions = async () => {
+    if (isApplyingTpSl) return;
+    setIsApplyingTpSl(true);
+    addLog('🚀 正在为当前所有活跃持仓按照图三标准批量补齐止盈单（10倍开盘价）与止损单（1倍开盘价）...', 'INFO');
+    try {
+      let os: any = null;
+      try {
+        const localOs = localStorage.getItem('monitoring4h_order_settings');
+        if (localOs) os = JSON.parse(localOs);
+      } catch (e) {}
+
+      const res = await fetch('/api/positions/apply-tp-sl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiConfig,
+          orderSettings: os
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        addLog(`✅ 批量风控挂单成功！已为 ${data.count} 个活跃持仓在币安挂出止盈单与止损单`, 'SUCCESS');
+        setTimeout(() => {
+          fetchSnapshotRef.current?.();
+        }, 1200);
+      } else {
+        addLog(`⚠️ 补挂止盈止损提示: ${data.error || data.message || '执行失败'}`, 'ERROR');
+      }
+    } catch (err: any) {
+      addLog(`❌ 补挂止盈止损异常: ${err?.message || err}`, 'ERROR');
+    } finally {
+      setIsApplyingTpSl(false);
+    }
+  };
+
   // 1号区域: 杠杆倍数选择处理器 (1X, 2X, 3X, 5X, 10X)
   const handleSelectLeverage = (lev: number) => {
     setLeverage(lev);
@@ -6167,7 +6204,19 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="text-[12px] font-mono text-zinc-400">
+              <div className="flex items-center gap-3 text-[12px] font-mono text-zinc-400">
+                {activeContractTab === 'positions' && sortedPositions.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleApply4hTpSlToAllPositions}
+                    disabled={isApplyingTpSl}
+                    className="flex items-center gap-1.5 px-3 py-1 bg-gradient-to-r from-amber-500/20 via-orange-500/20 to-amber-500/20 hover:from-amber-500/30 hover:to-orange-500/30 text-amber-300 hover:text-amber-100 border border-amber-500/50 rounded-lg text-xs font-bold transition-all cursor-pointer shadow-sm active:scale-95 disabled:opacity-50"
+                    title="按照图三【4H 下单设置】中配置的止损倍数与止盈倍数，一键为所有持仓补挂币安止损单与止盈单"
+                  >
+                    <ShieldAlert size={14} className={isApplyingTpSl ? "animate-spin text-amber-400" : "text-amber-400"} />
+                    <span>{isApplyingTpSl ? '正在向币安补挂...' : '⚡ 一键补齐图三止盈止损'}</span>
+                  </button>
+                )}
                 {activeContractTab === 'positions' ? (
                   <span>共 <strong className="text-zinc-200">{sortedPositions.length}</strong> 个活跃持仓</span>
                 ) : (

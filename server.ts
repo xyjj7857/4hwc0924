@@ -1767,6 +1767,211 @@ async function callBinanceSigned(
   return res.json();
 }
 
+/**
+ * 按照图三标准为指定币对持仓挂出 1 张止盈单与 1 张止损单：
+ * 止盈价 = 4H开盘价 × 设定止盈倍数 (使用 TAKE_PROFIT_MARKET 突破普通 LIMIT 限价的价格区间限制)
+ * 止损价 = 4H开盘价 × 设定止损倍数 (使用 STOP_MARKET，带智能防立即触发校验)
+ */
+async function placeTpSlForPositionBackend(
+  sym: string,
+  posAmount: number,
+  baseOpenPrice: number,
+  currentPrice: number,
+  orderSettings: any,
+  apiConfig: any,
+  exInfo: any
+): Promise<{ tpSuccess: boolean; slSuccess: boolean }> {
+  const closingSide = 'SELL';
+  const formattedQty = formatQtyForBackend(sym, posAmount, exInfo);
+
+  if (parseFloat(formattedQty) <= 0) {
+    addMonitorLog4h(`[4H自动策略-风控挂单] ⚠️ ${sym} 挂单数量为 0，跳过挂止盈止损`, 'INFO');
+    return { tpSuccess: false, slSuccess: false };
+  }
+
+  // 1. 检查持仓模式 (Hedge vs One-Way)
+  let isHedge = false;
+  try {
+    const dualRes = await callBinanceSigned(
+      '/fapi/v1/positionSide/dual',
+      'GET',
+      {},
+      apiConfig.apiKey,
+      apiConfig.apiSecret,
+      apiConfig.baseUrl
+    );
+    if (dualRes && dualRes.dualSidePosition) {
+      isHedge = true;
+    }
+  } catch (e) {}
+
+  const positionSide = isHedge ? 'LONG' : 'BOTH';
+
+  // 2. 撤销旧平仓挂单（防止历史旧单冲突）
+  try {
+    const openOrders = await callBinanceSigned(
+      '/fapi/v1/openOrders',
+      'GET',
+      { symbol: sym },
+      apiConfig.apiKey,
+      apiConfig.apiSecret,
+      apiConfig.baseUrl
+    );
+    if (Array.isArray(openOrders)) {
+      for (const o of openOrders) {
+        if (o.side === closingSide) {
+          await callBinanceSigned(
+            '/fapi/v1/order',
+            'DELETE',
+            { symbol: sym, orderId: o.orderId },
+            apiConfig.apiKey,
+            apiConfig.apiSecret,
+            apiConfig.baseUrl
+          );
+        }
+      }
+    }
+  } catch (e) {}
+
+  const baseAnchor = baseOpenPrice > 0 ? baseOpenPrice : currentPrice;
+  let tpSuccess = false;
+  let slSuccess = false;
+
+  // 3. 挂止盈单 (按照图三：止盈价 = 当前4H开盘价 × 设定倍数)
+  const tpEnabled = Boolean(orderSettings?.takeProfitMultiplier?.enabled);
+  const tpMultiplier = parseFloat(orderSettings?.takeProfitMultiplier?.value) || 0;
+
+  if (tpEnabled && tpMultiplier > 0) {
+    let targetTpPrice = baseAnchor * tpMultiplier;
+    // 安全钳制：多单止盈必须高于当前标记价，防止立即触发
+    if (currentPrice > 0 && targetTpPrice <= currentPrice) {
+      targetTpPrice = currentPrice * 1.005;
+      addMonitorLog4h(`[4H自动策略-止盈] 提示: ${sym} 计算止盈价低于或等于现价，安全调整为 ${targetTpPrice.toFixed(4)}`, 'INFO');
+    }
+    const finalTpPrice = formatPriceForBackend(sym, targetTpPrice, exInfo);
+
+    const tpParams: any = {
+      symbol: sym,
+      side: closingSide,
+      positionSide,
+      type: 'TAKE_PROFIT_MARKET',
+      stopPrice: finalTpPrice,
+      quantity: formattedQty,
+      workingType: 'MARK_PRICE'
+    };
+    if (!isHedge) {
+      tpParams.reduceOnly = 'true';
+    }
+
+    addMonitorLog4h(`[4H自动策略-风控挂单] 正在提交 ${sym} 止盈单 (触发价: ${finalTpPrice}, 数量: ${formattedQty}, 倍数: ${tpMultiplier}x)...`, 'TRADE');
+    try {
+      const tpRes = await callBinanceSigned(
+        '/fapi/v1/order',
+        'POST',
+        tpParams,
+        apiConfig.apiKey,
+        apiConfig.apiSecret,
+        apiConfig.baseUrl
+      );
+      if (tpRes && (tpRes.orderId || tpRes.clientOrderId)) {
+        tpSuccess = true;
+        addMonitorLog4h(`[4H自动策略-后端] ✅ ${sym} 止盈委托挂单成功！订单ID: ${tpRes.orderId} (触发价: ${finalTpPrice}, 数量: ${formattedQty})`, 'SUCCESS');
+      } else {
+        // 尝试 algoOrder
+        const algoTpParams: any = {
+          symbol: sym,
+          side: closingSide,
+          positionSide,
+          quantity: formattedQty,
+          workingType: 'MARK_PRICE',
+          stopPrice: finalTpPrice,
+          triggerPrice: finalTpPrice,
+          algoType: 'CONDITIONAL',
+          type: 'TAKE_PROFIT_MARKET'
+        };
+        if (!isHedge) algoTpParams.reduceOnly = 'true';
+        const algoRes = await callBinanceSigned('/fapi/v1/algoOrder', 'POST', algoTpParams, apiConfig.apiKey, apiConfig.apiSecret, apiConfig.baseUrl);
+        if (algoRes && (algoRes.algoId || algoRes.orderId)) {
+          tpSuccess = true;
+          addMonitorLog4h(`[4H自动策略-后端] ✅ ${sym} 算法止盈挂单成功！触发价: ${finalTpPrice}`, 'SUCCESS');
+        } else {
+          addMonitorLog4h(`[4H自动策略-后端] ⚠️ ${sym} 止盈挂单反馈: ${tpRes?.msg || algoRes?.msg || '未知异常'}`, 'INFO');
+        }
+      }
+    } catch (tpErr: any) {
+      addMonitorLog4h(`[4H自动策略-后端] ❌ ${sym} 止盈挂单异常: ${tpErr?.message || tpErr}`, 'ERROR');
+    }
+  }
+
+  // 4. 挂止损单 (按照图三：止损价 = 当前4H开盘价 × 设定倍数)
+  const slEnabled = Boolean(orderSettings?.stopLossMultiplier?.enabled);
+  const slMultiplier = parseFloat(orderSettings?.stopLossMultiplier?.value) || 0;
+
+  if (slEnabled && slMultiplier > 0) {
+    let targetSlPrice = baseAnchor * slMultiplier;
+    // 安全钳制：多单止损触发价必须严格低于当前现价/标记价，否则币安报 -2021: Order would immediately trigger
+    if (currentPrice > 0 && targetSlPrice >= currentPrice) {
+      targetSlPrice = currentPrice * 0.995;
+      addMonitorLog4h(`[4H自动策略-止损] 提示: ${sym} 设定止损价 (${(baseAnchor * slMultiplier).toFixed(4)}) 高于或等于当前现价 (${currentPrice})，安全下浮校准为 ${targetSlPrice.toFixed(4)}，防止币安拒单`, 'INFO');
+    }
+    const finalSlPrice = formatPriceForBackend(sym, targetSlPrice, exInfo);
+
+    const slParams: any = {
+      symbol: sym,
+      side: closingSide,
+      positionSide,
+      type: 'STOP_MARKET',
+      stopPrice: finalSlPrice,
+      quantity: formattedQty,
+      workingType: 'MARK_PRICE'
+    };
+    if (!isHedge) {
+      slParams.reduceOnly = 'true';
+    }
+
+    addMonitorLog4h(`[4H自动策略-风控挂单] 正在提交 ${sym} 止损单 (触发价: ${finalSlPrice}, 数量: ${formattedQty}, 倍数: ${slMultiplier}x)...`, 'TRADE');
+    try {
+      const slRes = await callBinanceSigned(
+        '/fapi/v1/order',
+        'POST',
+        slParams,
+        apiConfig.apiKey,
+        apiConfig.apiSecret,
+        apiConfig.baseUrl
+      );
+      if (slRes && (slRes.orderId || slRes.clientOrderId)) {
+        slSuccess = true;
+        addMonitorLog4h(`[4H自动策略-后端] ✅ ${sym} 止损委托挂单成功！订单ID: ${slRes.orderId} (触发价: ${finalSlPrice}, 数量: ${formattedQty})`, 'SUCCESS');
+      } else {
+        // 尝试 algoOrder
+        const algoSlParams: any = {
+          symbol: sym,
+          side: closingSide,
+          positionSide,
+          quantity: formattedQty,
+          workingType: 'MARK_PRICE',
+          stopPrice: finalSlPrice,
+          triggerPrice: finalSlPrice,
+          algoType: 'CONDITIONAL',
+          type: 'STOP_MARKET'
+        };
+        if (!isHedge) algoSlParams.reduceOnly = 'true';
+        const algoRes = await callBinanceSigned('/fapi/v1/algoOrder', 'POST', algoSlParams, apiConfig.apiKey, apiConfig.apiSecret, apiConfig.baseUrl);
+        if (algoRes && (algoRes.algoId || algoRes.orderId)) {
+          slSuccess = true;
+          addMonitorLog4h(`[4H自动策略-后端] ✅ ${sym} 算法止损挂单成功！触发价: ${finalSlPrice}`, 'SUCCESS');
+        } else {
+          addMonitorLog4h(`[4H自动策略-后端] ⚠️ ${sym} 止损挂单反馈: ${slRes?.msg || algoRes?.msg || '未知异常'}`, 'INFO');
+        }
+      }
+    } catch (slErr: any) {
+      addMonitorLog4h(`[4H自动策略-后端] ❌ ${sym} 止损挂单异常: ${slErr?.message || slErr}`, 'ERROR');
+    }
+  }
+
+  return { tpSuccess, slSuccess };
+}
+
 let lastBackendAutoExecutedCycle: number = -1;
 
 async function executeAutoTradingBackend4h(cycleId: number) {
@@ -2133,56 +2338,43 @@ async function executeAutoTradingBackend4h(cycleId: number) {
       orderSuccess ? '已成功开仓市价单' : orderReason, orderId, Date.now()
     );
 
-    // 4. 10 秒后自动挂止损
-    if (orderSuccess && orderSettings?.stopLoss?.enabled) {
+    // 4. 开仓单成交 10 秒后自动向币安挂出图三标准的止盈单与止损单 (按真实持仓量与 4H 开盘价)
+    if (orderSuccess) {
       setTimeout(async () => {
         try {
-          const slPercent = parseFloat(orderSettings.stopLoss.value) || 5;
-          const slPriceRaw = currentPrice * (1 - slPercent / 100);
-          const finalSlPrice = formatPriceForBackend(sym, slPriceRaw, exInfo);
-          const algoParams: any = {
-            symbol: sym,
-            side: 'SELL',
-            quantity: formattedQty,
-            workingType: 'MARK_PRICE',
-            stopPrice: finalSlPrice,
-            triggerPrice: finalSlPrice,
-            algoType: 'CONDITIONAL',
-            type: 'STOP_MARKET',
-            reduceOnly: 'true'
-          };
-          addMonitorLog4h(`[4H自动策略-10秒延时挂止损] 正在为 ${sym} 挂止损单 (触发价: ${finalSlPrice}, 数量: ${formattedQty})...`, 'TRADE');
-          const slRes = await callBinanceSigned(
-            '/fapi/v1/algoOrder',
-            'POST',
-            algoParams,
-            apiConfig.apiKey,
-            apiConfig.apiSecret,
-            apiConfig.baseUrl
-          );
-          if (slRes && (slRes.algoId || slRes.orderId)) {
-            addMonitorLog4h(`[4H自动策略-后端] ✅ ${sym} 算法止损委托挂单成功！触发价: ${finalSlPrice}`, 'SUCCESS');
-          } else {
-            // 兜底 STOP_MARKET
-            await callBinanceSigned(
-              '/fapi/v1/order',
-              'POST',
-              {
-                symbol: sym,
-                side: 'SELL',
-                type: 'STOP_MARKET',
-                stopPrice: finalSlPrice,
-                quantity: formattedQty,
-                reduceOnly: 'true'
-              },
+          // 重新从币安获取准确的成交持仓量与开仓均价
+          let actualAmount = parseFloat(formattedQty);
+          let actualPrice = currentPrice;
+          try {
+            const posCheck = await callBinanceSigned(
+              '/fapi/v2/positionRisk',
+              'GET',
+              { symbol: sym },
               apiConfig.apiKey,
               apiConfig.apiSecret,
               apiConfig.baseUrl
             );
-            addMonitorLog4h(`[4H自动策略-后端] ✅ ${sym} 标准止损挂单成功！触发价: ${finalSlPrice}`, 'SUCCESS');
-          }
+            if (Array.isArray(posCheck)) {
+              const p = posCheck.find((x: any) => x.symbol === sym && Math.abs(parseFloat(x.positionAmt || '0')) > 0);
+              if (p) {
+                actualAmount = Math.abs(parseFloat(p.positionAmt));
+                actualPrice = parseFloat(p.entryPrice) || currentPrice;
+              }
+            }
+          } catch (e) {}
+
+          const baseOpen = item.openPrice || actualPrice;
+          await placeTpSlForPositionBackend(
+            sym,
+            actualAmount,
+            baseOpen,
+            actualPrice,
+            orderSettings,
+            apiConfig,
+            exInfo
+          );
         } catch (e: any) {
-          console.error(`[4H自动策略-后端] ${sym} 挂止损失败:`, e);
+          console.error(`[4H自动策略-后端] ${sym} 延时挂止盈止损单失败:`, e);
         }
       }, 10000);
     }
@@ -3259,6 +3451,100 @@ async function startServer() {
     } catch (error: any) {
       console.error("Failed to clear alert logs:", error);
       res.status(500).json({ error: error.message });
+    }
+  });
+
+  // 一键为现有持仓补挂图三止盈止损单 (支持根据 4H 下单设置或请求体自定义倍数)
+  app.post("/api/positions/apply-tp-sl", async (req, res) => {
+    try {
+      let apiConfig: any = null;
+      let orderSettings: any = null;
+
+      try {
+        const apiRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("apiConfig") as any;
+        if (apiRow) apiConfig = JSON.parse(apiRow.value);
+        const osRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_order_settings") as any;
+        if (osRow) orderSettings = JSON.parse(osRow.value);
+      } catch (e) {}
+
+      // 允许从请求体传入 apiConfig
+      if (req.body?.apiConfig) {
+        apiConfig = { ...apiConfig, ...req.body.apiConfig };
+      }
+
+      if (!apiConfig || !apiConfig.apiKey || !apiConfig.apiSecret) {
+        return res.status(400).json({ error: "未检测到有效币安 API 凭据，请先连接并保存 API" });
+      }
+
+      // 如果请求体传递了覆盖配置，优先使用
+      if (req.body?.orderSettings) {
+        orderSettings = req.body.orderSettings;
+      }
+
+      if (!orderSettings) {
+        orderSettings = {
+          stopLossMultiplier: { enabled: true, value: '1' },
+          takeProfitMultiplier: { enabled: true, value: '10' }
+        };
+      }
+
+      const exInfo = await getBackendExchangeInfo();
+      const posRes = await callBinanceSigned(
+        '/fapi/v2/positionRisk',
+        'GET',
+        {},
+        apiConfig.apiKey,
+        apiConfig.apiSecret,
+        apiConfig.baseUrl
+      );
+
+      if (!Array.isArray(posRes)) {
+        return res.status(500).json({ error: "获取币安持仓失败: " + JSON.stringify(posRes) });
+      }
+
+      const activePositions = posRes.filter((p: any) => parseFloat(p.positionAmt || '0') !== 0);
+      if (activePositions.length === 0) {
+        return res.json({ success: true, count: 0, message: "当前无活跃合约持仓" });
+      }
+
+      const results: any[] = [];
+      for (const pos of activePositions) {
+        const sym = pos.symbol;
+        const posAmt = Math.abs(parseFloat(pos.positionAmt));
+        const entryPrice = parseFloat(pos.entryPrice) || 0;
+        const markPrice = parseFloat(pos.markPrice) || entryPrice;
+
+        // 获取该币对的 4H 开盘价（若 4H 结果中有，则取 4H 开盘价；否则取开仓均价 entryPrice）
+        let baseOpenPrice = entryPrice;
+        try {
+          const cand = (fourHourResults4h.allPassedSymbols || []).find((c: any) => c.symbol === sym);
+          if (cand && cand.openPrice) {
+            baseOpenPrice = cand.openPrice;
+          }
+        } catch (e) {}
+
+        addMonitorLog4h(`[一键补挂止盈止损] 正在为现有持仓 ${sym} (持仓量: ${posAmt}, 开仓价: ${entryPrice}) 挂止盈与止损单...`, 'INFO');
+        const resTpSl = await placeTpSlForPositionBackend(
+          sym,
+          posAmt,
+          baseOpenPrice,
+          markPrice,
+          orderSettings,
+          apiConfig,
+          exInfo
+        );
+        results.push({ symbol: sym, ...resTpSl });
+      }
+
+      res.json({
+        success: true,
+        count: results.length,
+        results,
+        message: `成功为 ${results.length} 个活跃持仓执行止盈止损挂单`
+      });
+    } catch (err: any) {
+      console.error("Failed to apply TP/SL for positions:", err);
+      res.status(500).json({ error: err.message || "补挂止盈止损发生异常" });
     }
   });
 

@@ -1900,106 +1900,157 @@ export default function MonitoringAssistant4h({
               console.warn('Cancel old algo orders error:', algoCancelErr);
             }
 
-            // 步骤 2: 按照图三提交止盈委托单 (LIMIT Maker 委托)
+            // 步骤 2: 按照图三提交止盈委托单 (优先使用 TAKE_PROFIT_MARKET，避免普通限价单被币安 PERCENT_PRICE 拒单)
             const baseAnchorPrice = base4hOpenPrice > 0 ? base4hOpenPrice : posEntryPrice;
             if (tpEnabled && tpMultiplier > 0) {
-              const calculatedTpPrice = baseAnchorPrice * tpMultiplier;
-              const finalTpPrice = formatPriceForSymbol(sym, calculatedTpPrice);
-              const orderParams: any = {
-                symbol: sym,
-                side: closingSide,
-                positionSide: posSide,
-                type: 'LIMIT',
-                price: finalTpPrice,
-                quantity: closingQty,
-                timeInForce: 'GTC',
-              };
-              if (posSide === 'BOTH') orderParams.reduceOnly = 'true';
-
-              addLog?.(`[4H自动策略-延时10s] 正在提交 ${sym} 止盈单 (价格: ${finalTpPrice}, 数量: ${closingQty})...`, 'TRADE');
-              const tpRes = await fetch('/api/binance-proxy', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  method: 'POST',
-                  endpoint: '/fapi/v1/order',
-                  params: orderParams,
-                  apiKey: apiConfig.apiKey,
-                  apiSecret: apiConfig.apiSecret
-                })
-              });
-              const tpData = await tpRes.json();
-              if (tpRes.ok && tpData.orderId) {
-                addLog?.(`[4H自动策略] ✅ ${sym} 止盈委托挂单成功！订单ID: ${tpData.orderId} (止盈价: ${finalTpPrice}, 数量: ${closingQty})`, 'SUCCESS');
-              } else {
-                addLog?.(`[4H自动策略] ⚠️ ${sym} 止盈挂单反馈: ${tpData.msg || '未知异常'}`, 'ERROR');
+              let calculatedTpPrice = baseAnchorPrice * tpMultiplier;
+              if (currentPrice > 0 && calculatedTpPrice <= currentPrice) {
+                calculatedTpPrice = currentPrice * 1.005;
+                addLog?.(`[4H自动策略-止盈] 提示: ${sym} 计算止盈价低于或等于现价，安全调整为 ${calculatedTpPrice.toFixed(4)}`, 'INFO');
               }
-            }
+              const finalTpPrice = formatPriceForSymbol(sym, calculatedTpPrice);
 
-            // 步骤 3: 按照图三提交算法止损委托单 (CONDITIONAL / STOP_MARKET)
-            if (slEnabled && slMultiplier > 0) {
-              const calculatedSlPrice = baseAnchorPrice * slMultiplier;
-              const finalSlPrice = formatPriceForSymbol(sym, calculatedSlPrice);
-              const algoParams: any = {
+              const tpOrderParams: any = {
                 symbol: sym,
                 side: closingSide,
                 positionSide: posSide,
+                type: 'TAKE_PROFIT_MARKET',
+                stopPrice: finalTpPrice,
                 quantity: closingQty,
-                workingType: 'MARK_PRICE',
-                stopPrice: finalSlPrice,
-                triggerPrice: finalSlPrice,
-                algoType: 'CONDITIONAL',
-                type: 'STOP_MARKET',
-                reduceOnly: 'true'
+                workingType: 'MARK_PRICE'
               };
+              if (posSide === 'BOTH') tpOrderParams.reduceOnly = 'true';
 
-              addLog?.(`[4H自动策略-延时10s] 正在提交 ${sym} 算法止损单 (触发价: ${finalSlPrice}, 数量: ${closingQty})...`, 'TRADE');
-              const slRes = await fetch('/api/binance-proxy', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  method: 'POST',
-                  endpoint: '/fapi/v1/algoOrder',
-                  baseUrl: apiConfig.baseUrl || "https://fapi.binance.com",
-                  params: algoParams,
-                  apiKey: apiConfig.apiKey,
-                  apiSecret: apiConfig.apiSecret
-                })
-              });
-              const slData = await slRes.json();
-              if (slRes.ok && (slData.algoId || slData.orderId || slData.clientAlgoId)) {
-                addLog?.(`[4H自动策略] ✅ ${sym} 算法止损委托挂单成功！触发价: ${finalSlPrice} (数量: ${closingQty})`, 'SUCCESS');
-              } else {
-                // 兜底降级为普通 STOP_MARKET 委托
-                addLog?.(`[4H自动策略] 算法止损提交遇到提示: ${slData.msg || '尝试标准止损单'}，正在使用标准止损挂单...`, 'INFO');
-                const fallbackParams: any = {
-                  symbol: sym,
-                  side: closingSide,
-                  positionSide: posSide,
-                  type: 'STOP_MARKET',
-                  stopPrice: finalSlPrice,
-                  quantity: closingQty,
-                  workingType: 'MARK_PRICE',
-                };
-                if (posSide === 'BOTH') fallbackParams.reduceOnly = 'true';
-
-                const fallbackRes = await fetch('/api/binance-proxy', {
+              addLog?.(`[4H自动策略-延时10s] 正在提交 ${sym} 止盈单 (触发价: ${finalTpPrice}, 数量: ${closingQty}, 倍数: ${tpMultiplier}x)...`, 'TRADE');
+              
+              let tpSuccess = false;
+              try {
+                const tpRes = await fetch('/api/binance-proxy', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     method: 'POST',
                     endpoint: '/fapi/v1/order',
-                    params: fallbackParams,
+                    params: tpOrderParams,
                     apiKey: apiConfig.apiKey,
                     apiSecret: apiConfig.apiSecret
                   })
                 });
-                const fbData = await fallbackRes.json();
-                if (fallbackRes.ok && fbData.orderId) {
-                  addLog?.(`[4H自动策略] ✅ ${sym} 标准止损单挂单成功！订单ID: ${fbData.orderId}`, 'SUCCESS');
+                const tpData = await tpRes.json();
+                if (tpRes.ok && (tpData.orderId || tpData.clientOrderId)) {
+                  tpSuccess = true;
+                  addLog?.(`[4H自动策略] ✅ ${sym} 止盈委托挂单成功！订单ID: ${tpData.orderId} (触发价: ${finalTpPrice}, 数量: ${closingQty})`, 'SUCCESS');
                 } else {
-                  addLog?.(`[4H自动策略] ⚠️ ${sym} 止损挂单最终反馈: ${fbData.msg || slData.msg || '未知错误'}`, 'ERROR');
+                  // 尝试 algoOrder 止盈
+                  const algoTpParams: any = {
+                    symbol: sym,
+                    side: closingSide,
+                    positionSide: posSide,
+                    quantity: closingQty,
+                    workingType: 'MARK_PRICE',
+                    stopPrice: finalTpPrice,
+                    triggerPrice: finalTpPrice,
+                    algoType: 'CONDITIONAL',
+                    type: 'TAKE_PROFIT_MARKET'
+                  };
+                  if (posSide === 'BOTH') algoTpParams.reduceOnly = 'true';
+                  const algoTpRes = await fetch('/api/binance-proxy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      method: 'POST',
+                      endpoint: '/fapi/v1/algoOrder',
+                      baseUrl: apiConfig.baseUrl || "https://fapi.binance.com",
+                      params: algoTpParams,
+                      apiKey: apiConfig.apiKey,
+                      apiSecret: apiConfig.apiSecret
+                    })
+                  });
+                  const algoTpData = await algoTpRes.json();
+                  if (algoTpRes.ok && (algoTpData.algoId || algoTpData.orderId)) {
+                    tpSuccess = true;
+                    addLog?.(`[4H自动策略] ✅ ${sym} 算法止盈委托挂单成功！触发价: ${finalTpPrice}`, 'SUCCESS');
+                  } else {
+                    addLog?.(`[4H自动策略] ⚠️ ${sym} 止盈挂单反馈: ${tpData.msg || algoTpData.msg || '未知异常'}`, 'INFO');
+                  }
                 }
+              } catch (tpErr: any) {
+                addLog?.(`[4H自动策略] ❌ ${sym} 止盈挂单异常: ${tpErr?.message || tpErr}`, 'ERROR');
+              }
+            }
+
+            // 步骤 3: 按照图三提交止损委托单 (STOP_MARKET 带智能防立即触发校验)
+            if (slEnabled && slMultiplier > 0) {
+              let calculatedSlPrice = baseAnchorPrice * slMultiplier;
+              if (currentPrice > 0 && calculatedSlPrice >= currentPrice) {
+                calculatedSlPrice = currentPrice * 0.995;
+                addLog?.(`[4H自动策略-止损] 提示: ${sym} 设定止损价 (${(baseAnchorPrice * slMultiplier).toFixed(4)}) 高于或等于当前现价 (${currentPrice})，安全下浮校准为 ${calculatedSlPrice.toFixed(4)}，防止币安 -2021 立即触发拒单`, 'INFO');
+              }
+              const finalSlPrice = formatPriceForSymbol(sym, calculatedSlPrice);
+
+              const slParams: any = {
+                symbol: sym,
+                side: closingSide,
+                positionSide: posSide,
+                type: 'STOP_MARKET',
+                stopPrice: finalSlPrice,
+                quantity: closingQty,
+                workingType: 'MARK_PRICE'
+              };
+              if (posSide === 'BOTH') slParams.reduceOnly = 'true';
+
+              addLog?.(`[4H自动策略-延时10s] 正在提交 ${sym} 止损单 (触发价: ${finalSlPrice}, 数量: ${closingQty}, 倍数: ${slMultiplier}x)...`, 'TRADE');
+              try {
+                const slRes = await fetch('/api/binance-proxy', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    method: 'POST',
+                    endpoint: '/fapi/v1/order',
+                    params: slParams,
+                    apiKey: apiConfig.apiKey,
+                    apiSecret: apiConfig.apiSecret
+                  })
+                });
+                const slData = await slRes.json();
+                if (slRes.ok && (slData.orderId || slData.clientOrderId)) {
+                  addLog?.(`[4H自动策略] ✅ ${sym} 止损委托挂单成功！订单ID: ${slData.orderId} (触发价: ${finalSlPrice}, 数量: ${closingQty})`, 'SUCCESS');
+                } else {
+                  // 尝试 algoOrder
+                  const algoParams: any = {
+                    symbol: sym,
+                    side: closingSide,
+                    positionSide: posSide,
+                    quantity: closingQty,
+                    workingType: 'MARK_PRICE',
+                    stopPrice: finalSlPrice,
+                    triggerPrice: finalSlPrice,
+                    algoType: 'CONDITIONAL',
+                    type: 'STOP_MARKET'
+                  };
+                  if (posSide === 'BOTH') algoParams.reduceOnly = 'true';
+
+                  const algoRes = await fetch('/api/binance-proxy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      method: 'POST',
+                      endpoint: '/fapi/v1/algoOrder',
+                      baseUrl: apiConfig.baseUrl || "https://fapi.binance.com",
+                      params: algoParams,
+                      apiKey: apiConfig.apiKey,
+                      apiSecret: apiConfig.apiSecret
+                    })
+                  });
+                  const algoData = await algoRes.json();
+                  if (algoRes.ok && (algoData.algoId || algoData.orderId)) {
+                    addLog?.(`[4H自动策略] ✅ ${sym} 算法止损委托挂单成功！触发价: ${finalSlPrice}`, 'SUCCESS');
+                  } else {
+                    addLog?.(`[4H自动策略] ⚠️ ${sym} 止损挂单最终反馈: ${slData.msg || algoData.msg || '未知错误'}`, 'ERROR');
+                  }
+                }
+              } catch (slErr: any) {
+                addLog?.(`[4H自动策略] ❌ ${sym} 止损挂单异常: ${slErr?.message || slErr}`, 'ERROR');
               }
             }
           } catch (delayErr: any) {
