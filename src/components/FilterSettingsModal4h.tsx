@@ -359,6 +359,9 @@ export default function FilterSettingsModal4h({
                   disabled={!formData.minVolume4h.enabled}
                   className="w-full px-3 py-2 bg-black/40 border border-white/15 rounded-xl font-mono text-white placeholder-zinc-600 focus:outline-none focus:border-amber-500 disabled:opacity-40 disabled:cursor-not-allowed"
                 />
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  💡 单位为“万 USDT”，填 1000 即代表 1000万 USDT (10,000,000)。系统已自动兼容输入原始金额。
+                </p>
               </div>
             </div>
 
@@ -505,6 +508,9 @@ export default function FilterSettingsModal4h({
                   disabled={!formData.minMaxGainPastK.enabled}
                   className="w-full px-3 py-2 bg-black/40 border border-white/15 rounded-xl font-mono text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed"
                 />
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  💡 要求前 {currentGainKCount} 根完结K线中最大单根涨幅 ≤ 此值（用于筛选低位横盘爆发币；若为强势连涨币，请提高此阈值或取消勾选该项）。
+                </p>
               </div>
             </div>
 

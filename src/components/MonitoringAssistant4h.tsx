@@ -34,7 +34,8 @@ import {
   Filter,
   Settings2,
   FileSpreadsheet,
-  ShieldAlert
+  ShieldAlert,
+  Sparkles
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TradeLog, Position } from '../types';
@@ -410,6 +411,7 @@ export default function MonitoringAssistant4h({
 
   // 4H 筛选设置状态
   const [isFilterModalOpen, setIsFilterModalOpen] = useState(false);
+  const [isFilterDiagnosticOpen, setIsFilterDiagnosticOpen] = useState(false);
   const [filterSettings, setFilterSettings] = useState<FilterSettings4h>(() => {
     try {
       const saved = localStorage.getItem('monitoring4h_filter_settings');
@@ -1134,10 +1136,12 @@ export default function MonitoringAssistant4h({
       if (!isNaN(min) && (data.closePos === undefined || data.closePos < min)) return false;
       if (!isNaN(max) && (data.closePos === undefined || data.closePos > max)) return false;
     }
-    // 3. 4H成交额不小于
+    // 3. 4H成交额不小于 (单位: 万 USDT)
     if (filterSettings.minVolume4h.enabled) {
-      const min = parseFloat(filterSettings.minVolume4h.value);
-      if (!isNaN(min) && (data.currentVolume || 0) < min) return false;
+      let min = parseFloat(filterSettings.minVolume4h.value);
+      if (min > 100000) min = min / 10000; // 智能兼容：输入原始USDT自动换算为万
+      const currentVolTenK = (data.currentVolume || 0) / 10000;
+      if (!isNaN(min) && currentVolTenK < min) return false;
     }
     // 4. 资金费率范围
     if (filterSettings.fundingRateRange.enabled) {
@@ -1158,6 +1162,116 @@ export default function MonitoringAssistant4h({
     }
     return true;
   }, [filterSettings, getSymbolDisplayData]);
+
+  // 诊断辅助函数：详细给出币对每一项筛选条件的匹配结果与未通过原因
+  const checkItemFilterBreakdown = useCallback((item: SymbolData) => {
+    const data = getSymbolDisplayData(item);
+    const rules: Array<{
+      name: string;
+      enabled: boolean;
+      passed: boolean;
+      actual: string;
+      ruleDesc: string;
+      reason: string;
+    }> = [];
+
+    // 1. 涨幅范围
+    if (filterSettings.gainRange.enabled) {
+      const min = parseFloat(filterSettings.gainRange.min);
+      const max = parseFloat(filterSettings.gainRange.max);
+      const val = data.effectiveChange;
+      const passed = (!isNaN(min) ? val >= min : true) && (!isNaN(max) ? val <= max : true);
+      rules.push({
+        name: '4H涨跌幅',
+        enabled: true,
+        passed,
+        actual: `${val >= 0 ? '+' : ''}${val.toFixed(2)}%`,
+        ruleDesc: `[${filterSettings.gainRange.min}% ~ ${filterSettings.gainRange.max}%]`,
+        reason: !passed ? (val < min ? `低于下限 ${min}%` : `高于上限 ${max}%`) : '符合'
+      });
+    }
+
+    // 2. 收位范围
+    if (filterSettings.closePosRange.enabled) {
+      const min = parseFloat(filterSettings.closePosRange.min);
+      const max = parseFloat(filterSettings.closePosRange.max);
+      const val = data.closePos;
+      const passed = val !== undefined && (!isNaN(min) ? val >= min : true) && (!isNaN(max) ? val <= max : true);
+      rules.push({
+        name: '收位',
+        enabled: true,
+        passed,
+        actual: val !== undefined ? `${val.toFixed(1)}%` : '--',
+        ruleDesc: `[${filterSettings.closePosRange.min}% ~ ${filterSettings.closePosRange.max}%]`,
+        reason: !passed ? (val === undefined ? '收位无数据' : val < min ? `低于下限 ${min}%` : `高于上限 ${max}%`) : '符合'
+      });
+    }
+
+    // 3. 4H成交额
+    if (filterSettings.minVolume4h.enabled) {
+      let min = parseFloat(filterSettings.minVolume4h.value);
+      if (min > 100000) min = min / 10000;
+      const volTenK = (data.currentVolume || 0) / 10000;
+      const passed = !isNaN(min) && volTenK >= min;
+      rules.push({
+        name: '4H成交额',
+        enabled: true,
+        passed,
+        actual: `${volTenK.toFixed(1)}万`,
+        ruleDesc: `≥ ${filterSettings.minVolume4h.value}万`,
+        reason: !passed ? `低于门槛 ${min}万` : '符合'
+      });
+    }
+
+    // 4. 资金费率
+    if (filterSettings.fundingRateRange.enabled) {
+      const min = parseFloat(filterSettings.fundingRateRange.min);
+      const max = parseFloat(filterSettings.fundingRateRange.max);
+      const val = data.fundingRate;
+      const passed = (!isNaN(min) ? val >= min : true) && (!isNaN(max) ? val <= max : true);
+      rules.push({
+        name: '资金费率',
+        enabled: true,
+        passed,
+        actual: `${val >= 0 ? '+' : ''}${val.toFixed(4)}%`,
+        ruleDesc: `[${filterSettings.fundingRateRange.min}% ~ ${filterSettings.fundingRateRange.max}%]`,
+        reason: !passed ? (val < min ? `低于下限 ${min}%` : `高于上限 ${max}%`) : '符合'
+      });
+    }
+
+    // 5. 量比
+    if (filterSettings.minVolumeRatio.enabled) {
+      const min = parseFloat(filterSettings.minVolumeRatio.value);
+      const val = data.volumeRatioPastK || 0;
+      const passed = !isNaN(min) && val >= min;
+      rules.push({
+        name: '量比',
+        enabled: true,
+        passed,
+        actual: `${val.toFixed(2)}x`,
+        ruleDesc: `≥ ${filterSettings.minVolumeRatio.value}`,
+        reason: !passed ? `量比不足 (${val.toFixed(2)} < ${min})` : '符合'
+      });
+    }
+
+    // 6. 前K高
+    if (filterSettings.minMaxGainPastK.enabled) {
+      const max = parseFloat(filterSettings.minMaxGainPastK.value);
+      const val = data.maxGainPastK || 0;
+      const passed = !isNaN(max) && val <= max;
+      rules.push({
+        name: `前${gainKCount}K高`,
+        enabled: true,
+        passed,
+        actual: `${val.toFixed(2)}%`,
+        ruleDesc: `≤ ${filterSettings.minMaxGainPastK.value}%`,
+        reason: !passed ? `前K极值超标 (${val.toFixed(2)}% > ${max}%)` : '符合'
+      });
+    }
+
+    const allPassed = rules.every(r => r.passed);
+    return { allPassed, rules };
+  }, [filterSettings, getSymbolDisplayData, gainKCount]);
 
   // 依据当前模式与排序方案展示 4H 榜单
   // 方案1、固定：排序不发生变化，保持入榜固定排位，仅数值实时更新（默认方案）
@@ -1192,45 +1306,23 @@ export default function MonitoringAssistant4h({
     });
   }, [fourHourBoards.losers, sortScheme, getSymbolDisplayData, filterSettings.filterTableRows, hasActiveFilters, checkItemMatchesFilters]);
 
-  // 汇总 4H 监控全部候选币对，供 4H 筛选榜单使用（方案一：优先采用后端全量达标币对池）
+  // 汇总 4H 监控全部候选币对，供 4H 筛选榜单使用（优先汇聚带有完整计算指标的榜单及全量达标池）
   const allCandidateSymbols4h = useMemo(() => {
-    const passedList = fourHourBoards.allPassedSymbols;
-    if (passedList && passedList.length > 0) {
-      const map = new Map<string, SymbolData>();
-      for (const item of passedList) {
-        if (item && item.symbol && !map.has(item.symbol)) {
-          map.set(item.symbol, item);
-        }
-      }
-      // 补充 1h 放量榜与 24h 榜单币对，确保放量异动币也不遗漏
-      const appendList = (arr?: SymbolData[] | VolumeSpikeData[]) => {
-        if (!arr) return;
-        for (const item of arr) {
-          if (item && item.symbol && !map.has(item.symbol)) {
-            map.set(item.symbol, item as SymbolData);
-          }
-        }
-      };
-      appendList(spikeAnd24hBoards.volumeSpike as any);
-      appendList(spikeAnd24hBoards.gainers24h);
-      appendList(spikeAnd24hBoards.losers24h);
-      return Array.from(map.values());
-    }
-
-    // 兜底策略：若全量达标池尚未下发，汇聚 6 个子榜单
     const map = new Map<string, SymbolData>();
-    const appendList = (arr?: SymbolData[]) => {
+    const appendList = (arr?: SymbolData[] | VolumeSpikeData[]) => {
       if (!arr) return;
       for (const item of arr) {
         if (item && item.symbol && !map.has(item.symbol)) {
-          map.set(item.symbol, item);
+          map.set(item.symbol, item as SymbolData);
         }
       }
     };
+    // 优先注入核心在榜币对，确保指标最丰富精准
     appendList(fourHourBoards.gainers);
     appendList(fourHourBoards.losers);
     appendList(fourHourBoards.amplitude15m);
-    appendList(spikeAnd24hBoards.volumeSpike);
+    appendList(fourHourBoards.allPassedSymbols);
+    appendList(spikeAnd24hBoards.volumeSpike as any);
     appendList(spikeAnd24hBoards.gainers24h);
     appendList(spikeAnd24hBoards.losers24h);
     return Array.from(map.values());
@@ -4234,8 +4326,104 @@ export default function MonitoringAssistant4h({
                             </button>
                           </div>
                         ) : filteredBoardSymbols.length === 0 ? (
-                          <div className="px-4 py-6 text-center text-zinc-500 italic text-xs sm:text-sm bg-white/[0.01]">
-                            当前暂无币对满足已勾选的全部筛选条件（已启用 {activeFilterCount} 项条件）
+                          <div className="px-4 py-6 text-center text-zinc-400 text-xs sm:text-sm bg-white/[0.01]">
+                            <p className="text-zinc-400 mb-2.5">
+                              当前暂无币对满足已勾选的全部筛选条件（已启用 {activeFilterCount} 项条件）
+                            </p>
+                            <div className="flex items-center justify-center gap-2 flex-wrap">
+                              <button
+                                type="button"
+                                onClick={() => setIsFilterDiagnosticOpen(prev => !prev)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-xs font-bold transition-all cursor-pointer active:scale-95 shadow-sm"
+                              >
+                                <Info className="w-3.5 h-3.5" />
+                                <span>{isFilterDiagnosticOpen ? "收起筛选未命中诊断" : "🔍 诊断：查看 4H 榜单币对未通过筛选的具体原因"}</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setIsFilterModalOpen(true)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-300 border border-white/10 text-xs font-medium transition-all cursor-pointer active:scale-95 shadow-sm"
+                              >
+                                <Filter className="w-3.5 h-3.5 text-amber-400" />
+                                <span>调整筛选参数</span>
+                              </button>
+                            </div>
+
+                            {/* 详细诊断展开区 */}
+                            {isFilterDiagnosticOpen && (
+                              <div className="mt-4 text-left max-w-4xl mx-auto bg-[#141518]/95 border border-amber-500/30 rounded-2xl p-4 shadow-2xl text-xs space-y-3">
+                                <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
+                                  <div>
+                                    <div className="font-bold text-amber-300 text-sm flex items-center gap-1.5">
+                                      <Sparkles className="w-4 h-4 text-amber-400" />
+                                      <span>4H 榜单前列币对逐项筛选诊断</span>
+                                    </div>
+                                    <p className="text-[11px] text-zinc-400 mt-0.5">
+                                      对比当前开启的 {activeFilterCount} 项门槛，直观排查币对为何被过滤：
+                                    </p>
+                                  </div>
+                                  <span className="text-[11px] text-zinc-400 font-mono">
+                                    榜单共 {(fourHourBoards.gainers || []).length} 个币对
+                                  </span>
+                                </div>
+
+                                <div className="space-y-2.5">
+                                  {(fourHourBoards.gainers || []).slice(0, 5).map((gItem, gIdx) => {
+                                    const breakdown = checkItemFilterBreakdown(gItem);
+                                    return (
+                                      <div key={gItem.symbol} className="p-3 rounded-xl bg-white/[0.02] border border-white/10">
+                                        <div className="flex items-center justify-between mb-2">
+                                          <div className="flex items-center gap-2">
+                                            <span className="font-bold text-zinc-100 text-base font-sans uppercase">
+                                              {gItem.symbol.replace('USDT', '')}
+                                            </span>
+                                            <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-mono">
+                                              #{gIdx + 1}
+                                            </span>
+                                            <span className="text-[12px] font-mono text-emerald-400 font-bold">
+                                              {gItem.change >= 0 ? '+' : ''}{gItem.change.toFixed(2)}%
+                                            </span>
+                                          </div>
+                                          <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${
+                                            breakdown.allPassed 
+                                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' 
+                                              : 'bg-red-500/15 text-red-300 border border-red-500/30'
+                                          }`}>
+                                            {breakdown.allPassed ? '✅ 全部符合' : '❌ 未通过全部筛选条件'}
+                                          </span>
+                                        </div>
+
+                                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                                          {breakdown.rules.map((rule) => (
+                                            <div 
+                                              key={rule.name} 
+                                              className={`p-2 rounded-lg border text-[11px] ${
+                                                rule.passed 
+                                                  ? 'bg-emerald-500/[0.08] border-emerald-500/25 text-emerald-300' 
+                                                  : 'bg-red-500/[0.08] border-red-500/25 text-red-300'
+                                              }`}
+                                            >
+                                              <div className="flex items-center justify-between font-bold mb-0.5">
+                                                <span>{rule.name}</span>
+                                                <span className="font-mono text-[10px]">{rule.passed ? '✅ 符合' : '❌ 不符'}</span>
+                                              </div>
+                                              <div className="text-[10px] opacity-80 truncate font-mono">
+                                                实际: {rule.actual} (门槛: {rule.ruleDesc})
+                                              </div>
+                                              {!rule.passed && (
+                                                <div className="text-[10px] text-red-400 font-bold mt-1">
+                                                  原因: {rule.reason}
+                                                </div>
+                                              )}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         ) : (
                           <table className="w-full text-left border-collapse min-w-[880px]">

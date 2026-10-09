@@ -1018,6 +1018,144 @@ const getLiveEnrichedScanResults15m = () => {
   };
 };
 
+const enrichItem4h = (item: any) => {
+  const kline = marketDataManager.getSymbol4hKline(item.symbol, config4h.volumeKCount || 12, config4h.gainKCount || 6);
+  const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
+  const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
+  const price = marketDataManager.getSymbolPrice(item.symbol) || (kline ? kline.close : item.lastPrice);
+  const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
+
+  let change = kline ? kline.change : item.change;
+  let amplitude = kline ? kline.amplitude : item.amplitude;
+  let openPrice = kline ? kline.open : item.openPrice;
+  let vol4h = kline ? kline.volume : item.volume15m;
+  let currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
+  let currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
+
+  if (kline && kline.open > 0 && price > 0) {
+    change = ((price - kline.open) / kline.open) * 100;
+    currentHigh = Math.max(kline.high, price);
+    currentLow = kline.low > 0 ? Math.min(kline.low, price) : price;
+    if (currentLow > 0) {
+      amplitude = ((currentHigh - currentLow) / currentLow) * 100;
+    }
+  }
+
+  const closePos = calcClosePos(price, currentHigh, currentLow);
+  const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : change;
+  const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
+
+  const minVol = kline ? kline.minVolumePastK : (item.minVolumePastK || 0);
+  const volRatio = minVol > 0 ? (vol4h / minVol) : (kline ? kline.volumeRatioPastK : (item.volumeRatioPastK || 0));
+
+  return {
+    ...item,
+    volume24h: vol24h > 0 ? vol24h : item.volume24h,
+    volume15m: vol4h,
+    openPrice: openPrice,
+    lastPrice: price,
+    change: change,
+    highChange: highChange,
+    change24h: chg24h !== 0 ? chg24h : item.change24h,
+    amplitude: amplitude,
+    high: currentHigh,
+    low: currentLow,
+    closePos,
+    fundingRate: fundingInfo.fundingRate,
+    fundingIntervalHours: fundingInfo.fundingIntervalHours,
+    settlementCycle: fundingInfo.settlementCycle,
+    nextFundingTime: fundingInfo.nextFundingTime,
+    listingOpen: extremes.listingOpen,
+    listingTime: extremes.listingTime,
+    historicalHigh: extremes.historicalHigh,
+    historicalLow: extremes.historicalLow,
+    highTime: extremes.highTime,
+    lowTime: extremes.lowTime,
+    laterExtreme: extremes.laterExtreme,
+    candlesCount: extremes.candlesCount,
+    minVolumePastK: minVol,
+    volumeRatioPastK: volRatio,
+    maxGainPastK_standard: kline ? kline.maxGainPastK_standard : (item.maxGainPastK_standard || 0),
+    maxGainPastK_high: kline ? kline.maxGainPastK_high : (item.maxGainPastK_high || 0),
+    past4hCandles: kline?.past4hCandles || item.past4hCandles || []
+  };
+};
+
+const enrichItemSpike = (item: any) => {
+  const spike = marketDataManager.getSymbol1hSpike(item.symbol);
+  const kline = marketDataManager.getSymbol4hKline(item.symbol);
+  const price = marketDataManager.getSymbolPrice(item.symbol) || item.lastPrice || 0;
+  const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
+  const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
+  const openPrice = kline ? kline.open : (item.openPrice || 0);
+  const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : (spike ? spike.change1h : item.change);
+  const currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
+  const currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
+  const closePos = calcClosePos(price, currentHigh, currentLow);
+  return {
+    ...item,
+    ratio: spike ? spike.ratio : item.ratio,
+    currVolume: spike ? spike.currVolume : item.currVolume,
+    prevVolume: spike ? spike.prevVolume : item.prevVolume,
+    change: spike ? spike.change1h : item.change,
+    highChange,
+    openPrice,
+    lastPrice: price,
+    high: currentHigh,
+    low: currentLow,
+    closePos,
+    fundingRate: fundingInfo.fundingRate,
+    fundingIntervalHours: fundingInfo.fundingIntervalHours,
+    settlementCycle: fundingInfo.settlementCycle,
+    nextFundingTime: fundingInfo.nextFundingTime,
+    listingOpen: extremes.listingOpen,
+    listingTime: extremes.listingTime,
+    historicalHigh: extremes.historicalHigh,
+    historicalLow: extremes.historicalLow,
+    highTime: extremes.highTime,
+    lowTime: extremes.lowTime,
+    laterExtreme: extremes.laterExtreme,
+    candlesCount: extremes.candlesCount
+  };
+};
+
+const enrichItem24h = (item: any) => {
+  const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
+  const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
+  const price = marketDataManager.getSymbolPrice(item.symbol) || item.lastPrice || 0;
+  const kline = marketDataManager.getSymbol4hKline(item.symbol);
+  const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
+  const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
+  const openPrice = kline ? kline.open : (item.openPrice || 0);
+  const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : chg24h;
+  const currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
+  const currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
+  const closePos = calcClosePos(price, currentHigh, currentLow);
+  return {
+    ...item,
+    volume24h: vol24h > 0 ? vol24h : item.volume24h,
+    openPrice,
+    lastPrice: price > 0 ? price : item.lastPrice,
+    change24h: chg24h !== 0 ? chg24h : item.change24h,
+    highChange,
+    high: currentHigh,
+    low: currentLow,
+    closePos,
+    fundingRate: fundingInfo.fundingRate,
+    fundingIntervalHours: fundingInfo.fundingIntervalHours,
+    settlementCycle: fundingInfo.settlementCycle,
+    nextFundingTime: fundingInfo.nextFundingTime,
+    listingOpen: extremes.listingOpen,
+    listingTime: extremes.listingTime,
+    historicalHigh: extremes.historicalHigh,
+    historicalLow: extremes.historicalLow,
+    highTime: extremes.highTime,
+    lowTime: extremes.lowTime,
+    laterExtreme: extremes.laterExtreme,
+    candlesCount: extremes.candlesCount
+  };
+};
+
 // 依据最新实时行情，对 4h / 1h放量 / 24h 在榜币对的成交额、涨跌幅、振幅、放量倍数等实时数据动态更新
 const getFullResults4h = () => {
   // 兜底补齐 4H 结果
@@ -1034,18 +1172,25 @@ const getFullResults4h = () => {
 
         const kline = marketDataManager.getSymbol4hKline(symbol, config4h.volumeKCount || 12, config4h.gainKCount || 6);
         if (kline && kline.volume > min4h) {
-          const highChange = kline.close > 0 && kline.open > 0 ? ((kline.close - kline.open) / kline.close) * 100 : kline.change;
+          const price = marketDataManager.getSymbolPrice(symbol) || kline.close;
+          const currentHigh = Math.max(kline.high || price, price);
+          const currentLow = kline.low > 0 ? Math.min(kline.low, price) : price;
+          const closePos = calcClosePos(price, currentHigh, currentLow);
+          const highChange = price > 0 && kline.open > 0 ? ((price - kline.open) / price) * 100 : kline.change;
           const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
           finalResults.push({
             symbol,
             volume24h: vol24h,
             volume15m: kline.volume,
             openPrice: kline.open,
-            lastPrice: kline.close,
+            lastPrice: price,
             change: kline.change,
             highChange,
             change24h: marketDataManager.getSymbol24hChange(symbol),
             amplitude: kline.amplitude,
+            high: currentHigh,
+            low: currentLow,
+            closePos,
             fundingRate: fundingInfo.fundingRate,
             fundingIntervalHours: fundingInfo.fundingIntervalHours,
             settlementCycle: fundingInfo.settlementCycle,
@@ -1146,144 +1291,6 @@ const getFullResults4h = () => {
       };
     }
   }
-
-  const enrichItem4h = (item: any) => {
-    const kline = marketDataManager.getSymbol4hKline(item.symbol, config4h.volumeKCount || 12, config4h.gainKCount || 6);
-    const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
-    const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
-    const price = marketDataManager.getSymbolPrice(item.symbol) || (kline ? kline.close : item.lastPrice);
-    const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
-
-    let change = kline ? kline.change : item.change;
-    let amplitude = kline ? kline.amplitude : item.amplitude;
-    let openPrice = kline ? kline.open : item.openPrice;
-    let vol4h = kline ? kline.volume : item.volume15m;
-    let currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
-    let currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
-
-    if (kline && kline.open > 0 && price > 0) {
-      change = ((price - kline.open) / kline.open) * 100;
-      currentHigh = Math.max(kline.high, price);
-      currentLow = kline.low > 0 ? Math.min(kline.low, price) : price;
-      if (currentLow > 0) {
-        amplitude = ((currentHigh - currentLow) / currentLow) * 100;
-      }
-    }
-
-    const closePos = calcClosePos(price, currentHigh, currentLow);
-    const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : change;
-    const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
-
-    const minVol = kline ? kline.minVolumePastK : (item.minVolumePastK || 0);
-    const volRatio = minVol > 0 ? (vol4h / minVol) : (kline ? kline.volumeRatioPastK : (item.volumeRatioPastK || 0));
-
-    return {
-      ...item,
-      volume24h: vol24h > 0 ? vol24h : item.volume24h,
-      volume15m: vol4h,
-      openPrice: openPrice,
-      lastPrice: price,
-      change: change,
-      highChange: highChange,
-      change24h: chg24h !== 0 ? chg24h : item.change24h,
-      amplitude: amplitude,
-      high: currentHigh,
-      low: currentLow,
-      closePos,
-      fundingRate: fundingInfo.fundingRate,
-      fundingIntervalHours: fundingInfo.fundingIntervalHours,
-      settlementCycle: fundingInfo.settlementCycle,
-      nextFundingTime: fundingInfo.nextFundingTime,
-      listingOpen: extremes.listingOpen,
-      listingTime: extremes.listingTime,
-      historicalHigh: extremes.historicalHigh,
-      historicalLow: extremes.historicalLow,
-      highTime: extremes.highTime,
-      lowTime: extremes.lowTime,
-      laterExtreme: extremes.laterExtreme,
-      candlesCount: extremes.candlesCount,
-      minVolumePastK: minVol,
-      volumeRatioPastK: volRatio,
-      maxGainPastK_standard: kline ? kline.maxGainPastK_standard : (item.maxGainPastK_standard || 0),
-      maxGainPastK_high: kline ? kline.maxGainPastK_high : (item.maxGainPastK_high || 0),
-      past4hCandles: kline?.past4hCandles || item.past4hCandles || []
-    };
-  };
-
-  const enrichItemSpike = (item: any) => {
-    const spike = marketDataManager.getSymbol1hSpike(item.symbol);
-    const kline = marketDataManager.getSymbol4hKline(item.symbol);
-    const price = marketDataManager.getSymbolPrice(item.symbol) || item.lastPrice || 0;
-    const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
-    const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
-    const openPrice = kline ? kline.open : (item.openPrice || 0);
-    const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : (spike ? spike.change1h : item.change);
-    const currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
-    const currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
-    const closePos = calcClosePos(price, currentHigh, currentLow);
-    return {
-      ...item,
-      ratio: spike ? spike.ratio : item.ratio,
-      currVolume: spike ? spike.currVolume : item.currVolume,
-      prevVolume: spike ? spike.prevVolume : item.prevVolume,
-      change: spike ? spike.change1h : item.change,
-      highChange,
-      openPrice,
-      lastPrice: price,
-      high: currentHigh,
-      low: currentLow,
-      closePos,
-      fundingRate: fundingInfo.fundingRate,
-      fundingIntervalHours: fundingInfo.fundingIntervalHours,
-      settlementCycle: fundingInfo.settlementCycle,
-      nextFundingTime: fundingInfo.nextFundingTime,
-      listingOpen: extremes.listingOpen,
-      listingTime: extremes.listingTime,
-      historicalHigh: extremes.historicalHigh,
-      historicalLow: extremes.historicalLow,
-      highTime: extremes.highTime,
-      lowTime: extremes.lowTime,
-      laterExtreme: extremes.laterExtreme,
-      candlesCount: extremes.candlesCount
-    };
-  };
-
-  const enrichItem24h = (item: any) => {
-    const vol24h = marketDataManager.getSymbol24hVolume(item.symbol);
-    const chg24h = marketDataManager.getSymbol24hChange(item.symbol);
-    const price = marketDataManager.getSymbolPrice(item.symbol) || item.lastPrice || 0;
-    const kline = marketDataManager.getSymbol4hKline(item.symbol);
-    const fundingInfo = marketDataManager.getSymbolFundingInfo(item.symbol);
-    const extremes = marketDataManager.getSymbolHistoricalExtremes(item.symbol);
-    const openPrice = kline ? kline.open : (item.openPrice || 0);
-    const highChange = price > 0 && openPrice > 0 ? ((price - openPrice) / price) * 100 : chg24h;
-    const currentHigh = kline ? Math.max(kline.high, price) : (item.high || price);
-    const currentLow = kline ? (kline.low > 0 ? Math.min(kline.low, price) : price) : (item.low || price);
-    const closePos = calcClosePos(price, currentHigh, currentLow);
-    return {
-      ...item,
-      volume24h: vol24h > 0 ? vol24h : item.volume24h,
-      openPrice,
-      lastPrice: price > 0 ? price : item.lastPrice,
-      change24h: chg24h !== 0 ? chg24h : item.change24h,
-      highChange,
-      high: currentHigh,
-      low: currentLow,
-      closePos,
-      fundingRate: fundingInfo.fundingRate,
-      fundingIntervalHours: fundingInfo.fundingIntervalHours,
-      settlementCycle: fundingInfo.settlementCycle,
-      nextFundingTime: fundingInfo.nextFundingTime,
-      listingOpen: extremes.listingOpen,
-      listingTime: extremes.listingTime,
-      historicalHigh: extremes.historicalHigh,
-      historicalLow: extremes.historicalLow,
-      highTime: extremes.highTime,
-      lowTime: extremes.lowTime,
-      laterExtreme: extremes.laterExtreme,
-      candlesCount: extremes.candlesCount
-    };
-  };
 
   return {
     gainers: (fourHourResults4h.gainers || []).map(enrichItem4h),
@@ -1394,6 +1401,9 @@ const runCycleScan4h = async (isScheduledOrManual: boolean = true) => {
       if (kline && kline.volume > min4h) {
         passedCount++;
         const price = marketDataManager.getSymbolPrice(symbol) || kline.close;
+        const currentHigh = Math.max(kline.high || price, price);
+        const currentLow = kline.low > 0 ? Math.min(kline.low, price) : price;
+        const closePos = calcClosePos(price, currentHigh, currentLow);
         const change = kline.open > 0 ? ((price - kline.open) / kline.open) * 100 : kline.change;
         const highChange = price > 0 && kline.open > 0 ? ((price - kline.open) / price) * 100 : change;
         const fundingInfo = marketDataManager.getSymbolFundingInfo(symbol);
@@ -1407,6 +1417,9 @@ const runCycleScan4h = async (isScheduledOrManual: boolean = true) => {
           highChange,
           change24h: marketDataManager.getSymbol24hChange(symbol),
           amplitude: kline.amplitude,
+          high: currentHigh,
+          low: currentLow,
+          closePos,
           fundingRate: fundingInfo.fundingRate,
           fundingIntervalHours: fundingInfo.fundingIntervalHours,
           settlementCycle: fundingInfo.settlementCycle,
@@ -2090,8 +2103,8 @@ async function executeAutoTradingBackend4h(cycleId: number) {
     console.error("[4H自动策略-后端] 读取持久化配置失败:", e);
   }
 
-  // 获取本次 4H 结算的全量达标币对池
-  const allPassed = (fourHourResults4h.allPassedSymbols || []) as any[];
+  // 获取本次 4H 结算的全量达标币对池，并统一采用最新行情与计算指标补齐
+  const allPassed = ((fourHourResults4h.allPassedSymbols || []).map(enrichItem4h)) as any[];
   if (!allPassed || allPassed.length === 0) {
     addMonitorLog4h('[4H自动策略-后端常驻] 本周期全量达标币对池为空，无需筛选', 'INFO');
     return;
@@ -2121,9 +2134,13 @@ async function executeAutoTradingBackend4h(cycleId: number) {
     return;
   }
 
+  const currentGainMode = getGainMode4h();
+
   const checkMatches = (item: any) => {
     if (!filterSettings) return false;
-    const chg = item.highChange !== undefined ? item.highChange : item.change;
+    const chg = currentGainMode === 'high'
+      ? (item.highChange !== undefined ? item.highChange : item.change)
+      : (item.change !== undefined ? item.change : item.highChange);
     
     // 1. 涨幅范围 (gainRange)
     const gainCfg = filterSettings.gainRange || filterSettings.changePercent;
@@ -2138,14 +2155,19 @@ async function executeAutoTradingBackend4h(cycleId: number) {
     if (cpCfg?.enabled) {
       const min = parseFloat(cpCfg.min);
       const max = parseFloat(cpCfg.max);
-      const closePos = item.closePos ?? 0;
+      let closePos = item.closePos;
+      if (closePos === undefined && item.lastPrice > 0 && item.high > item.low) {
+        closePos = calcClosePos(item.lastPrice, item.high, item.low);
+      }
+      if (closePos === undefined) closePos = 50.0;
       if (!isNaN(min) && closePos < min) return false;
       if (!isNaN(max) && closePos > max) return false;
     }
     // 3. 4H 成交额 (万) minVolume4h
     const vol4hCfg = filterSettings.minVolume4h || filterSettings.volume4h;
     if (vol4hCfg?.enabled) {
-      const min = parseFloat(vol4hCfg.value);
+      let min = parseFloat(vol4hCfg.value);
+      if (min > 100000) min = min / 10000; // 智能容错：用户输入原始 USDT 自动换算为 万
       const vol4hTenK = (item.volume15m || 0) / 10000;
       if (!isNaN(min) && vol4hTenK < min) return false;
     }
@@ -2169,7 +2191,9 @@ async function executeAutoTradingBackend4h(cycleId: number) {
     const mgCfg = filterSettings.minMaxGainPastK || filterSettings.maxGainPastK;
     if (mgCfg?.enabled) {
       const max = parseFloat(mgCfg.value);
-      const mGain = item.maxGainPastK_standard ?? item.maxGainPastK ?? 0;
+      const mGain = currentGainMode === 'high'
+        ? (item.maxGainPastK_high ?? item.maxGainPastK_standard ?? item.maxGainPastK ?? 0)
+        : (item.maxGainPastK_standard ?? item.maxGainPastK ?? 0);
       if (!isNaN(max) && mGain > max) return false;
     }
     return true;
