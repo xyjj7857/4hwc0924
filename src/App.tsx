@@ -2864,12 +2864,12 @@ export default function App() {
     }
   };
 
-  // 一键为当前所有活跃持仓补齐图三标准的止盈单与止损单
-  const [isApplyingTpSl, setIsApplyingTpSl] = useState(false);
-  const handleApply4hTpSlToAllPositions = async () => {
-    if (isApplyingTpSl) return;
-    setIsApplyingTpSl(true);
-    addLog('🚀 正在为当前所有活跃持仓按照图三标准批量补齐止盈单（10倍开盘价）与止损单（1倍开盘价）...', 'INFO');
+  // 为指定单个持仓独立补齐图三标准的止盈单与止损单（仅影响当前订单，其他仓单不受影响）
+  const [applyingPositionSymbol, setApplyingPositionSymbol] = useState<string | null>(null);
+  const handleApply4hTpSlForPosition = async (pos: Position) => {
+    if (applyingPositionSymbol) return;
+    setApplyingPositionSymbol(pos.symbol);
+    addLog(`🚀 正在为持仓 ${pos.symbol} 按照图三标准补齐止盈单与止损单...`, 'INFO');
     try {
       let os: any = null;
       try {
@@ -2882,22 +2882,23 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           apiConfig,
-          orderSettings: os
+          orderSettings: os,
+          symbol: pos.symbol
         })
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        addLog(`✅ 批量风控挂单成功！已为 ${data.count} 个活跃持仓在币安挂出止盈单与止损单`, 'SUCCESS');
+        addLog(`✅ ${pos.symbol} 补挂止盈止损成功！已在币安挂出对应止盈单与止损单`, 'SUCCESS');
         setTimeout(() => {
           fetchSnapshotRef.current?.();
-        }, 1200);
+        }, 1000);
       } else {
-        addLog(`⚠️ 补挂止盈止损提示: ${data.error || data.message || '执行失败'}`, 'ERROR');
+        addLog(`⚠️ ${pos.symbol} 补挂止盈止损提示: ${data.error || data.message || '执行失败'}`, 'ERROR');
       }
     } catch (err: any) {
-      addLog(`❌ 补挂止盈止损异常: ${err?.message || err}`, 'ERROR');
+      addLog(`❌ ${pos.symbol} 补挂止盈止损异常: ${err?.message || err}`, 'ERROR');
     } finally {
-      setIsApplyingTpSl(false);
+      setApplyingPositionSymbol(null);
     }
   };
 
@@ -6205,18 +6206,6 @@ export default function App() {
               </div>
 
               <div className="flex items-center gap-3 text-[12px] font-mono text-zinc-400">
-                {activeContractTab === 'positions' && sortedPositions.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={handleApply4hTpSlToAllPositions}
-                    disabled={isApplyingTpSl}
-                    className="flex items-center gap-1.5 px-3 py-1 bg-gradient-to-r from-amber-500/20 via-orange-500/20 to-amber-500/20 hover:from-amber-500/30 hover:to-orange-500/30 text-amber-300 hover:text-amber-100 border border-amber-500/50 rounded-lg text-xs font-bold transition-all cursor-pointer shadow-sm active:scale-95 disabled:opacity-50"
-                    title="按照图三【4H 下单设置】中配置的止损倍数与止盈倍数，一键为所有持仓补挂币安止损单与止盈单"
-                  >
-                    <ShieldAlert size={14} className={isApplyingTpSl ? "animate-spin text-amber-400" : "text-amber-400"} />
-                    <span>{isApplyingTpSl ? '正在向币安补挂...' : '⚡ 一键补齐图三止盈止损'}</span>
-                  </button>
-                )}
                 {activeContractTab === 'positions' ? (
                   <span>共 <strong className="text-zinc-200">{sortedPositions.length}</strong> 个活跃持仓</span>
                 ) : (
@@ -6439,14 +6428,26 @@ export default function App() {
                                 </div>
                               </td>
                               <td className="px-5 py-2 text-center">
-                                <button 
-                                  onClick={() => handleClosePosition(pos.id)}
-                                  className="w-[105px] h-[47px] bg-emerald-300 hover:bg-emerald-400 text-zinc-950 text-[16.5px] font-bold rounded-md flex items-center justify-center gap-1.5 mx-auto transition-all active:scale-95 shadow-sm whitespace-nowrap"
-                                  title="市价平仓"
-                                >
-                                  <XCircle size={17} className="stroke-[2.5] shrink-0" />
-                                  <span>市价平仓</span>
-                                </button>
+                                <div className="flex items-center justify-center gap-2">
+                                  <button 
+                                    type="button"
+                                    onClick={() => handleApply4hTpSlForPosition(pos)}
+                                    disabled={applyingPositionSymbol === pos.symbol}
+                                    className="h-[47px] px-3 bg-gradient-to-r from-amber-500/20 via-orange-500/20 to-amber-500/20 hover:from-amber-500/30 hover:to-orange-500/30 text-amber-300 hover:text-amber-100 border border-amber-500/50 rounded-md text-[13.5px] font-bold flex items-center justify-center gap-1.5 transition-all active:scale-95 shadow-sm disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                                    title={`按照图三【4H 下单设置】为 ${pos.symbol} 补挂币安止损单与止盈单（仅影响当前订单）`}
+                                  >
+                                    <ShieldAlert size={15} className={applyingPositionSymbol === pos.symbol ? "animate-spin text-amber-400" : "text-amber-400"} />
+                                    <span>{applyingPositionSymbol === pos.symbol ? '补挂中...' : '⚡ 补齐止盈止损'}</span>
+                                  </button>
+                                  <button 
+                                    onClick={() => handleClosePosition(pos.id)}
+                                    className="w-[105px] h-[47px] bg-emerald-300 hover:bg-emerald-400 text-zinc-950 text-[16.5px] font-bold rounded-md flex items-center justify-center gap-1.5 transition-all active:scale-95 shadow-sm whitespace-nowrap cursor-pointer"
+                                    title="市价平仓"
+                                  >
+                                    <XCircle size={17} className="stroke-[2.5] shrink-0" />
+                                    <span>市价平仓</span>
+                                  </button>
+                                </div>
                               </td>
                             </motion.tr>
                           );

@@ -3674,8 +3674,17 @@ async function startServer() {
         return res.json({ success: true, count: 0, message: "当前无活跃合约持仓" });
       }
 
+      const targetSymbol = req.body?.symbol;
+      const positionsToProcess = targetSymbol
+        ? activePositions.filter((p: any) => p.symbol === targetSymbol || p.symbol === targetSymbol.toUpperCase())
+        : activePositions;
+
+      if (positionsToProcess.length === 0) {
+        return res.status(404).json({ error: `未找到 ${targetSymbol || ''} 的有效持仓仓单` });
+      }
+
       const results: any[] = [];
-      for (const pos of activePositions) {
+      for (const pos of positionsToProcess) {
         const sym = pos.symbol;
         const posAmt = Math.abs(parseFloat(pos.positionAmt));
         const entryPrice = parseFloat(pos.entryPrice) || 0;
@@ -3690,7 +3699,7 @@ async function startServer() {
           }
         } catch (e) {}
 
-        addMonitorLog4h(`[一键补挂止盈止损] 正在为现有持仓 ${sym} (持仓量: ${posAmt}, 开仓价: ${entryPrice}) 挂止盈与止损单...`, 'INFO');
+        addMonitorLog4h(`[补挂止盈止损] 正在为现有持仓 ${sym} (持仓量: ${posAmt}, 开仓价: ${entryPrice}) 挂止盈与止损单...`, 'INFO');
         const resTpSl = await placeTpSlForPositionBackend(
           sym,
           posAmt,
@@ -3707,7 +3716,9 @@ async function startServer() {
         success: true,
         count: results.length,
         results,
-        message: `成功为 ${results.length} 个活跃持仓执行止盈止损挂单`
+        message: targetSymbol
+          ? `已成功为 ${targetSymbol} 补齐止盈单与止损单`
+          : `成功为 ${results.length} 个活跃持仓执行止盈止损挂单`
       });
     } catch (err: any) {
       console.error("Failed to apply TP/SL for positions:", err);

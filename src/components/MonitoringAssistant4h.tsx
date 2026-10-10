@@ -4230,23 +4230,6 @@ export default function MonitoringAssistant4h({
                     )}
                   </button>
 
-                  {/* 一键为持仓补齐图三止盈止损单 快捷按钮 */}
-                  {(positions || []).some(p => p.amount > 0) && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleApplyTpSlToAllPositions();
-                      }}
-                      disabled={isApplyingTpSlAll}
-                      className="px-2.5 py-1.5 rounded-xl border border-amber-500/40 bg-gradient-to-r from-amber-500/15 to-orange-500/15 text-amber-300 hover:text-amber-100 hover:bg-amber-500/25 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer select-none active:scale-95 disabled:opacity-50 shadow-xs"
-                      title="按照图三下单设置，为当前持有的所有仓单在币安补挂 1 张止盈单 + 1 张止损单"
-                    >
-                      <span className={isApplyingTpSlAll ? "animate-spin" : ""}>⚡</span>
-                      <span>{isApplyingTpSlAll ? '补挂中...' : '补齐止盈止损'}</span>
-                    </button>
-                  )}
-
                   {/* 自动 交易开关按钮 */}
                   <button
                     type="button"
