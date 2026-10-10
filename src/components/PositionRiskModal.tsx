@@ -271,40 +271,116 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
       let lastTpId = '';
       let lastSlId = '';
 
-      // 步骤 2: 若勾选了止盈，提交止盈委托（LIMIT Maker 委托）
+      // 步骤 2: 若勾选了止盈，提交算法条件止盈委托 (TAKE_PROFIT_MARKET，0 占用合约保证金)
       if (currentConfig.tpSlControl.tpEnabled) {
         const finalTpPrice = formatPrice(position.symbol, calculatedTpPrice);
-        const orderParams: any = {
-          symbol: position.symbol,
-          side: closingSide,
-          positionSide: position.positionSide,
-          type: 'LIMIT',
-          price: finalTpPrice,
-          quantity: closingQty,
-          timeInForce: 'GTC',
+        const buildAlgoTpParams = (targetPosSide: string, withReduceOnly: boolean) => {
+          const p: any = {
+            symbol: position.symbol,
+            side: closingSide,
+            positionSide: targetPosSide,
+            quantity: closingQty,
+            workingType: 'MARK_PRICE',
+            triggerPrice: finalTpPrice,
+            algoType: 'CONDITIONAL',
+            type: 'TAKE_PROFIT_MARKET'
+          };
+          if (withReduceOnly && targetPosSide === 'BOTH') {
+            p.reduceOnly = 'true';
+          }
+          return p;
         };
-        if (position.positionSide === 'BOTH') orderParams.reduceOnly = 'true';
 
-        addLog(`[专属风控] 正在提交 ${position.symbol} 止盈单 (价格: ${finalTpPrice}, 数量: ${closingQty})...`, 'TRADE');
-        const tpRes = await fetch('/api/binance-proxy', {
+        addLog(`[专属风控] 正在向币安 Algo 算法端点提交 ${position.symbol} 条件止盈单 (0占用保证金, 触发价: ${finalTpPrice}, 数量: ${closingQty})...`, 'TRADE');
+
+        let currentPosSide = position.positionSide || 'BOTH';
+        let algoTpParams = buildAlgoTpParams(currentPosSide, currentPosSide === 'BOTH');
+
+        let tpRes = await fetch('/api/binance-proxy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             method: 'POST',
-            endpoint: '/fapi/v1/order',
-            params: orderParams,
+            endpoint: '/fapi/v1/algoOrder',
+            params: algoTpParams,
             apiKey: apiConfig.apiKey,
             apiSecret: apiConfig.apiSecret
           })
         });
 
-        const tpData = await tpRes.json();
-        if (tpRes.ok && tpData.orderId) {
+        let tpData = await tpRes.json();
+
+        // 自愈重试 1: 若 position side 报错，自愈为另一侧重新在 algoOrder 提交
+        if (!tpRes.ok && String(tpData?.msg || '').includes('position side')) {
+          currentPosSide = currentPosSide === 'BOTH' ? 'LONG' : 'BOTH';
+          algoTpParams = buildAlgoTpParams(currentPosSide, currentPosSide === 'BOTH');
+          tpRes = await fetch('/api/binance-proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              method: 'POST',
+              endpoint: '/fapi/v1/algoOrder',
+              params: algoTpParams,
+              apiKey: apiConfig.apiKey,
+              apiSecret: apiConfig.apiSecret
+            })
+          });
+          tpData = await tpRes.json();
+        }
+
+        // 自愈重试 2: 若 reduceOnly 报错，去除 reduceOnly 重新在 algoOrder 提交
+        if (!tpRes.ok && String(tpData?.msg || '').includes('reduceOnly')) {
+          algoTpParams = buildAlgoTpParams(currentPosSide, false);
+          tpRes = await fetch('/api/binance-proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              method: 'POST',
+              endpoint: '/fapi/v1/algoOrder',
+              params: algoTpParams,
+              apiKey: apiConfig.apiKey,
+              apiSecret: apiConfig.apiSecret
+            })
+          });
+          tpData = await tpRes.json();
+        }
+
+        if (tpRes.ok && (tpData.algoId || tpData.orderId || tpData.clientAlgoId)) {
           tpSuccess = true;
-          lastTpId = String(tpData.orderId);
-          addLog(`[专属风控] ${position.symbol} 止盈委托挂单成功！订单ID: ${tpData.orderId} (止盈价: ${finalTpPrice})`, 'SUCCESS');
+          const aId = String(tpData.algoId || tpData.orderId || tpData.clientAlgoId);
+          lastTpId = aId;
+          addLog(`[专属风控] ${position.symbol} 条件止盈委托 (AlgoOrder) 挂单成功(0占用保证金)！AlgoID: ${aId} (触发价: ${finalTpPrice})`, 'SUCCESS');
         } else {
-          addLog(`[专属风控] ${position.symbol} 止盈挂单失败: ${tpData.msg || '未知异常'}`, 'ERROR');
+          // 降级尝试以 /fapi/v1/order 条件单端点提交 TAKE_PROFIT_MARKET
+          const fallbackParams: any = {
+            symbol: position.symbol,
+            side: closingSide,
+            positionSide: currentPosSide,
+            type: 'TAKE_PROFIT_MARKET',
+            stopPrice: finalTpPrice,
+            quantity: closingQty,
+            workingType: 'MARK_PRICE'
+          };
+          if (currentPosSide === 'BOTH') fallbackParams.reduceOnly = 'true';
+          const fallbackRes = await fetch('/api/binance-proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              method: 'POST',
+              endpoint: '/fapi/v1/order',
+              params: fallbackParams,
+              apiKey: apiConfig.apiKey,
+              apiSecret: apiConfig.apiSecret
+            })
+          });
+          const fallbackData = await fallbackRes.json();
+          if (fallbackRes.ok && (fallbackData.orderId || fallbackData.clientOrderId)) {
+            tpSuccess = true;
+            lastTpId = String(fallbackData.orderId);
+            addLog(`[专属风控] ${position.symbol} 条件止盈单挂单成功(0占用保证金)！订单ID: ${fallbackData.orderId} (触发价: ${finalTpPrice})`, 'SUCCESS');
+          } else {
+            addLog(`[专属风控] ${position.symbol} 止盈挂单失败: ${tpData?.msg || fallbackData?.msg || '未知异常'}`, 'ERROR');
+          }
         }
       }
 

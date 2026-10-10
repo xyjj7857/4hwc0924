@@ -2088,7 +2088,7 @@ async function executeAutoTradingBackend4h(cycleId: number) {
     if (apiRow) apiConfig = JSON.parse(apiRow.value);
     if (!apiConfig || !apiConfig.apiKey) {
       try {
-        const credRow = db.prepare("SELECT * FROM api_credentials ORDER BY is_active DESC, updated_at DESC LIMIT 1").get() as any;
+        const credRow = db.prepare("SELECT * FROM api_credentials LIMIT 1").get() as any;
         if (credRow && credRow.api_key && credRow.api_secret) {
           apiConfig = {
             accountName: credRow.account_name,
@@ -2596,32 +2596,30 @@ function runBackgroundMonitor4h() {
       runVolumeSpikeScanBackend4h();
     }
 
-    // 周期结算点自动触发：计算榜单并执行 7x24 常驻后台自动交易与全量达标筛选
-    if (totalSecondsInCycle >= settleTargetSeconds && last4hCycleTrigger !== currentCycleStart) {
+    // 确定本周期 4H 结算与筛选的触发时刻 (秒)
+    // 优先采用用户在筛选设置中自定义的扫描时刻 scanMoment，其次采用监控基础配置中的结算时刻 (settleMin / settleSec)
+    let effectiveTargetSec = settleTargetSeconds;
+    try {
+      const fsRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_filter_settings") as any;
+      if (fsRow && fsRow.value) {
+        const fs = JSON.parse(fsRow.value);
+        if (fs.scanMoment && typeof fs.scanMoment.minute === 'number') {
+          const smH = typeof fs.scanMoment.hour === 'number' ? fs.scanMoment.hour : 3;
+          const smM = fs.scanMoment.minute;
+          const smS = fs.scanMoment.second || 0;
+          effectiveTargetSec = (smH * 3600) + (smM * 60) + smS;
+        }
+      }
+    } catch (e) {}
+
+    // 当周期内的当前秒数达到或超过目标时刻，且本周期尚未执行时触发（保证每个周期在后台精准执行一次，无论前端是否开启）
+    if (totalSecondsInCycle >= effectiveTargetSec && last4hCycleTrigger !== currentCycleStart) {
       last4hCycleTrigger = currentCycleStart;
       await runCycleScan4h(true);
       executeAutoTradingBackend4h(currentCycleStart).catch(err => {
         console.error('[4H自动策略-后端执行异常]:', err);
       });
     }
-
-    // 检查是否有用户自定义设定的 4H 扫描时刻 (scanMoment)
-    try {
-      const fsRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_filter_settings") as any;
-      if (fsRow && fsRow.value) {
-        const fs = JSON.parse(fsRow.value);
-        if (fs.scanMoment && typeof fs.scanMoment.hour === 'number' && typeof fs.scanMoment.minute === 'number') {
-          const customSec = (fs.scanMoment.hour * 3600) + (fs.scanMoment.minute * 60) + (fs.scanMoment.second || 0);
-          if (Math.abs(totalSecondsInCycle - customSec) <= 1 && last4hCycleTrigger !== currentCycleStart) {
-            last4hCycleTrigger = currentCycleStart;
-            await runCycleScan4h(true);
-            executeAutoTradingBackend4h(currentCycleStart).catch(err => {
-              console.error('[4H自动策略-后端执行异常]:', err);
-            });
-          }
-        }
-      }
-    } catch (e) {}
   }, 1000);
 }
 runBackgroundMonitor4h();

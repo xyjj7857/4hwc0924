@@ -491,23 +491,6 @@ export default function MonitoringAssistant4h({
         }
       })
       .catch(e => console.warn('Failed to load screening records from DB:', e));
-
-    // 启动时将当前 4H 自动交易状态、筛选设置与下单设置双向持久化同步至后端 settings 表
-    try {
-      const savedAuto = localStorage.getItem('monitoring4h_auto_trading') === 'true';
-      const savedFs = localStorage.getItem('monitoring4h_filter_settings');
-      const savedOs = localStorage.getItem('monitoring4h_order_settings');
-      const syncPayload: Record<string, any> = {
-        monitoring4h_auto_trading: savedAuto
-      };
-      if (savedFs) syncPayload.monitoring4h_filter_settings = JSON.parse(savedFs);
-      if (savedOs) syncPayload.monitoring4h_order_settings = JSON.parse(savedOs);
-      fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(syncPayload)
-      }).catch(() => {});
-    } catch {}
   }, []);
 
   // 保存筛选记录辅助函数 (双重持久化: 状态 + 本地数据库 + localStorage)
@@ -578,30 +561,64 @@ export default function MonitoringAssistant4h({
     }
   }, [addLog]);
 
-  // 从本地数据库 (SQLite settings 表) 初始化恢复所有 4H 相关参数配置
+  // 从本地数据库 (SQLite settings 表) 初始化恢复所有 4H 相关参数配置 (以服务端数据库为核心权威源)
   useEffect(() => {
     let active = true;
     fetch('/api/settings')
       .then(res => res.ok ? res.json() : null)
       .then((settings: Record<string, any> | null) => {
         if (!active || !settings) return;
+        const missingFromDb: Record<string, any> = {};
+
+        // 1. 筛选设置 (优先采用数据库中的持久化配置)
         if (settings.monitoring4h_filter_settings && typeof settings.monitoring4h_filter_settings === 'object') {
           setFilterSettings(settings.monitoring4h_filter_settings);
           try { localStorage.setItem('monitoring4h_filter_settings', JSON.stringify(settings.monitoring4h_filter_settings)); } catch {}
+        } else {
+          // 数据库缺失此项时，使用缓存或默认值补齐并写入数据库
+          let initFs = DEFAULT_FILTER_SETTINGS_4H;
+          try {
+            const saved = localStorage.getItem('monitoring4h_filter_settings');
+            if (saved) initFs = JSON.parse(saved);
+          } catch {}
+          setFilterSettings(initFs);
+          missingFromDb.monitoring4h_filter_settings = initFs;
         }
+
+        // 2. 下单设置 (优先采用数据库中的持久化配置)
         if (settings.monitoring4h_order_settings && typeof settings.monitoring4h_order_settings === 'object') {
-          setOrderSettings({
+          const merged = {
             ...DEFAULT_ORDER_SETTINGS_4H,
             ...settings.monitoring4h_order_settings,
             maxPositionCount: settings.monitoring4h_order_settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
-          });
-          try { localStorage.setItem('monitoring4h_order_settings', JSON.stringify(settings.monitoring4h_order_settings)); } catch {}
+          };
+          setOrderSettings(merged);
+          try { localStorage.setItem('monitoring4h_order_settings', JSON.stringify(merged)); } catch {}
+        } else {
+          let initOs = DEFAULT_ORDER_SETTINGS_4H;
+          try {
+            const saved = localStorage.getItem('monitoring4h_order_settings');
+            if (saved) initOs = { ...DEFAULT_ORDER_SETTINGS_4H, ...JSON.parse(saved) };
+          } catch {}
+          setOrderSettings(initOs);
+          missingFromDb.monitoring4h_order_settings = initOs;
         }
+
+        // 3. 自动交易开关 (以服务端数据库为唯一标准，绝不被未经确认的前端状态覆盖)
         if (settings.monitoring4h_auto_trading !== undefined) {
           const autoState = Boolean(settings.monitoring4h_auto_trading);
           setIsAutoTradingActive(autoState);
           try { localStorage.setItem('monitoring4h_auto_trading', String(autoState)); } catch {}
+        } else {
+          missingFromDb.monitoring4h_auto_trading = false;
         }
+
+        // 4. 4H 监控基础配置
+        if (settings.monitoring_config_4h && typeof settings.monitoring_config_4h === 'object') {
+          setConfig(prev => ({ ...prev, ...settings.monitoring_config_4h }));
+        }
+
+        // 5. 其它统计与模式配置
         if (typeof settings.monitor_4h_volume_k_count === 'number') {
           const val = Math.max(1, Math.min(30, settings.monitor_4h_volume_k_count));
           setVolumeKCount(val);
@@ -634,6 +651,15 @@ export default function MonitoringAssistant4h({
           setIsFilteredBoardCollapsed(fbCol);
           try { localStorage.setItem('monitoring4h_filtered_board_collapsed', String(fbCol)); } catch {}
         }
+
+        // 仅在数据库缺少某项初始键时，将其写入数据库补齐
+        if (Object.keys(missingFromDb).length > 0) {
+          fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(missingFromDb)
+          }).catch(() => {});
+        }
       })
       .catch(err => {
         console.warn('Failed to load 4H settings from DB:', err);
@@ -647,7 +673,12 @@ export default function MonitoringAssistant4h({
       try {
         localStorage.setItem('monitoring4h_auto_trading', String(next));
       } catch {}
-      saveDbSettings({ monitoring4h_auto_trading: next });
+      // 启动或停止自动交易时，连同当前最新筛选与下单设置一并固化到 SQLite 数据库
+      saveDbSettings({ 
+        monitoring4h_auto_trading: next,
+        monitoring4h_filter_settings: filterSettings,
+        monitoring4h_order_settings: orderSettings
+      });
       if (next) {
         const sm = filterSettings.scanMoment || { hour: 3, minute: 58, second: 30 };
         const maxPos = orderSettings.maxPositionCount?.enabled !== false ? (orderSettings.maxPositionCount?.value || '10') : '10';
