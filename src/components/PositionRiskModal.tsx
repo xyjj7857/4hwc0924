@@ -16,10 +16,18 @@ import {
   Info,
   Swords,
   Flame,
-  Target
+  Target,
+  Layers,
+  ArrowRight
 } from 'lucide-react';
 import { Position, ApiConfig, OpenOrder } from '../types';
-import { PositionRiskConfig, getDefaultPositionRiskConfig, getRiskButtonDisplay } from '../types/positionRisk';
+import { 
+  PositionRiskConfig, 
+  getDefaultPositionRiskConfig, 
+  getRiskButtonDisplay, 
+  normalizeConditionControl,
+  detectPositionTpSl
+} from '../types/positionRisk';
 
 interface PositionRiskModalProps {
   isOpen: boolean;
@@ -34,6 +42,7 @@ interface PositionRiskModalProps {
   formatQty: (symbol: string, qty: number) => string;
   openOrders?: OpenOrder[];
   onRefreshOrders?: () => void;
+  currentN?: number;
 }
 
 export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
@@ -48,14 +57,19 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
   formatPrice,
   formatQty,
   openOrders = [],
-  onRefreshOrders
+  onRefreshOrders,
+  currentN
 }) => {
   const isLong = position ? position.side === 'BUY' : true;
   const entryPrice = position?.entryPrice || 0;
 
   // 内部表单临时状态，关闭或保存时生效
   const [currentConfig, setCurrentConfig] = useState<PositionRiskConfig>(() => {
-    if (config) return JSON.parse(JSON.stringify(config));
+    if (config) {
+      const cloned = JSON.parse(JSON.stringify(config));
+      cloned.conditionControl = normalizeConditionControl(cloned.conditionControl);
+      return cloned;
+    }
     if (position) return getDefaultPositionRiskConfig(position.id, position.symbol, position.side, entryPrice);
     return getDefaultPositionRiskConfig('default', '', 'BUY', 0);
   });
@@ -63,7 +77,9 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
   // 当外部传入新的 config 或 position 切换时重置表单
   useEffect(() => {
     if (config) {
-      setCurrentConfig(JSON.parse(JSON.stringify(config)));
+      const cloned = JSON.parse(JSON.stringify(config));
+      cloned.conditionControl = normalizeConditionControl(cloned.conditionControl);
+      setCurrentConfig(cloned);
     } else if (position) {
       setCurrentConfig(getDefaultPositionRiskConfig(position.id, position.symbol, position.side, entryPrice));
     }
@@ -532,7 +548,7 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
       addLog(`[时间风控] 已为持仓 ${position.symbol} 激活最大持仓时间风控 (${currentConfig.timeControl.maxHoldMinutes} 分钟)，倒计时现已启动`, 'SUCCESS');
     }
     if (finalConfig.conditionControl.enabled) {
-      addLog(`[条件风控] 已勾选 ${position.symbol} 的条件风控框架`, 'INFO');
+      addLog(`[条件风控] 已为持仓 ${position.symbol} 启用条件风控 (阶梯分批平仓 & 动态回撤移动止损已生效)`, 'SUCCESS');
     }
 
     onClose();
@@ -1032,13 +1048,13 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
             </div>
           </div>
 
-          {/* 条件 C: 条件风控 (框架预留) */}
+          {/* 条件 C: 条件风控 (N值阶梯平仓 & 动态回撤移动止损) */}
           <div className={`p-4 rounded-xl border transition-all ${
             currentConfig.conditionControl.enabled 
               ? 'bg-purple-950/20 border-purple-500/40 shadow-sm shadow-purple-500/10' 
               : 'bg-[#18181A] border-[#27272A]'
           }`}>
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center justify-between mb-3 pb-2 border-b border-zinc-800/80">
               <label className="flex items-center gap-2.5 cursor-pointer select-none">
                 <input 
                   type="checkbox"
@@ -1056,29 +1072,312 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
                 />
                 <div className="flex items-center gap-1.5">
                   <Flame size={16} className={currentConfig.conditionControl.enabled ? 'text-purple-400' : 'text-zinc-400'} />
-                  <span className="text-sm font-bold text-white">条件 C：条件风控 (规则框架预留)</span>
+                  <span className="text-sm font-bold text-white">条件 C：条件风控 (阶梯分批平仓 & 动态回撤移动止损)</span>
                 </div>
               </label>
 
               <span className={`text-[11px] px-2 py-0.5 rounded font-mono ${
                 currentConfig.conditionControl.enabled ? 'bg-purple-500/20 text-purple-300 font-semibold' : 'bg-zinc-800 text-zinc-500'
               }`}>
-                {currentConfig.conditionControl.enabled ? '已勾选启用' : '未勾选'}
+                {currentConfig.conditionControl.enabled ? '已勾选启用 (默认)' : '未勾选'}
               </span>
             </div>
 
-            <div className="bg-[#121214] p-3 rounded-lg border border-dashed border-purple-500/30 text-xs text-zinc-400 space-y-2">
-              <div className="flex items-center gap-1.5 text-purple-300 font-medium">
-                <Info size={14} />
-                <span>框架保留声明：</span>
+            {/* 条件 C 内部选项 */}
+            <div className={`space-y-4 text-xs transition-opacity ${currentConfig.conditionControl.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+              
+              {/* 子选项 1: N值阶梯分批平仓 (3组独立配置) */}
+              <div className="bg-[#121214] p-3.5 rounded-xl border border-zinc-800/80 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Layers size={14} className="text-purple-400" />
+                    <span className="font-bold text-zinc-200">1. N值阶梯分批平仓 (共 3 组，每次平现有仓位的百分比)</span>
+                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 text-purple-300 font-mono">
+                    独立勾选生效
+                  </span>
+                </div>
+
+                <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  当持仓的 N值（盈利倍数）达到目标时，自动按当时<strong className="text-purple-300 font-semibold">【现有仓位】</strong>的设定百分比执行市价平仓。
+                </p>
+
+                {/* 3 组阶梯配置 */}
+                <div className="space-y-2.5">
+                  {currentConfig.conditionControl.stageCloseRules.map((stage, idx) => {
+                    const stageNumber = idx + 1;
+                    return (
+                      <div 
+                        key={stage.id || `stage_${stageNumber}`}
+                        className={`p-2.5 rounded-lg border transition-all ${
+                          stage.enabled 
+                            ? 'bg-[#18181C] border-purple-500/30 shadow-xs' 
+                            : 'bg-[#151517] border-zinc-800/60 opacity-60'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <label className="flex items-center gap-2 cursor-pointer select-none">
+                            <input 
+                              type="checkbox"
+                              checked={stage.enabled}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                setCurrentConfig(prev => {
+                                  const updatedStages = [...prev.conditionControl.stageCloseRules];
+                                  updatedStages[idx] = { ...updatedStages[idx], enabled: checked };
+                                  return {
+                                    ...prev,
+                                    conditionControl: {
+                                      ...prev.conditionControl,
+                                      stageCloseRules: updatedStages
+                                    }
+                                  };
+                                });
+                              }}
+                              className="w-3.5 h-3.5 rounded text-purple-500 bg-zinc-900 border-zinc-700 focus:ring-purple-500"
+                            />
+                            <span className="font-bold text-xs text-white">
+                              第 {stageNumber} 组
+                            </span>
+                          </label>
+
+                          <div className="flex items-center gap-3">
+                            {/* N = 输入 */}
+                            <div className="flex items-center gap-1.5 font-mono">
+                              <span className="text-zinc-400 text-xs">当 N =</span>
+                              <input 
+                                type="number"
+                                min="1"
+                                step="1"
+                                value={stage.targetN}
+                                onChange={(e) => {
+                                  const val = Math.max(1, parseInt(e.target.value) || 1);
+                                  setCurrentConfig(prev => {
+                                    const updatedStages = [...prev.conditionControl.stageCloseRules];
+                                    updatedStages[idx] = { ...updatedStages[idx], targetN: val };
+                                    return {
+                                      ...prev,
+                                      conditionControl: {
+                                        ...prev.conditionControl,
+                                        stageCloseRules: updatedStages
+                                      }
+                                    };
+                                  });
+                                }}
+                                className="w-16 px-2 py-1 bg-zinc-900 border border-zinc-700 rounded text-center text-amber-300 font-bold focus:outline-hidden focus:border-purple-500"
+                              />
+                            </div>
+
+                            {/* 平仓比例输入 */}
+                            <div className="flex items-center gap-1.5 font-mono">
+                              <span className="text-zinc-400 text-xs">平仓现有</span>
+                              <input 
+                                type="number"
+                                min="1"
+                                max="100"
+                                step="1"
+                                value={stage.closeRatio}
+                                onChange={(e) => {
+                                  const val = Math.min(100, Math.max(1, parseFloat(e.target.value) || 1));
+                                  setCurrentConfig(prev => {
+                                    const updatedStages = [...prev.conditionControl.stageCloseRules];
+                                    updatedStages[idx] = { ...updatedStages[idx], closeRatio: val };
+                                    return {
+                                      ...prev,
+                                      conditionControl: {
+                                        ...prev.conditionControl,
+                                        stageCloseRules: updatedStages
+                                      }
+                                    };
+                                  });
+                                }}
+                                className="w-16 px-2 py-1 bg-zinc-900 border border-zinc-700 rounded text-center text-emerald-400 font-bold focus:outline-hidden focus:border-purple-500"
+                              />
+                              <span className="text-zinc-400 text-xs">%</span>
+                            </div>
+
+                            {/* 执行状态标签 */}
+                            <div className="text-[10px] font-mono">
+                              {stage.executed ? (
+                                <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/40">
+                                  ✅ 已在 N={stage.targetN} 平仓 ({stage.executedAmount || '-'})
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-400">
+                                  待触发
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* 阶梯平仓示例卡片 */}
+                <div className="bg-[#0D0D0E] p-2.5 rounded-lg border border-zinc-800 text-[11px] text-zinc-400 space-y-1">
+                  <div className="text-purple-300 font-semibold flex items-center gap-1">
+                    <Info size={12} />
+                    <span>按现有仓位分步平仓推演（例：初始持仓 100 张，每组均设平仓 50%）：</span>
+                  </div>
+                  <div className="pl-4 space-y-0.5 text-zinc-400 font-mono text-[10px]">
+                    <div>• 触达 N=2：平仓现有仓位 100 × 50% = 50 张，剩余 50 张</div>
+                    <div>• 触达 N=3：平仓现有仓位 50 × 50% = 25 张，剩余 25 张</div>
+                    <div>• 触达 N=4：平仓现有仓位 25 × 50% = 12.5 张，剩余 12.5 张</div>
+                  </div>
+                </div>
               </div>
-              <p className="text-[11px] leading-relaxed">
-                按照您的指令，此处完整保留了“条件风控”的数据结构、开关以及规则优先判定机制。待您想好具体策略（如：动态移动追踪止损、指标背离平仓、突发巨幅振幅平仓等）后，我们将随时为您接入具体执行规则！
-              </p>
-              <div className="flex items-center gap-2 text-[10px] text-purple-400/80 font-mono">
-                <span className="px-1.5 py-0.5 bg-purple-500/10 rounded">规则类型: RESERVED_FRAMEWORK</span>
-                <span className="px-1.5 py-0.5 bg-purple-500/10 rounded">权重优先级: 最高 (条件风控 ＞ 时间风控 ＞ 死斗)</span>
+
+              {/* 子选项 2: N值动态移动回撤止损调整 */}
+              <div className="bg-[#121214] p-3.5 rounded-xl border border-zinc-800/80 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input 
+                      type="checkbox"
+                      checked={currentConfig.conditionControl.trailingStopRule.enabled}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setCurrentConfig(prev => ({
+                          ...prev,
+                          conditionControl: {
+                            ...prev.conditionControl,
+                            trailingStopRule: {
+                              ...prev.conditionControl.trailingStopRule,
+                              enabled: checked
+                            }
+                          }
+                        }));
+                      }}
+                      className="w-3.5 h-3.5 rounded text-purple-500 bg-zinc-900 border-zinc-700 focus:ring-purple-500"
+                    />
+                    <div className="flex items-center gap-1.5 font-bold text-zinc-200">
+                      <TrendingUp size={14} className="text-purple-400" />
+                      <span>2. N值动态移动回撤止损调整 (自动抬升 Algo 算法止损单)</span>
+                    </div>
+                  </label>
+
+                  <span className={`text-[10px] px-2 py-0.5 rounded font-mono ${
+                    currentConfig.conditionControl.trailingStopRule.enabled 
+                      ? 'bg-purple-500/10 text-purple-300 font-bold' 
+                      : 'bg-zinc-800 text-zinc-500'
+                  }`}>
+                    {currentConfig.conditionControl.trailingStopRule.enabled ? '已勾选生效 (默认)' : '未勾选'}
+                  </span>
+                </div>
+
+                {/* 参数输入 */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-2.5 bg-[#18181C] rounded-lg border border-purple-500/20">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-zinc-400 font-mono text-xs">当 N &gt;= 几时:</span>
+                    <div className="flex items-center gap-1.5 font-mono">
+                      <span className="text-zinc-500 text-xs">N &gt;=</span>
+                      <input 
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={currentConfig.conditionControl.trailingStopRule.minN}
+                        onChange={(e) => {
+                          const val = Math.max(1, parseInt(e.target.value) || 1);
+                          setCurrentConfig(prev => ({
+                            ...prev,
+                            conditionControl: {
+                              ...prev.conditionControl,
+                              trailingStopRule: {
+                                ...prev.conditionControl.trailingStopRule,
+                                minN: val
+                              }
+                            }
+                          }));
+                        }}
+                        className="w-18 px-2 py-1 bg-zinc-900 border border-zinc-700 rounded text-center text-amber-300 font-bold focus:outline-hidden focus:border-purple-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-zinc-400 font-mono text-xs">回撤比例:</span>
+                    <div className="flex items-center gap-1.5 font-mono">
+                      <input 
+                        type="number"
+                        min="1"
+                        max="99"
+                        step="1"
+                        value={currentConfig.conditionControl.trailingStopRule.drawdownRatio}
+                        onChange={(e) => {
+                          const val = Math.min(99, Math.max(1, parseFloat(e.target.value) || 1));
+                          setCurrentConfig(prev => ({
+                            ...prev,
+                            conditionControl: {
+                              ...prev.conditionControl,
+                              trailingStopRule: {
+                                ...prev.conditionControl.trailingStopRule,
+                                drawdownRatio: val
+                              }
+                            }
+                          }));
+                        }}
+                        className="w-18 px-2 py-1 bg-zinc-900 border border-zinc-700 rounded text-center text-rose-400 font-bold focus:outline-hidden focus:border-purple-500"
+                      />
+                      <span className="text-zinc-400 text-xs">%</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 动态试算与对照卡片 */}
+                {(() => {
+                  const trailing = currentConfig.conditionControl.trailingStopRule;
+                  const ratio = (trailing.drawdownRatio || 80) / 100;
+                  const effectiveN = Math.max(currentN || 1, trailing.minN || 3);
+                  const dynamicPrice = isLong 
+                    ? entryPrice * effectiveN * (1 - ratio)
+                    : (entryPrice / effectiveN) * (1 + ratio);
+                  
+                  const detected = detectPositionTpSl(position, openOrders, currentConfig);
+                  const currentOrderSlPrice = detected.slPrice || currentConfig.tpSlControl.slPrice || 0;
+                  const isPriceHigher = isLong ? (dynamicPrice > currentOrderSlPrice) : (dynamicPrice < currentOrderSlPrice);
+
+                  return (
+                    <div className="bg-[#0D0D0E] p-3 rounded-lg border border-zinc-800 space-y-2">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-400 font-medium">公式: 开仓价 × N × (1 - 回撤比例)</span>
+                        <span className="text-purple-300 font-mono">当前持仓 N值: {currentN || 1}</span>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 text-[11px] font-mono bg-[#141416] p-2 rounded border border-zinc-800/80">
+                        <div>
+                          <span className="text-zinc-500 block text-[10px]">当前止损挂单价</span>
+                          <span className="text-zinc-200 font-bold">
+                            {currentOrderSlPrice > 0 ? formatPrice(position.symbol, currentOrderSlPrice) : '暂无 (0)'}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-zinc-500 block text-[10px]">N={effectiveN} 试算止损价</span>
+                          <span className="text-amber-400 font-bold">
+                            {formatPrice(position.symbol, dynamicPrice)}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="text-[10.5px] leading-relaxed text-zinc-400 pt-1 border-t border-zinc-800/60">
+                        {isPriceHigher ? (
+                          <div className="text-emerald-400 flex items-start gap-1">
+                            <ArrowRight size={13} className="shrink-0 mt-0.5 text-emerald-400" />
+                            <span>试算价 ({formatPrice(position.symbol, dynamicPrice)}) 优于当前止损价：触发撤销原挂单，以该价向币安重新挂 Algo 算法止损单！</span>
+                          </div>
+                        ) : (
+                          <div className="text-zinc-400 flex items-start gap-1">
+                            <Info size={13} className="shrink-0 mt-0.5 text-zinc-500" />
+                            <span>试算价 ({formatPrice(position.symbol, dynamicPrice)}) 未超过当前止损价：维持当前止损挂单不变。当 N 增加至 {effectiveN + 1} 时自动抬升！</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
+
               </div>
+
             </div>
           </div>
 

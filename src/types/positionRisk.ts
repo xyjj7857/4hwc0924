@@ -1,5 +1,34 @@
 import { Position, OpenOrder } from '../types';
 
+export interface StageCloseRule {
+  id: string; // 'stage_1' | 'stage_2' | 'stage_3'
+  enabled: boolean;
+  targetN: number;      // 当 N = 几时 (默认: 第1组 N=2, 第2组 N=3, 第3组 N=4)
+  closeRatio: number;   // 平仓现有仓位的百分之多少 (默认 50%)
+  executed?: boolean;   // 是否已执行
+  executedAt?: number;  // 执行时间戳
+  executedAmount?: number; // 当次执行平仓数量
+}
+
+export interface TrailingStopRule {
+  enabled: boolean;
+  minN: number;             // 当 N >= 几时 (默认 3)
+  drawdownRatio: number;    // 回撤比例 (默认 80%)
+  lastAdjustedN?: number;   // 上一次调整生效时的 N 值
+  currentAlgoId?: string;   // 当前动态维护的 algoId
+  currentStopPrice?: number;// 当前动态挂单止损价
+}
+
+export interface ConditionControlConfig {
+  enabled: boolean;
+  ruleType: string;
+  description?: string;
+  // 1、N值阶梯平仓设置 (3组独立配置)
+  stageCloseRules: StageCloseRule[];
+  // 2、N值动态移动回撤止损调整
+  trailingStopRule: TrailingStopRule;
+}
+
 export interface PositionRiskConfig {
   positionId: string;
   symbol: string;
@@ -35,12 +64,8 @@ export interface PositionRiskConfig {
     };
   };
 
-  // c，暂时没有想好，请保留这个条件框架，等我想好后再按规则编写；
-  conditionControl: {
-    enabled: boolean;
-    ruleType: string;
-    description?: string;
-  };
+  // c，条件风控：1、N值阶梯平仓（3组独立勾选）；2、N值动态移动回撤止损调整
+  conditionControl: ConditionControlConfig;
 }
 
 export interface PositionTpSlResult {
@@ -198,23 +223,31 @@ export function getLocalPositionRiskConfigs(accountName?: string): Record<string
   try {
     const accKey = accountName ? `binance_position_risk_configs_v1_${accountName}` : STORAGE_KEY;
     const raw = localStorage.getItem(accKey);
+    let parsed: Record<string, PositionRiskConfig> = {};
     if (raw) {
-      return JSON.parse(raw);
-    }
-    // Check all-accounts map if exists
-    const allRaw = localStorage.getItem('binance_all_accounts_position_risk_configs');
-    if (allRaw) {
-      const all = JSON.parse(allRaw);
-      if (accountName && all[accountName]) {
-        return all[accountName];
+      parsed = JSON.parse(raw);
+    } else {
+      // Check all-accounts map if exists
+      const allRaw = localStorage.getItem('binance_all_accounts_position_risk_configs');
+      if (allRaw) {
+        const all = JSON.parse(allRaw);
+        if (accountName && all[accountName]) {
+          parsed = all[accountName];
+        }
+      }
+      // Fallback to legacy key if accountName matches or not provided
+      if (!parsed && !accountName) {
+        const legacyRaw = localStorage.getItem(STORAGE_KEY);
+        if (legacyRaw) parsed = JSON.parse(legacyRaw);
       }
     }
-    // Fallback to legacy key if accountName matches or not provided
-    if (!accountName) {
-      const legacyRaw = localStorage.getItem(STORAGE_KEY);
-      if (legacyRaw) return JSON.parse(legacyRaw);
+    const normalized: Record<string, PositionRiskConfig> = {};
+    for (const [k, v] of Object.entries(parsed || {})) {
+      if (v && typeof v === 'object') {
+        normalized[k] = normalizePositionRiskConfig(v);
+      }
     }
-    return {};
+    return normalized;
   } catch (err) {
     console.error('Failed to load local position risk configs:', err);
     return {};
@@ -264,6 +297,60 @@ export function saveAllLocalPositionRiskConfigs(allConfigs: Record<string, Recor
   }
 }
 
+export function getDefaultConditionControlConfig(): ConditionControlConfig {
+  return {
+    enabled: true, // 专属持仓风控管理中 条件c默认勾选
+    ruleType: 'DYNAMIC_N_STAGE_AND_TRAILING',
+    description: 'N值阶梯平仓与动态回撤移动止损',
+    stageCloseRules: [
+      { id: 'stage_1', enabled: true, targetN: 2, closeRatio: 50 },
+      { id: 'stage_2', enabled: true, targetN: 3, closeRatio: 50 },
+      { id: 'stage_3', enabled: true, targetN: 4, closeRatio: 50 }
+    ],
+    trailingStopRule: {
+      enabled: true, // 默认勾选
+      minN: 3,       // 默认 N>=3
+      drawdownRatio: 80 // 默认回撤比例 80%
+    }
+  };
+}
+
+export function normalizeConditionControl(cc?: Partial<ConditionControlConfig>): ConditionControlConfig {
+  const defaults = getDefaultConditionControlConfig();
+  if (!cc) return defaults;
+  return {
+    enabled: cc.enabled !== undefined ? cc.enabled : true, // 默认勾选
+    ruleType: cc.ruleType || defaults.ruleType,
+    description: cc.description || defaults.description,
+    stageCloseRules: Array.isArray(cc.stageCloseRules) && cc.stageCloseRules.length === 3
+      ? cc.stageCloseRules.map((s, idx) => ({
+          id: s.id || `stage_${idx + 1}`,
+          enabled: s.enabled !== undefined ? s.enabled : true,
+          targetN: Number(s.targetN) > 0 ? Number(s.targetN) : (idx + 2),
+          closeRatio: Number(s.closeRatio) > 0 ? Number(s.closeRatio) : 50,
+          executed: Boolean(s.executed),
+          executedAt: s.executedAt,
+          executedAmount: s.executedAmount
+        }))
+      : defaults.stageCloseRules,
+    trailingStopRule: {
+      enabled: cc.trailingStopRule?.enabled !== undefined ? cc.trailingStopRule.enabled : true,
+      minN: Number(cc.trailingStopRule?.minN) > 0 ? Number(cc.trailingStopRule.minN) : 3,
+      drawdownRatio: Number(cc.trailingStopRule?.drawdownRatio) > 0 ? Number(cc.trailingStopRule.drawdownRatio) : 80,
+      lastAdjustedN: cc.trailingStopRule?.lastAdjustedN,
+      currentAlgoId: cc.trailingStopRule?.currentAlgoId,
+      currentStopPrice: cc.trailingStopRule?.currentStopPrice
+    }
+  };
+}
+
+export function normalizePositionRiskConfig(cfg: PositionRiskConfig): PositionRiskConfig {
+  return {
+    ...cfg,
+    conditionControl: normalizeConditionControl(cfg.conditionControl)
+  };
+}
+
 export function getDefaultPositionRiskConfig(posId: string, symbol: string, side: 'BUY' | 'SELL', entryPrice: number): PositionRiskConfig {
   return {
     positionId: posId,
@@ -283,10 +370,6 @@ export function getDefaultPositionRiskConfig(posId: string, symbol: string, side
       slPercent: 3.0,
       slPrice: side === 'BUY' ? entryPrice * 0.97 : entryPrice * 1.03,
     },
-    conditionControl: {
-      enabled: false,
-      ruleType: 'RESERVED_FRAMEWORK',
-      description: '条件风控核心框架已预留，待策略规则完善后嵌入生效'
-    }
+    conditionControl: getDefaultConditionControlConfig()
   };
 }

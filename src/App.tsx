@@ -58,7 +58,8 @@ import {
   saveLocalPositionRiskConfigs,
   getAllLocalPositionRiskConfigs,
   saveAllLocalPositionRiskConfigs,
-  detectPositionTpSl
+  detectPositionTpSl,
+  normalizePositionRiskConfig
 } from './types/positionRisk';
 import { 
   matchSymbolWithVerificationList, 
@@ -3500,6 +3501,322 @@ export default function App() {
           continue;
         }
       }
+
+      // 4. 检查条件C：专属持仓条件风控 (1、N值阶梯分批平仓；2、N值动态移动回撤止损调整)
+      if (cfg.conditionControl?.enabled) {
+        const isLong = pos.side === 'BUY';
+        const instantRatio = (pos.entryPrice > 0 && currentMarkPrice > 0)
+          ? (isLong ? currentMarkPrice / pos.entryPrice : pos.entryPrice / currentMarkPrice)
+          : 1;
+        const instantFloor = Math.floor(instantRatio);
+        const currentN = Math.max(positionNValuesRef.current[pos.id] || 0, instantFloor);
+
+        // 4.1 N值阶梯分批平仓 (共 3 组，每次按现有仓位比例平仓)
+        if (Array.isArray(cfg.conditionControl.stageCloseRules)) {
+          const stages = [...cfg.conditionControl.stageCloseRules];
+          for (let i = 0; i < stages.length; i++) {
+            const stage = stages[i];
+            if (stage.enabled && !stage.executed && stage.targetN > 0 && stage.closeRatio > 0) {
+              if (currentN >= stage.targetN) {
+                closingPositionIdsRef.current.add(pos.id);
+                const currentAmt = pos.amount;
+                const closeRatio = Math.min(100, Math.max(1, stage.closeRatio));
+                const closeAmt = currentAmt * (closeRatio / 100);
+                const formattedCloseQty = formatQty(pos.symbol, closeAmt);
+
+                if (closeRatio >= 100 || parseFloat(formattedCloseQty) >= currentAmt) {
+                  const reason = `🎯 条件C阶梯分批平仓 (触达 N=${stage.targetN}, 平仓 100%)`;
+                  closingPositionIdsRef.current.delete(pos.id);
+                  handleClosePositionRef.current(pos.id, currentPositions, reason);
+                  break;
+                } else {
+                  // 部分平仓现有仓位
+                  (async () => {
+                    try {
+                      const positionSide = pos.positionSide || 'BOTH';
+                      const closingSide = isLong ? 'SELL' : 'BUY';
+                      const orderParams: any = {
+                        symbol: pos.symbol,
+                        side: closingSide,
+                        type: 'MARKET',
+                        quantity: formattedCloseQty,
+                        positionSide: positionSide
+                      };
+                      if (positionSide === 'BOTH') {
+                        orderParams.reduceOnly = 'true';
+                      }
+
+                      let orderRes = await fetch('/api/binance-proxy', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          method: 'POST',
+                          endpoint: '/fapi/v1/order',
+                          params: orderParams,
+                          baseUrl: apiConfigRef.current.baseUrl || "https://fapi.binance.com",
+                          apiKey: apiConfigRef.current.apiKey,
+                          apiSecret: apiConfigRef.current.apiSecret
+                        })
+                      });
+
+                      let orderData = await orderRes.json();
+
+                      // 若因 reduceOnly 与已有止盈限价单冲突，临时撤销该币对止盈普通单后重试
+                      if (!orderRes.ok && String(orderData?.msg || '').includes('ReduceOnly')) {
+                        try {
+                          await fetch('/api/binance-proxy', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              method: 'DELETE',
+                              endpoint: '/fapi/v1/allOpenOrders',
+                              params: { symbol: pos.symbol },
+                              baseUrl: apiConfigRef.current.baseUrl || "https://fapi.binance.com",
+                              apiKey: apiConfigRef.current.apiKey,
+                              apiSecret: apiConfigRef.current.apiSecret
+                            })
+                          });
+                          orderRes = await fetch('/api/binance-proxy', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              method: 'POST',
+                              endpoint: '/fapi/v1/order',
+                              params: orderParams,
+                              baseUrl: apiConfigRef.current.baseUrl || "https://fapi.binance.com",
+                              apiKey: apiConfigRef.current.apiKey,
+                              apiSecret: apiConfigRef.current.apiSecret
+                            })
+                          });
+                          orderData = await orderRes.json();
+                        } catch (retryE) {}
+                      }
+
+                      if (orderRes.ok) {
+                        addLogRef.current(
+                          `[条件C风控-阶梯平仓] ✅ 持仓 ${pos.symbol} 触达 N=${stage.targetN}，已平仓现有仓位的 ${closeRatio}% (平仓数量: ${formattedCloseQty})`,
+                          'SUCCESS'
+                        );
+                        const nextStages = [...stages];
+                        nextStages[i] = {
+                          ...stage,
+                          executed: true,
+                          executedAt: Date.now(),
+                          executedAmount: parseFloat(formattedCloseQty)
+                        };
+                        const updatedCfg = {
+                          ...cfg,
+                          conditionControl: {
+                            ...cfg.conditionControl,
+                            stageCloseRules: nextStages
+                          }
+                        };
+                        handleSavePositionRiskConfig(updatedCfg);
+                        fetchSnapshotRef.current?.();
+                      } else {
+                        addLogRef.current(
+                          `[条件C风控-阶梯平仓] ❌ 持仓 ${pos.symbol} 阶梯平仓失败: ${orderData.msg || '未知异常'}`,
+                          'ERROR'
+                        );
+                      }
+                    } catch (err: any) {
+                      addLogRef.current(
+                        `[条件C风控-阶梯平仓] ❌ 持仓 ${pos.symbol} 阶梯平仓网络异常: ${err?.message || err}`,
+                        'ERROR'
+                      );
+                    } finally {
+                      closingPositionIdsRef.current.delete(pos.id);
+                    }
+                  })();
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // 4.2 N值动态移动回撤止损调整
+        const trailing = cfg.conditionControl.trailingStopRule;
+        if (trailing && trailing.enabled && trailing.minN > 0) {
+          if (currentN >= trailing.minN) {
+            const drawdownRatio = (trailing.drawdownRatio || 80) / 100;
+            // 开仓价*N*(1-回撤比例)
+            const dynamicStopPriceRaw = isLong
+              ? pos.entryPrice * currentN * (1 - drawdownRatio)
+              : (pos.entryPrice / currentN) * (1 + drawdownRatio);
+            const dynamicStopPrice = parseFloat(formatPrice(pos.symbol, dynamicStopPriceRaw));
+
+            // 获取当前挂单止损价
+            const { slPrice } = detectPositionTpSl(pos, openOrdersRef.current, cfg);
+            const currentSlPrice = slPrice || trailing.currentStopPrice || cfg.tpSlControl?.slPrice || 0;
+
+            const isPriceBetter = isLong 
+              ? (dynamicStopPrice > currentSlPrice)
+              : (dynamicStopPrice < currentSlPrice);
+
+            const alreadyAdjustedForThisN = trailing.lastAdjustedN === currentN && trailing.currentStopPrice === dynamicStopPrice;
+
+            if (isPriceBetter && !alreadyAdjustedForThisN && dynamicStopPrice > 0) {
+              // 标记避免同一时间重复触发
+              trailing.lastAdjustedN = currentN;
+              trailing.currentStopPrice = dynamicStopPrice;
+
+              (async () => {
+                try {
+                  addLogRef.current(
+                    `[条件C风控-动态止损] 📈 持仓 ${pos.symbol} (${isLong ? '多单' : '空单'}) N值达到 ${currentN} (>=${trailing.minN})！计算动态止损价 ${dynamicStopPrice} 优于当前止损价 ${currentSlPrice > 0 ? currentSlPrice : '无'}，撤销旧止损挂单并重新挂入 Algo 止损单...`,
+                    'TRADE'
+                  );
+
+                  // 1. 撤销旧算法委托单
+                  try {
+                    const openAlgoRes = await fetch('/api/binance-proxy', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        method: 'GET',
+                        endpoint: '/fapi/v1/openAlgoOrders',
+                        params: { symbol: pos.symbol },
+                        baseUrl: apiConfigRef.current.baseUrl || "https://fapi.binance.com",
+                        apiKey: apiConfigRef.current.apiKey,
+                        apiSecret: apiConfigRef.current.apiSecret
+                      })
+                    });
+                    if (openAlgoRes.ok) {
+                      const algoData = await openAlgoRes.json();
+                      const allAlgoOrders = Array.isArray(algoData) ? algoData : (algoData.orders || algoData.algoOrders || []);
+                      const closingSide = isLong ? 'SELL' : 'BUY';
+                      for (const a of allAlgoOrders) {
+                        const aId = a.algoId || a.clientAlgoId;
+                        if (aId && (a.side === closingSide || a.orderType === 'STOP_MARKET')) {
+                          await fetch('/api/binance-proxy', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              method: 'DELETE',
+                              endpoint: '/fapi/v1/algoOrder',
+                              params: { algoId: aId, symbol: pos.symbol },
+                              baseUrl: apiConfigRef.current.baseUrl || "https://fapi.binance.com",
+                              apiKey: apiConfigRef.current.apiKey,
+                              apiSecret: apiConfigRef.current.apiSecret
+                            })
+                          });
+                        }
+                      }
+                    }
+                  } catch (cancelErr) {
+                    console.error('撤销旧算法单异常:', cancelErr);
+                  }
+
+                  // 2. 挂入新的 Algo 算法止损单
+                  const finalSlPriceStr = formatPrice(pos.symbol, dynamicStopPrice);
+                  const closingSide = isLong ? 'SELL' : 'BUY';
+                  const closingQty = formatQty(pos.symbol, pos.amount);
+                  let currentPosSide = pos.positionSide || 'BOTH';
+
+                  const buildAlgoSlParams = (targetPosSide: string, withReduceOnly: boolean) => {
+                    const p: any = {
+                      symbol: pos.symbol,
+                      side: closingSide,
+                      positionSide: targetPosSide,
+                      quantity: closingQty,
+                      workingType: 'MARK_PRICE',
+                      triggerPrice: finalSlPriceStr,
+                      algoType: 'CONDITIONAL',
+                      type: 'STOP_MARKET'
+                    };
+                    if (withReduceOnly && targetPosSide === 'BOTH') {
+                      p.reduceOnly = 'true';
+                    }
+                    return p;
+                  };
+
+                  let algoParams = buildAlgoSlParams(currentPosSide, currentPosSide === 'BOTH');
+                  let slRes = await fetch('/api/binance-proxy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      method: 'POST',
+                      endpoint: '/fapi/v1/algoOrder',
+                      baseUrl: apiConfigRef.current.baseUrl || "https://fapi.binance.com",
+                      params: algoParams,
+                      apiKey: apiConfigRef.current.apiKey,
+                      apiSecret: apiConfigRef.current.apiSecret
+                    })
+                  });
+                  let slData = await slRes.json();
+
+                  // 自愈重试 1: 若 positionSide 报错
+                  if (!slRes.ok && String(slData?.msg || '').includes('position side')) {
+                    currentPosSide = currentPosSide === 'BOTH' ? (closingSide === 'SELL' ? 'LONG' : 'SHORT') : 'BOTH';
+                    algoParams = buildAlgoSlParams(currentPosSide, currentPosSide === 'BOTH');
+                    slRes = await fetch('/api/binance-proxy', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        method: 'POST',
+                        endpoint: '/fapi/v1/algoOrder',
+                        baseUrl: apiConfigRef.current.baseUrl || "https://fapi.binance.com",
+                        params: algoParams,
+                        apiKey: apiConfigRef.current.apiKey,
+                        apiSecret: apiConfigRef.current.apiSecret
+                      })
+                    });
+                    slData = await slRes.json();
+                  }
+
+                  // 自愈重试 2: 若 reduceOnly 报错
+                  if (!slRes.ok && String(slData?.msg || '').includes('reduceOnly')) {
+                    algoParams = buildAlgoSlParams(currentPosSide, false);
+                    slRes = await fetch('/api/binance-proxy', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        method: 'POST',
+                        endpoint: '/fapi/v1/algoOrder',
+                        baseUrl: apiConfigRef.current.baseUrl || "https://fapi.binance.com",
+                        params: algoParams,
+                        apiKey: apiConfigRef.current.apiKey,
+                        apiSecret: apiConfigRef.current.apiSecret
+                      })
+                    });
+                    slData = await slRes.json();
+                  }
+
+                  if (slRes.ok && (slData.algoId || slData.orderId || slData.clientAlgoId)) {
+                    const newAlgoId = String(slData.algoId || slData.orderId || slData.clientAlgoId);
+                    addLogRef.current(
+                      `[条件C风控-动态止损] ✅ ${pos.symbol} 动态移动止损抬升成功！N=${currentN}，新 Algo 止损触发价: ${finalSlPriceStr} (订单ID: ${newAlgoId})`,
+                      'SUCCESS'
+                    );
+                    const updatedCfg = {
+                      ...cfg,
+                      conditionControl: {
+                        ...cfg.conditionControl,
+                        trailingStopRule: {
+                          ...trailing,
+                          lastAdjustedN: currentN,
+                          currentStopPrice: dynamicStopPrice,
+                          currentAlgoId: newAlgoId
+                        }
+                      }
+                    };
+                    handleSavePositionRiskConfig(updatedCfg);
+                    fetchSnapshotRef.current?.();
+                  } else {
+                    addLogRef.current(
+                      `[条件C风控-动态止损] ❌ ${pos.symbol} 动态止损重新挂单反馈: ${slData.msg || '未知异常'}`,
+                      'WARN'
+                    );
+                  }
+                } catch (dynErr: any) {
+                  console.error('动态移动止损调整异常:', dynErr);
+                }
+              })();
+            }
+          }
+        }
+      }
     }
   }, [handleSavePositionRiskConfig]);
 
@@ -6753,6 +7070,7 @@ export default function App() {
           formatQty={formatQty}
           openOrders={openOrders}
           onRefreshOrders={() => fetchSnapshotRef.current?.()}
+          currentN={selectedRiskPosition ? (positionNValues[selectedRiskPosition.id] || Math.max(1, Math.floor(selectedRiskPosition.side === 'BUY' ? (selectedRiskPosition.markPrice / (selectedRiskPosition.entryPrice || 1)) : ((selectedRiskPosition.entryPrice || 1) / (selectedRiskPosition.markPrice || 1))))) : 1}
         />
       )}
 
