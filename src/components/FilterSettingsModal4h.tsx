@@ -62,6 +62,7 @@ export interface FilterSettings4h {
     requireH2GteH1?: boolean;
     requireH3GteH2?: boolean;
     requireScanGteH3?: boolean;
+    requireScanGteH2?: boolean;
     requireScanGteH1?: boolean;
   };
   // 9. 扫描时刻 (4小时绝对周期的第几小时、第几分、第几秒，始终生效)
@@ -113,6 +114,7 @@ export const DEFAULT_FILTER_SETTINGS_4H: FilterSettings4h = {
     requireH2GteH1: true,
     requireH3GteH2: true,
     requireScanGteH3: true,
+    requireScanGteH2: false,
     requireScanGteH1: false
   },
   scanMoment: {
@@ -654,14 +656,15 @@ export default function FilterSettingsModal4h({
                               requireH2GteH1: cur.requireH2GteH1 ?? true,
                               requireH3GteH2: cur.requireH3GteH2 ?? true,
                               requireScanGteH3: cur.requireScanGteH3 ?? true,
+                              requireScanGteH2: cur.requireScanGteH2 ?? false,
                               requireScanGteH1: cur.requireScanGteH1 ?? false
                             };
                             if (m.id === 'strict') {
-                              newSubs = { requireH1GteOpen: true, requireH2GteH1: true, requireH3GteH2: true, requireScanGteH3: true, requireScanGteH1: false };
+                              newSubs = { requireH1GteOpen: true, requireH2GteH1: true, requireH3GteH2: true, requireScanGteH3: true, requireScanGteH2: false, requireScanGteH1: false };
                             } else if (m.id === 'loose') {
-                              newSubs = { requireH1GteOpen: true, requireH2GteH1: false, requireH3GteH2: false, requireScanGteH3: false, requireScanGteH1: true };
+                              newSubs = { requireH1GteOpen: true, requireH2GteH1: false, requireH3GteH2: false, requireScanGteH3: false, requireScanGteH2: false, requireScanGteH1: true };
                             } else if (m.id === 'moderate') {
-                              newSubs = { requireH1GteOpen: true, requireH2GteH1: false, requireH3GteH2: false, requireScanGteH3: true, requireScanGteH1: true };
+                              newSubs = { requireH1GteOpen: true, requireH2GteH1: false, requireH3GteH2: false, requireScanGteH3: true, requireScanGteH2: false, requireScanGteH1: true };
                             }
                             return {
                               ...prev,
@@ -783,6 +786,28 @@ export default function FilterSettingsModal4h({
                         className="rounded text-emerald-500 bg-white/10 border-white/20 accent-emerald-500"
                       />
                       <span>扫描时刻价格 ≥ 第3小时收盘 <span className="text-[10px] text-zinc-500 font-mono">(07:58:30 ≥ 7点收)</span></span>
+                    </label>
+
+                    <label className={`flex items-center gap-2 p-2 rounded-lg border transition-all cursor-pointer ${
+                      formData.hourlyProgression?.requireScanGteH2 
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-zinc-200' 
+                        : 'bg-white/[0.02] border-white/5 text-zinc-500'
+                    }`}>
+                      <input 
+                        type="checkbox"
+                        disabled={!formData.hourlyProgression?.enabled}
+                        checked={formData.hourlyProgression?.requireScanGteH2 ?? false}
+                        onChange={e => setFormData(prev => ({
+                          ...prev,
+                          hourlyProgression: {
+                            ...(prev.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression!),
+                            mode: 'custom',
+                            requireScanGteH2: e.target.checked
+                          }
+                        }))}
+                        className="rounded text-emerald-500 bg-white/10 border-white/20 accent-emerald-500"
+                      />
+                      <span>扫描时刻价格 ≥ 第2小时收盘 <span className="text-[10px] text-zinc-500 font-mono">(07:58:30 ≥ 6点收)</span></span>
                     </label>
 
                     <label className={`flex items-center gap-2 p-2 rounded-lg border transition-all cursor-pointer ${

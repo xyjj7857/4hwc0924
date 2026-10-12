@@ -2244,6 +2244,7 @@ async function executeAutoTradingBackend4h(cycleId: number) {
         if (hpCfg.requireH2GteH1 && hc.h2Completed && !hc.h2GteH1) return false;
         if (hpCfg.requireH3GteH2 && hc.h3Completed && !hc.h3GteH2) return false;
         if (hpCfg.requireScanGteH3 && hc.h3Completed && !hc.scanGteH3) return false;
+        if (hpCfg.requireScanGteH2 && hc.h2Completed && !hc.scanGteH2) return false;
         if (hpCfg.requireScanGteH1 && hc.h1Completed && !hc.scanGteH1) return false;
       }
     }

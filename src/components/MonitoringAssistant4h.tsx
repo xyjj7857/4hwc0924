@@ -119,6 +119,7 @@ interface SymbolData {
     h2GteH1: boolean;
     h3GteH2: boolean;
     scanGteH3: boolean;
+    scanGteH2: boolean;
     scanGteH1: boolean;
     h3GteH1: boolean;
   };
@@ -1061,6 +1062,7 @@ export default function MonitoringAssistant4h({
         ...item.hourlyCloses,
         scanPrice: currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice,
         scanGteH3: (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) > 0 && item.hourlyCloses.h3 > 0 && (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) >= item.hourlyCloses.h3,
+        scanGteH2: (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) > 0 && item.hourlyCloses.h2 > 0 && (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) >= item.hourlyCloses.h2,
         scanGteH1: (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) > 0 && item.hourlyCloses.h1 > 0 && (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) >= item.hourlyCloses.h1
       } : undefined
     };
@@ -1271,6 +1273,7 @@ export default function MonitoringAssistant4h({
         if (hp.requireH2GteH1 && hc.h2Completed && !hc.h2GteH1) return false;
         if (hp.requireH3GteH2 && hc.h3Completed && !hc.h3GteH2) return false;
         if (hp.requireScanGteH3 && hc.h3Completed && !hc.scanGteH3) return false;
+        if (hp.requireScanGteH2 && hc.h2Completed && !hc.scanGteH2) return false;
         if (hp.requireScanGteH1 && hc.h1Completed && !hc.scanGteH1) return false;
       }
     }
@@ -1427,6 +1430,7 @@ export default function MonitoringAssistant4h({
           else if (hp.requireH2GteH1 && hc.h2Completed && !hc.h2GteH1) { passed = false; failReason = '2H未高于1H'; }
           else if (hp.requireH3GteH2 && hc.h3Completed && !hc.h3GteH2) { passed = false; failReason = '3H未高于2H'; }
           else if (hp.requireScanGteH3 && hc.h3Completed && !hc.scanGteH3) { passed = false; failReason = '扫描价未高于3H'; }
+          else if (hp.requireScanGteH2 && hc.h2Completed && !hc.scanGteH2) { passed = false; failReason = '扫描价未高于2H'; }
           else if (hp.requireScanGteH1 && hc.h1Completed && !hc.scanGteH1) { passed = false; failReason = '扫描价未高于1H'; }
         }
       }

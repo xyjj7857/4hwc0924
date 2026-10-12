@@ -1089,6 +1089,7 @@ export class MarketDataManager {
       h2GteH1: boolean;
       h3GteH2: boolean;
       scanGteH3: boolean;
+      scanGteH2: boolean;
       scanGteH1: boolean;
       h3GteH1: boolean;
     };
@@ -1272,6 +1273,7 @@ export class MarketDataManager {
       h2GteH1: h2Close > 0 && h1Close > 0 && h2Close >= h1Close,
       h3GteH2: h3Close > 0 && h2Close > 0 && h3Close >= h2Close,
       scanGteH3: close > 0 && h3Close > 0 && close >= h3Close,
+      scanGteH2: close > 0 && h2Close > 0 && close >= h2Close,
       scanGteH1: close > 0 && h1Close > 0 && close >= h1Close,
       h3GteH1: h3Close > 0 && h1Close > 0 && h3Close >= h1Close
     };
