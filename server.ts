@@ -1077,6 +1077,10 @@ const enrichItem4h = (item: any) => {
     volumeRatioPastK: volRatio,
     maxGainPastK_standard: kline ? kline.maxGainPastK_standard : (item.maxGainPastK_standard || 0),
     maxGainPastK_high: kline ? kline.maxGainPastK_high : (item.maxGainPastK_high || 0),
+    firstHourGain: kline ? kline.firstHourGain : (item.firstHourGain || 0),
+    firstHourRatio: kline ? kline.firstHourRatio : (item.firstHourRatio || 0),
+    firstHourCompleted: kline ? kline.firstHourCompleted : (item.firstHourCompleted !== false),
+    hourlyCloses: kline ? kline.hourlyCloses : item.hourlyCloses,
     past4hCandles: kline?.past4hCandles || item.past4hCandles || []
   };
 };
@@ -1199,6 +1203,10 @@ const getFullResults4h = () => {
             volumeRatioPastK: kline.volumeRatioPastK,
             maxGainPastK_standard: kline.maxGainPastK_standard,
             maxGainPastK_high: kline.maxGainPastK_high,
+            firstHourGain: kline.firstHourGain,
+            firstHourRatio: kline.firstHourRatio,
+            firstHourCompleted: kline.firstHourCompleted,
+            hourlyCloses: kline.hourlyCloses,
             past4hCandles: kline.past4hCandles
           });
         }
@@ -1428,6 +1436,10 @@ const runCycleScan4h = async (isScheduledOrManual: boolean = true) => {
           volumeRatioPastK: kline.volumeRatioPastK,
           maxGainPastK_standard: kline.maxGainPastK_standard,
           maxGainPastK_high: kline.maxGainPastK_high,
+          firstHourGain: kline.firstHourGain,
+          firstHourRatio: kline.firstHourRatio,
+          firstHourCompleted: kline.firstHourCompleted,
+          hourlyCloses: kline.hourlyCloses,
           past4hCandles: kline.past4hCandles
         });
       }
@@ -2125,7 +2137,9 @@ async function executeAutoTradingBackend4h(cycleId: number) {
     (filterSettings?.minVolume4h?.enabled || filterSettings?.volume4h?.enabled) ||
     (filterSettings?.fundingRateRange?.enabled || filterSettings?.fundingRate?.enabled) ||
     (filterSettings?.minVolumeRatio?.enabled || filterSettings?.volumeRatio?.enabled) ||
-    (filterSettings?.minMaxGainPastK?.enabled || filterSettings?.maxGainPastK?.enabled)
+    (filterSettings?.minMaxGainPastK?.enabled || filterSettings?.maxGainPastK?.enabled) ||
+    (filterSettings?.maxFirstHourGainRatio?.enabled || filterSettings?.firstHourGainRatio?.enabled) ||
+    (filterSettings?.hourlyProgression?.enabled)
   );
 
   // 用户要求：目前只记录满足“筛选设置”的币对信息，其他的币对不记录。
@@ -2196,6 +2210,43 @@ async function executeAutoTradingBackend4h(cycleId: number) {
         : (item.maxGainPastK_standard ?? item.maxGainPastK ?? 0);
       if (!isNaN(max) && mGain > max) return false;
     }
+    // 7. 本4H第1小时涨跌幅占比不超过 maxFirstHourGainRatio
+    const fhrCfg = filterSettings.maxFirstHourGainRatio || filterSettings.firstHourGainRatio;
+    if (fhrCfg?.enabled) {
+      const maxRatio = parseFloat(fhrCfg.value);
+      if (!isNaN(maxRatio)) {
+        const ratio = item.firstHourRatio;
+        if (ratio !== undefined && ratio !== null && item.firstHourCompleted !== false) {
+          if (ratio > maxRatio) return false;
+        }
+      }
+    }
+    // 8. 本4小时前3小时及扫描时刻逐级递增筛选 hourlyProgression
+    const hpCfg = filterSettings.hourlyProgression;
+    if (hpCfg?.enabled) {
+      const hc = item.hourlyCloses;
+      if (!hc) return false;
+      const mode = hpCfg.mode || 'strict';
+      if (mode === 'strict') {
+        if (hc.h1Completed && !hc.h1GteOpen) return false;
+        if (hc.h2Completed && !hc.h2GteH1) return false;
+        if (hc.h3Completed && !hc.h3GteH2) return false;
+        if (hc.h3Completed && !hc.scanGteH3) return false;
+      } else if (mode === 'loose') {
+        if (hc.h1Completed && !hc.h1GteOpen) return false;
+        if (hc.h1Completed && !hc.scanGteH1) return false;
+      } else if (mode === 'moderate') {
+        if (hc.h1Completed && !hc.h1GteOpen) return false;
+        if (hc.h3Completed && !hc.h3GteH1) return false;
+        if (hc.h3Completed && !hc.scanGteH3) return false;
+      } else if (mode === 'custom') {
+        if (hpCfg.requireH1GteOpen && hc.h1Completed && !hc.h1GteOpen) return false;
+        if (hpCfg.requireH2GteH1 && hc.h2Completed && !hc.h2GteH1) return false;
+        if (hpCfg.requireH3GteH2 && hc.h3Completed && !hc.h3GteH2) return false;
+        if (hpCfg.requireScanGteH3 && hc.h3Completed && !hc.scanGteH3) return false;
+        if (hpCfg.requireScanGteH1 && hc.h1Completed && !hc.scanGteH1) return false;
+      }
+    }
     return true;
   };
 
@@ -2224,6 +2275,13 @@ async function executeAutoTradingBackend4h(cycleId: number) {
   if (vrCfg?.enabled) fsSummaryParts.push(`量比>=${vrCfg.value ?? '-'}`);
   const mgCfg = filterSettings.minMaxGainPastK || filterSettings.maxGainPastK;
   if (mgCfg?.enabled) fsSummaryParts.push(`前K高<=${mgCfg.value ?? '-'}`);
+  const fhrCfg = filterSettings.maxFirstHourGainRatio || filterSettings.firstHourGainRatio;
+  if (fhrCfg?.enabled) fsSummaryParts.push(`首小时占比<=${fhrCfg.value ?? '80'}%`);
+  const hpCfg = filterSettings.hourlyProgression;
+  if (hpCfg?.enabled) {
+    const modeDesc = hpCfg.mode === 'strict' ? '严格逐级递增' : hpCfg.mode === 'loose' ? '宽松首末' : hpCfg.mode === 'moderate' ? '稳健三节点' : '自定义阶梯';
+    fsSummaryParts.push(`小时递增[${modeDesc}]`);
+  }
   const filterSummary = fsSummaryParts.join('; ') || '满足筛选设置';
 
   addMonitorLog4h(

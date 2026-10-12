@@ -1073,6 +1073,25 @@ export class MarketDataManager {
     volumeRatioPastK: number;
     maxGainPastK_standard: number;
     maxGainPastK_high: number;
+    firstHourGain: number;
+    firstHourRatio: number;
+    firstHourCompleted: boolean;
+    hourlyCloses: {
+      open: number;
+      h1: number;
+      h2: number;
+      h3: number;
+      scanPrice: number;
+      h1Completed: boolean;
+      h2Completed: boolean;
+      h3Completed: boolean;
+      h1GteOpen: boolean;
+      h2GteH1: boolean;
+      h3GteH2: boolean;
+      scanGteH3: boolean;
+      scanGteH1: boolean;
+      h3GteH1: boolean;
+    };
     past4hCandles: Array<{
       kIndex: number;
       openTime: number;
@@ -1200,6 +1219,63 @@ export class MarketDataManager {
     const maxGainPastK_standard = validStandardGains.length > 0 ? Math.max(...validStandardGains) : 0;
     const maxGainPastK_high = validHighGains.length > 0 ? Math.max(...validHighGains) : 0;
 
+    // 3. 计算本 4H 内第 1 个小时涨跌幅及占比 (基于 15m 蜡烛聚合，第 1 个小时对应前 4 根 15m K线)
+    const ONE_HOUR_MS = 60 * 60 * 1000;
+    const isFirstHourCompleted = (now - current4hStart >= ONE_HOUR_MS) || in4hCandles.length >= 4;
+    const firstHourCandles = in4hCandles.filter(c => c.openTime >= current4hStart && c.openTime < current4hStart + ONE_HOUR_MS);
+
+    let firstHourGain = 0;
+    let firstHourRatio = 0;
+
+    if (firstHourCandles.length > 0) {
+      const fhOpen = exactStartCandle ? exactStartCandle.open : firstHourCandles[0].open;
+      const fhClose = firstHourCandles[firstHourCandles.length - 1].close;
+      if (fhOpen > 0) {
+        firstHourGain = ((fhClose - fhOpen) / fhOpen) * 100;
+      }
+    }
+
+    if (Math.abs(change) >= 0.1) {
+      firstHourRatio = (firstHourGain / change) * 100;
+    } else {
+      firstHourRatio = 0;
+    }
+
+    // 4. 计算本 4H 内小时级（1H、2H、3H）收盘价及与开盘价、扫描时刻现价的阶梯递增关系 (基于15m聚合)
+    const start1h = current4hStart;
+    const end1h = current4hStart + ONE_HOUR_MS;
+    const end2h = current4hStart + 2 * ONE_HOUR_MS;
+    const end3h = current4hStart + 3 * ONE_HOUR_MS;
+
+    const h1Candles = in4hCandles.filter(c => c.openTime >= start1h && c.openTime < end1h && c.close > 0);
+    const h2Candles = in4hCandles.filter(c => c.openTime >= end1h && c.openTime < end2h && c.close > 0);
+    const h3Candles = in4hCandles.filter(c => c.openTime >= end2h && c.openTime < end3h && c.close > 0);
+
+    const h1Close = h1Candles.length > 0 ? h1Candles[h1Candles.length - 1].close : 0;
+    const h2Close = h2Candles.length > 0 ? h2Candles[h2Candles.length - 1].close : 0;
+    const h3Close = h3Candles.length > 0 ? h3Candles[h3Candles.length - 1].close : 0;
+
+    const h1Completed = (now - current4hStart >= 1 * ONE_HOUR_MS) || h1Candles.length >= 4;
+    const h2Completed = (now - current4hStart >= 2 * ONE_HOUR_MS) || h2Candles.length >= 4;
+    const h3Completed = (now - current4hStart >= 3 * ONE_HOUR_MS) || h3Candles.length >= 4;
+
+    const hourlyCloses = {
+      open,
+      h1: h1Close,
+      h2: h2Close,
+      h3: h3Close,
+      scanPrice: close,
+      h1Completed,
+      h2Completed,
+      h3Completed,
+      h1GteOpen: h1Close > 0 && open > 0 && h1Close >= open,
+      h2GteH1: h2Close > 0 && h1Close > 0 && h2Close >= h1Close,
+      h3GteH2: h3Close > 0 && h2Close > 0 && h3Close >= h2Close,
+      scanGteH3: close > 0 && h3Close > 0 && close >= h3Close,
+      scanGteH1: close > 0 && h1Close > 0 && close >= h1Close,
+      h3GteH1: h3Close > 0 && h1Close > 0 && h3Close >= h1Close
+    };
+
     return {
       open,
       high,
@@ -1215,6 +1291,10 @@ export class MarketDataManager {
       volumeRatioPastK,
       maxGainPastK_standard,
       maxGainPastK_high,
+      firstHourGain: parseFloat(firstHourGain.toFixed(2)),
+      firstHourRatio: parseFloat(firstHourRatio.toFixed(1)),
+      firstHourCompleted: isFirstHourCompleted,
+      hourlyCloses,
       past4hCandles: past4hCandles.slice(0, 30)
     };
   }

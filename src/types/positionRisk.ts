@@ -3,7 +3,7 @@ import { Position, OpenOrder } from '../types';
 export interface StageCloseRule {
   id: string; // 'stage_1' | 'stage_2' | 'stage_3'
   enabled: boolean;
-  targetN: number;      // 当 N = 几时 (默认: 第1组 N=2 开启, 第2组 N=3 关闭, 第3组 N=100 开启且平仓100%)
+  targetN: number;      // 当 N = 几时 (默认: 第1组 N=2 开启, 第2组 N=3 关闭, 第3组 N=30 开启且平仓100%)
   closeRatio: number;   // 平仓现有仓位的百分之多少 (默认 50%)
   executed?: boolean;   // 是否已执行
   executedAt?: number;  // 执行时间戳
@@ -305,7 +305,7 @@ export function getDefaultConditionControlConfig(): ConditionControlConfig {
     stageCloseRules: [
       { id: 'stage_1', enabled: true, targetN: 2, closeRatio: 50 },
       { id: 'stage_2', enabled: false, targetN: 3, closeRatio: 50 },
-      { id: 'stage_3', enabled: true, targetN: 100, closeRatio: 100 }
+      { id: 'stage_3', enabled: true, targetN: 30, closeRatio: 100 }
     ],
     trailingStopRule: {
       enabled: true, // 默认勾选

@@ -1224,7 +1224,7 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
                   <div className="pl-4 space-y-0.5 text-zinc-400 font-mono text-[10px]">
                     <div>• 第1组（N=2 开启）：触达 N=2 时，平仓现有仓位 100 × 50% = 50 张，剩余 50 张</div>
                     <div>• 第2组（N=3 默认关闭）：未勾选不触发</div>
-                    <div>• 第3组（N=100 开启）：触达 N=100 时，平仓现有仓位 50 × 100% = 50 张，全仓平仓出场</div>
+                    <div>• 第3组（N=30 开启）：触达 N=30 时，平仓现有仓位 50 × 100% = 50 张，全仓平仓出场</div>
                   </div>
                 </div>
               </div>

@@ -103,6 +103,25 @@ interface SymbolData {
   volumeRatioPastK?: number;
   maxGainPastK_standard?: number;
   maxGainPastK_high?: number;
+  firstHourGain?: number;
+  firstHourRatio?: number;
+  firstHourCompleted?: boolean;
+  hourlyCloses?: {
+    open: number;
+    h1: number;
+    h2: number;
+    h3: number;
+    scanPrice: number;
+    h1Completed: boolean;
+    h2Completed: boolean;
+    h3Completed: boolean;
+    h1GteOpen: boolean;
+    h2GteH1: boolean;
+    h3GteH2: boolean;
+    scanGteH3: boolean;
+    scanGteH1: boolean;
+    h3GteH1: boolean;
+  };
   past4hCandles?: Array<{
     kIndex: number;
     openTime: number;
@@ -415,7 +434,15 @@ export default function MonitoringAssistant4h({
   const [filterSettings, setFilterSettings] = useState<FilterSettings4h>(() => {
     try {
       const saved = localStorage.getItem('monitoring4h_filter_settings');
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          ...DEFAULT_FILTER_SETTINGS_4H,
+          ...parsed,
+          maxFirstHourGainRatio: parsed.maxFirstHourGainRatio || DEFAULT_FILTER_SETTINGS_4H.maxFirstHourGainRatio,
+          hourlyProgression: parsed.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression
+        };
+      }
     } catch {}
     return DEFAULT_FILTER_SETTINGS_4H;
   });
@@ -572,8 +599,14 @@ export default function MonitoringAssistant4h({
 
         // 1. 筛选设置 (优先采用数据库中的持久化配置)
         if (settings.monitoring4h_filter_settings && typeof settings.monitoring4h_filter_settings === 'object') {
-          setFilterSettings(settings.monitoring4h_filter_settings);
-          try { localStorage.setItem('monitoring4h_filter_settings', JSON.stringify(settings.monitoring4h_filter_settings)); } catch {}
+          const merged = {
+            ...DEFAULT_FILTER_SETTINGS_4H,
+            ...settings.monitoring4h_filter_settings,
+            maxFirstHourGainRatio: settings.monitoring4h_filter_settings.maxFirstHourGainRatio || DEFAULT_FILTER_SETTINGS_4H.maxFirstHourGainRatio,
+            hourlyProgression: settings.monitoring4h_filter_settings.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression
+          };
+          setFilterSettings(merged);
+          try { localStorage.setItem('monitoring4h_filter_settings', JSON.stringify(merged)); } catch {}
         } else {
           // 数据库缺失此项时，使用缓存或默认值补齐并写入数据库
           let initFs = DEFAULT_FILTER_SETTINGS_4H;
@@ -711,24 +744,28 @@ export default function MonitoringAssistant4h({
   // 统计是否有任何激活的过滤条件
   const hasActiveFilters = useMemo(() => {
     return Boolean(
-      filterSettings.gainRange.enabled ||
-      filterSettings.closePosRange.enabled ||
-      filterSettings.minVolume4h.enabled ||
-      filterSettings.fundingRateRange.enabled ||
-      filterSettings.minVolumeRatio.enabled ||
-      filterSettings.minMaxGainPastK.enabled
+      filterSettings.gainRange?.enabled ||
+      filterSettings.closePosRange?.enabled ||
+      filterSettings.minVolume4h?.enabled ||
+      filterSettings.fundingRateRange?.enabled ||
+      filterSettings.minVolumeRatio?.enabled ||
+      filterSettings.minMaxGainPastK?.enabled ||
+      filterSettings.maxFirstHourGainRatio?.enabled ||
+      filterSettings.hourlyProgression?.enabled
     );
   }, [filterSettings]);
 
   // 统计已启用的筛选条件项数
   const activeFilterCount = useMemo(() => {
     return [
-      filterSettings.gainRange.enabled,
-      filterSettings.closePosRange.enabled,
-      filterSettings.minVolume4h.enabled,
-      filterSettings.fundingRateRange.enabled,
-      filterSettings.minVolumeRatio.enabled,
-      filterSettings.minMaxGainPastK.enabled
+      filterSettings.gainRange?.enabled,
+      filterSettings.closePosRange?.enabled,
+      filterSettings.minVolume4h?.enabled,
+      filterSettings.fundingRateRange?.enabled,
+      filterSettings.minVolumeRatio?.enabled,
+      filterSettings.minMaxGainPastK?.enabled,
+      filterSettings.maxFirstHourGainRatio?.enabled,
+      filterSettings.hourlyProgression?.enabled
     ].filter(Boolean).length;
   }, [filterSettings]);
 
@@ -1016,7 +1053,16 @@ export default function MonitoringAssistant4h({
       currentVolume: current4hVolume,
       minVolumePastK,
       volumeRatioPastK,
-      maxGainPastK
+      maxGainPastK,
+      firstHourGain: item.firstHourGain,
+      firstHourRatio: item.firstHourRatio ?? (item.firstHourGain !== undefined && Math.abs(effectiveChange) >= 0.1 ? (item.firstHourGain / effectiveChange) * 100 : undefined),
+      firstHourCompleted: item.firstHourCompleted,
+      hourlyCloses: item.hourlyCloses ? {
+        ...item.hourlyCloses,
+        scanPrice: currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice,
+        scanGteH3: (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) > 0 && item.hourlyCloses.h3 > 0 && (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) >= item.hourlyCloses.h3,
+        scanGteH1: (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) > 0 && item.hourlyCloses.h1 > 0 && (currentPrice > 0 ? currentPrice : item.hourlyCloses.scanPrice) >= item.hourlyCloses.h1
+      } : undefined
     };
   }, [livePrices, gainMode, fundingRates, contextFundingRates, volumeKCount, gainKCount]);
 
@@ -1187,9 +1233,46 @@ export default function MonitoringAssistant4h({
       if (!isNaN(min) && (data.volumeRatioPastK || 0) < min) return false;
     }
     // 6. 前 N 根涨幅极值不大于 (自动跟随前端 gainKCount 与 gainMode)
-    if (filterSettings.minMaxGainPastK.enabled) {
+    if (filterSettings.minMaxGainPastK?.enabled) {
       const max = parseFloat(filterSettings.minMaxGainPastK.value);
       if (!isNaN(max) && (data.maxGainPastK || 0) > max) return false;
+    }
+    // 7. 本4H第1小时涨跌幅占比不超过 (maxFirstHourGainRatio)
+    if (filterSettings.maxFirstHourGainRatio?.enabled) {
+      const maxRatio = parseFloat(filterSettings.maxFirstHourGainRatio.value);
+      if (!isNaN(maxRatio)) {
+        const ratio = data.firstHourRatio;
+        const isCompleted = data.firstHourCompleted !== false;
+        if (isCompleted && ratio !== undefined && ratio !== null) {
+          if (ratio > maxRatio) return false;
+        }
+      }
+    }
+    // 8. 本4小时前3小时及扫描时刻逐级递增筛选 (hourlyProgression)
+    if (filterSettings.hourlyProgression?.enabled) {
+      const hp = filterSettings.hourlyProgression;
+      const hc = data.hourlyCloses;
+      if (!hc) return false;
+      const mode = hp.mode || 'strict';
+      if (mode === 'strict') {
+        if (hc.h1Completed && !hc.h1GteOpen) return false;
+        if (hc.h2Completed && !hc.h2GteH1) return false;
+        if (hc.h3Completed && !hc.h3GteH2) return false;
+        if (hc.h3Completed && !hc.scanGteH3) return false;
+      } else if (mode === 'loose') {
+        if (hc.h1Completed && !hc.h1GteOpen) return false;
+        if (hc.h1Completed && !hc.scanGteH1) return false;
+      } else if (mode === 'moderate') {
+        if (hc.h1Completed && !hc.h1GteOpen) return false;
+        if (hc.h3Completed && !hc.h3GteH1) return false;
+        if (hc.h3Completed && !hc.scanGteH3) return false;
+      } else if (mode === 'custom') {
+        if (hp.requireH1GteOpen && hc.h1Completed && !hc.h1GteOpen) return false;
+        if (hp.requireH2GteH1 && hc.h2Completed && !hc.h2GteH1) return false;
+        if (hp.requireH3GteH2 && hc.h3Completed && !hc.h3GteH2) return false;
+        if (hp.requireScanGteH3 && hc.h3Completed && !hc.scanGteH3) return false;
+        if (hp.requireScanGteH1 && hc.h1Completed && !hc.scanGteH1) return false;
+      }
     }
     return true;
   }, [filterSettings, getSymbolDisplayData]);
@@ -1286,7 +1369,7 @@ export default function MonitoringAssistant4h({
     }
 
     // 6. 前K高
-    if (filterSettings.minMaxGainPastK.enabled) {
+    if (filterSettings.minMaxGainPastK?.enabled) {
       const max = parseFloat(filterSettings.minMaxGainPastK.value);
       const val = data.maxGainPastK || 0;
       const passed = !isNaN(max) && val <= max;
@@ -1297,6 +1380,65 @@ export default function MonitoringAssistant4h({
         actual: `${val.toFixed(2)}%`,
         ruleDesc: `≤ ${filterSettings.minMaxGainPastK.value}%`,
         reason: !passed ? `前K极值超标 (${val.toFixed(2)}% > ${max}%)` : '符合'
+      });
+    }
+
+    // 7. 首小时涨跌占比
+    if (filterSettings.maxFirstHourGainRatio?.enabled) {
+      const max = parseFloat(filterSettings.maxFirstHourGainRatio.value);
+      const ratio = data.firstHourRatio;
+      const isCompleted = data.firstHourCompleted !== false;
+      const passed = !isNaN(max) ? (isCompleted && ratio !== undefined ? ratio <= max : true) : true;
+      rules.push({
+        name: '首小时涨跌占比',
+        enabled: true,
+        passed,
+        actual: ratio !== undefined ? `${ratio.toFixed(1)}%` : (isCompleted ? '--' : '首小时未完结'),
+        ruleDesc: `≤ ${filterSettings.maxFirstHourGainRatio.value}%`,
+        reason: !passed ? `首小时占比超标 (${ratio?.toFixed(1)}% > ${max}%)` : '符合'
+      });
+    }
+
+    // 8. 小时收盘逐级递增
+    if (filterSettings.hourlyProgression?.enabled) {
+      const hp = filterSettings.hourlyProgression;
+      const hc = data.hourlyCloses;
+      let passed = true;
+      let failReason = '';
+      if (!hc) {
+        passed = false;
+        failReason = '缺少小时K线数据';
+      } else {
+        const mode = hp.mode || 'strict';
+        if (mode === 'strict') {
+          if (hc.h1Completed && !hc.h1GteOpen) { passed = false; failReason = '1H收盘低于开盘价'; }
+          else if (hc.h2Completed && !hc.h2GteH1) { passed = false; failReason = '2H收盘低于1H收盘'; }
+          else if (hc.h3Completed && !hc.h3GteH2) { passed = false; failReason = '3H收盘低于2H收盘'; }
+          else if (hc.h3Completed && !hc.scanGteH3) { passed = false; failReason = '扫描价低于3H收盘'; }
+        } else if (mode === 'loose') {
+          if (hc.h1Completed && !hc.h1GteOpen) { passed = false; failReason = '1H收盘低于开盘价'; }
+          else if (hc.h1Completed && !hc.scanGteH1) { passed = false; failReason = '扫描价低于1H收盘'; }
+        } else if (mode === 'moderate') {
+          if (hc.h1Completed && !hc.h1GteOpen) { passed = false; failReason = '1H收盘低于开盘价'; }
+          else if (hc.h3Completed && !hc.h3GteH1) { passed = false; failReason = '3H收盘低于1H收盘'; }
+          else if (hc.h3Completed && !hc.scanGteH3) { passed = false; failReason = '扫描价低于3H收盘'; }
+        } else if (mode === 'custom') {
+          if (hp.requireH1GteOpen && hc.h1Completed && !hc.h1GteOpen) { passed = false; failReason = '1H未高于开盘'; }
+          else if (hp.requireH2GteH1 && hc.h2Completed && !hc.h2GteH1) { passed = false; failReason = '2H未高于1H'; }
+          else if (hp.requireH3GteH2 && hc.h3Completed && !hc.h3GteH2) { passed = false; failReason = '3H未高于2H'; }
+          else if (hp.requireScanGteH3 && hc.h3Completed && !hc.scanGteH3) { passed = false; failReason = '扫描价未高于3H'; }
+          else if (hp.requireScanGteH1 && hc.h1Completed && !hc.scanGteH1) { passed = false; failReason = '扫描价未高于1H'; }
+        }
+      }
+
+      const modeLabel = (hp.mode === 'strict' ? '严格(开≤1H≤2H≤3H≤现)' : hp.mode === 'loose' ? '宽松(开≤1H≤现)' : hp.mode === 'moderate' ? '稳健(开≤1H≤3H≤现)' : '自定义阶梯');
+      rules.push({
+        name: '小时逐级递增',
+        enabled: true,
+        passed,
+        actual: hc ? `1H:${formatPriceVal(hc.h1)} 2H:${formatPriceVal(hc.h2)} 3H:${formatPriceVal(hc.h3)} 现:${formatPriceVal(hc.scanPrice)}` : '--',
+        ruleDesc: modeLabel,
+        reason: passed ? '形态符合' : failReason
       });
     }
 
@@ -1801,6 +1943,11 @@ export default function MonitoringAssistant4h({
     if (currentFilterSettings.fundingRateRange?.enabled) fsSummaryParts.push(`费率[${currentFilterSettings.fundingRateRange.min ?? '-'}, ${currentFilterSettings.fundingRateRange.max ?? '-'}]%`);
     if (currentFilterSettings.minVolumeRatio?.enabled) fsSummaryParts.push(`量比>=${currentFilterSettings.minVolumeRatio.value ?? '-'}`);
     if (currentFilterSettings.minMaxGainPastK?.enabled) fsSummaryParts.push(`前K高<=${currentFilterSettings.minMaxGainPastK.value ?? '-'}`);
+    if (currentFilterSettings.maxFirstHourGainRatio?.enabled) fsSummaryParts.push(`首小时占比<=${currentFilterSettings.maxFirstHourGainRatio.value ?? '80'}%`);
+    if (currentFilterSettings.hourlyProgression?.enabled) {
+      const modeDesc = currentFilterSettings.hourlyProgression.mode === 'strict' ? '严格步步高升' : currentFilterSettings.hourlyProgression.mode === 'loose' ? '宽松首末' : currentFilterSettings.hourlyProgression.mode === 'moderate' ? '稳健三节点' : '自定义阶梯';
+      fsSummaryParts.push(`小时递增[${modeDesc}]`);
+    }
     const filterSummary = fsSummaryParts.join('; ') || '满足筛选设置';
 
     // 用户要求：目前只记录满足“筛选设置”的币对信息，其他的币对不记录。
@@ -1810,7 +1957,9 @@ export default function MonitoringAssistant4h({
       currentFilterSettings.minVolume4h?.enabled ||
       currentFilterSettings.fundingRateRange?.enabled ||
       currentFilterSettings.minVolumeRatio?.enabled ||
-      currentFilterSettings.minMaxGainPastK?.enabled
+      currentFilterSettings.minMaxGainPastK?.enabled ||
+      currentFilterSettings.maxFirstHourGainRatio?.enabled ||
+      currentFilterSettings.hourlyProgression?.enabled
     );
 
     if (!hasActiveFiltersLocal) {
@@ -4295,9 +4444,15 @@ export default function MonitoringAssistant4h({
                               filterSettings.gainRange.enabled && `涨幅[${filterSettings.gainRange.min}%~${filterSettings.gainRange.max}%]`,
                               filterSettings.closePosRange.enabled && `收位[${filterSettings.closePosRange.min}%~${filterSettings.closePosRange.max}%]`,
                               filterSettings.minVolume4h.enabled && `4H额≥${filterSettings.minVolume4h.value}万`,
-                              filterSettings.fundingRateRange.enabled && `费率[${filterSettings.fundingRateRange.min}%~${filterSettings.fundingRateRange.max}%]`,
-                              filterSettings.minVolumeRatio.enabled && `量比≥${filterSettings.minVolumeRatio.value}`,
-                              filterSettings.minMaxGainPastK.enabled && `前${gainKCount}K高≤${filterSettings.minMaxGainPastK.value}%`
+                              filterSettings.fundingRateRange?.enabled && `费率[${filterSettings.fundingRateRange.min}%~${filterSettings.fundingRateRange.max}%]`,
+                              filterSettings.minVolumeRatio?.enabled && `量比≥${filterSettings.minVolumeRatio.value}`,
+                              filterSettings.minMaxGainPastK?.enabled && `前${gainKCount}K高≤${filterSettings.minMaxGainPastK.value}%`,
+                              filterSettings.maxFirstHourGainRatio?.enabled && `首小时占比≤${filterSettings.maxFirstHourGainRatio.value}%`,
+                              filterSettings.hourlyProgression?.enabled && `小时递增[${
+                                filterSettings.hourlyProgression.mode === 'strict' ? '严格' :
+                                filterSettings.hourlyProgression.mode === 'loose' ? '宽松' :
+                                filterSettings.hourlyProgression.mode === 'moderate' ? '稳健' : '自定义'
+                              }]`
                             ].filter(Boolean).join(' · ')})
                           </span>
                         )}

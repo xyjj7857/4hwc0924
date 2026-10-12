@@ -10,7 +10,8 @@ import {
   Layers, 
   DollarSign, 
   Sparkles,
-  Info
+  Info,
+  Hourglass
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -48,7 +49,22 @@ export interface FilterSettings4h {
     enabled: boolean;
     value: string;
   };
-  // 7. 扫描时刻 (4小时绝对周期的第几小时、第几分、第几秒，始终生效)
+  // 7. 本4小时第1小时涨跌幅占比不超过 (%)
+  maxFirstHourGainRatio: {
+    enabled: boolean;
+    value: string;
+  };
+  // 8. 本4小时前3小时及扫描时刻递增模式 (勾选生效)
+  hourlyProgression?: {
+    enabled: boolean;
+    mode: 'strict' | 'loose' | 'moderate' | 'custom';
+    requireH1GteOpen?: boolean;
+    requireH2GteH1?: boolean;
+    requireH3GteH2?: boolean;
+    requireScanGteH3?: boolean;
+    requireScanGteH1?: boolean;
+  };
+  // 9. 扫描时刻 (4小时绝对周期的第几小时、第几分、第几秒，始终生效)
   scanMoment: {
     hour: number;   // 0 ~ 3
     minute: number; // 0 ~ 59
@@ -85,6 +101,19 @@ export const DEFAULT_FILTER_SETTINGS_4H: FilterSettings4h = {
   minMaxGainPastK: {
     enabled: false,
     value: '5.0'
+  },
+  maxFirstHourGainRatio: {
+    enabled: false,
+    value: '80'
+  },
+  hourlyProgression: {
+    enabled: false,
+    mode: 'strict',
+    requireH1GteOpen: true,
+    requireH2GteH1: true,
+    requireH3GteH2: true,
+    requireScanGteH3: true,
+    requireScanGteH1: false
   },
   scanMoment: {
     hour: 3,
@@ -143,12 +172,14 @@ export default function FilterSettingsModal4h({
 
   // 统计已启用的筛选规则数
   const activeCount = [
-    formData.gainRange.enabled,
-    formData.closePosRange.enabled,
-    formData.minVolume4h.enabled,
-    formData.fundingRateRange.enabled,
-    formData.minVolumeRatio.enabled,
-    formData.minMaxGainPastK.enabled
+    formData.gainRange?.enabled,
+    formData.closePosRange?.enabled,
+    formData.minVolume4h?.enabled,
+    formData.fundingRateRange?.enabled,
+    formData.minVolumeRatio?.enabled,
+    formData.minMaxGainPastK?.enabled,
+    formData.maxFirstHourGainRatio?.enabled,
+    formData.hourlyProgression?.enabled
   ].filter(Boolean).length;
 
   return (
@@ -514,7 +545,277 @@ export default function FilterSettingsModal4h({
               </div>
             </div>
 
-            {/* 7. 扫描时刻 (4小时绝对周期，无勾选，始终生效) */}
+            {/* 7. 本4小时第1小时涨跌幅占比不超过 (勾选生效) */}
+            <div className={`p-4 rounded-2xl border transition-all ${
+              formData.maxFirstHourGainRatio?.enabled 
+                ? 'bg-rose-500/[0.06] border-rose-500/40 shadow-sm' 
+                : 'bg-white/[0.02] border-white/5 opacity-75 hover:opacity-100'
+            }`}>
+              <div className="flex items-center justify-between mb-3">
+                <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                  <input 
+                    type="checkbox" 
+                    checked={formData.maxFirstHourGainRatio?.enabled ?? false}
+                    onChange={e => setFormData(prev => ({
+                      ...prev,
+                      maxFirstHourGainRatio: {
+                        ...(prev.maxFirstHourGainRatio || { value: '80' }),
+                        enabled: e.target.checked
+                      }
+                    }))}
+                    className="w-4 h-4 rounded text-rose-500 focus:ring-rose-500 focus:ring-offset-0 bg-white/10 border-white/20 accent-rose-500 cursor-pointer"
+                  />
+                  <span className="font-bold text-zinc-100 flex items-center gap-1.5">
+                    <Hourglass className="w-4 h-4 text-rose-400" />
+                    第1小时涨跌幅占比不超过 (%)
+                  </span>
+                </label>
+                <span className="text-xs text-rose-300/80 bg-rose-500/10 px-2 py-0.5 rounded border border-rose-500/20">
+                  前4根15m聚合数据
+                </span>
+              </div>
+              <div className="pl-6">
+                <div className="flex items-center justify-between text-[11px] text-zinc-400 mb-1">
+                  <span>首小时涨跌幅占整个4H总涨跌幅比重上限 (≤ %)</span>
+                </div>
+                <input 
+                  type="text" 
+                  value={formData.maxFirstHourGainRatio?.value ?? '80'}
+                  placeholder="如 80"
+                  onChange={e => handleNumberInput(e.target.value, (val) => setFormData(prev => ({
+                    ...prev,
+                    maxFirstHourGainRatio: {
+                      ...(prev.maxFirstHourGainRatio || { enabled: false }),
+                      value: val
+                    }
+                  })))}
+                  disabled={!formData.maxFirstHourGainRatio?.enabled}
+                  className="w-full px-3 py-2 bg-black/40 border border-white/15 rounded-xl font-mono text-white placeholder-zinc-600 focus:outline-none focus:border-rose-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                />
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  💡 勾选生效：判断当前4小时内第1个小时（由前4根15m聚合）的涨跌幅占整个4H总涨跌幅的比重。默认上限为 80%（例如总涨幅 20%，首小时若上涨 18% 占 90% &gt; 80%，则自动排除该币对）。
+                </p>
+              </div>
+            </div>
+
+            {/* 8. 本4小时前3小时及扫描时刻逐级递增筛选 (勾选生效) */}
+            <div className={`p-4 rounded-2xl border transition-all ${
+              formData.hourlyProgression?.enabled 
+                ? 'bg-emerald-500/[0.06] border-emerald-500/40 shadow-sm' 
+                : 'bg-white/[0.02] border-white/5 opacity-75 hover:opacity-100'
+            }`}>
+              <div className="flex items-center justify-between mb-3">
+                <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                  <input 
+                    type="checkbox" 
+                    checked={formData.hourlyProgression?.enabled ?? false}
+                    onChange={e => setFormData(prev => ({
+                      ...prev,
+                      hourlyProgression: {
+                        ...(prev.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression!),
+                        enabled: e.target.checked
+                      }
+                    }))}
+                    className="w-4 h-4 rounded text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0 bg-white/10 border-white/20 accent-emerald-500 cursor-pointer"
+                  />
+                  <span className="font-bold text-zinc-100 flex items-center gap-1.5">
+                    <TrendingUp className="w-4 h-4 text-emerald-400" />
+                    小时收盘及扫描价逐级递增模式
+                  </span>
+                </label>
+                <span className="text-xs text-emerald-300/80 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                  前3小时+扫描价阶梯
+                </span>
+              </div>
+              <div className="pl-6 space-y-3">
+                <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                  <span>形态组合方案 (快捷预设与自由定制)</span>
+                </div>
+
+                {/* 模式选择快捷按钮组 */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {[
+                    { id: 'strict', label: '严格逐级递增', desc: '开盘 ≤ 1H ≤ 2H ≤ 3H ≤ 扫描价' },
+                    { id: 'loose', label: '宽松基础组合', desc: '开盘 ≤ 1H ≤ 扫描价' },
+                    { id: 'moderate', label: '稳健三节点', desc: '开盘 ≤ 1H ≤ 3H ≤ 扫描价' },
+                    { id: 'custom', label: '自定义自由组合', desc: '自由搭配下方节点' }
+                  ].map(m => {
+                    const isSelected = (formData.hourlyProgression?.mode || 'strict') === m.id;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        disabled={!formData.hourlyProgression?.enabled}
+                        onClick={() => {
+                          setFormData(prev => {
+                            const cur = prev.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression!;
+                            let newSubs = {
+                              requireH1GteOpen: cur.requireH1GteOpen ?? true,
+                              requireH2GteH1: cur.requireH2GteH1 ?? true,
+                              requireH3GteH2: cur.requireH3GteH2 ?? true,
+                              requireScanGteH3: cur.requireScanGteH3 ?? true,
+                              requireScanGteH1: cur.requireScanGteH1 ?? false
+                            };
+                            if (m.id === 'strict') {
+                              newSubs = { requireH1GteOpen: true, requireH2GteH1: true, requireH3GteH2: true, requireScanGteH3: true, requireScanGteH1: false };
+                            } else if (m.id === 'loose') {
+                              newSubs = { requireH1GteOpen: true, requireH2GteH1: false, requireH3GteH2: false, requireScanGteH3: false, requireScanGteH1: true };
+                            } else if (m.id === 'moderate') {
+                              newSubs = { requireH1GteOpen: true, requireH2GteH1: false, requireH3GteH2: false, requireScanGteH3: true, requireScanGteH1: true };
+                            }
+                            return {
+                              ...prev,
+                              hourlyProgression: {
+                                ...cur,
+                                mode: m.id as any,
+                                ...newSubs
+                              }
+                            };
+                          });
+                        }}
+                        className={`p-2 rounded-xl border text-left transition-all text-xs cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                          isSelected && formData.hourlyProgression?.enabled
+                            ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-200 shadow-sm'
+                            : 'bg-white/[0.03] border-white/10 text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06]'
+                        }`}
+                      >
+                        <div className="font-bold flex items-center justify-between">
+                          <span>{m.label}</span>
+                          {isSelected && <Check className="w-3.5 h-3.5 text-emerald-400" />}
+                        </div>
+                        <div className="text-[10px] text-zinc-500 mt-1 truncate">{m.desc}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* 细分子条件勾选项 */}
+                <div className="bg-black/30 border border-white/10 rounded-xl p-3 space-y-2">
+                  <div className="text-[11px] font-medium text-zinc-300 mb-1 flex items-center justify-between">
+                    <span>各时间节点价格递增细则要求 (由15m蜡烛聚合)：</span>
+                    <span className="text-[10px] text-zinc-500">以 04:00~08:00 周期为例</span>
+                  </div>
+                  
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                    <label className={`flex items-center gap-2 p-2 rounded-lg border transition-all cursor-pointer ${
+                      formData.hourlyProgression?.requireH1GteOpen 
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-zinc-200' 
+                        : 'bg-white/[0.02] border-white/5 text-zinc-500'
+                    }`}>
+                      <input 
+                        type="checkbox"
+                        disabled={!formData.hourlyProgression?.enabled}
+                        checked={formData.hourlyProgression?.requireH1GteOpen ?? true}
+                        onChange={e => setFormData(prev => ({
+                          ...prev,
+                          hourlyProgression: {
+                            ...(prev.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression!),
+                            mode: 'custom',
+                            requireH1GteOpen: e.target.checked
+                          }
+                        }))}
+                        className="rounded text-emerald-500 bg-white/10 border-white/20 accent-emerald-500"
+                      />
+                      <span>第1小时收盘 ≥ 开盘价 <span className="text-[10px] text-zinc-500 font-mono">(5点收 ≥ 4点开)</span></span>
+                    </label>
+
+                    <label className={`flex items-center gap-2 p-2 rounded-lg border transition-all cursor-pointer ${
+                      formData.hourlyProgression?.requireH2GteH1 
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-zinc-200' 
+                        : 'bg-white/[0.02] border-white/5 text-zinc-500'
+                    }`}>
+                      <input 
+                        type="checkbox"
+                        disabled={!formData.hourlyProgression?.enabled}
+                        checked={formData.hourlyProgression?.requireH2GteH1 ?? false}
+                        onChange={e => setFormData(prev => ({
+                          ...prev,
+                          hourlyProgression: {
+                            ...(prev.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression!),
+                            mode: 'custom',
+                            requireH2GteH1: e.target.checked
+                          }
+                        }))}
+                        className="rounded text-emerald-500 bg-white/10 border-white/20 accent-emerald-500"
+                      />
+                      <span>第2小时收盘 ≥ 第1小时收盘 <span className="text-[10px] text-zinc-500 font-mono">(6点收 ≥ 5点收)</span></span>
+                    </label>
+
+                    <label className={`flex items-center gap-2 p-2 rounded-lg border transition-all cursor-pointer ${
+                      formData.hourlyProgression?.requireH3GteH2 
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-zinc-200' 
+                        : 'bg-white/[0.02] border-white/5 text-zinc-500'
+                    }`}>
+                      <input 
+                        type="checkbox"
+                        disabled={!formData.hourlyProgression?.enabled}
+                        checked={formData.hourlyProgression?.requireH3GteH2 ?? false}
+                        onChange={e => setFormData(prev => ({
+                          ...prev,
+                          hourlyProgression: {
+                            ...(prev.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression!),
+                            mode: 'custom',
+                            requireH3GteH2: e.target.checked
+                          }
+                        }))}
+                        className="rounded text-emerald-500 bg-white/10 border-white/20 accent-emerald-500"
+                      />
+                      <span>第3小时收盘 ≥ 第2小时收盘 <span className="text-[10px] text-zinc-500 font-mono">(7点收 ≥ 6点收)</span></span>
+                    </label>
+
+                    <label className={`flex items-center gap-2 p-2 rounded-lg border transition-all cursor-pointer ${
+                      formData.hourlyProgression?.requireScanGteH3 
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-zinc-200' 
+                        : 'bg-white/[0.02] border-white/5 text-zinc-500'
+                    }`}>
+                      <input 
+                        type="checkbox"
+                        disabled={!formData.hourlyProgression?.enabled}
+                        checked={formData.hourlyProgression?.requireScanGteH3 ?? false}
+                        onChange={e => setFormData(prev => ({
+                          ...prev,
+                          hourlyProgression: {
+                            ...(prev.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression!),
+                            mode: 'custom',
+                            requireScanGteH3: e.target.checked
+                          }
+                        }))}
+                        className="rounded text-emerald-500 bg-white/10 border-white/20 accent-emerald-500"
+                      />
+                      <span>扫描时刻价格 ≥ 第3小时收盘 <span className="text-[10px] text-zinc-500 font-mono">(07:58:30 ≥ 7点收)</span></span>
+                    </label>
+
+                    <label className={`flex items-center gap-2 p-2 rounded-lg border transition-all cursor-pointer ${
+                      formData.hourlyProgression?.requireScanGteH1 
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-zinc-200' 
+                        : 'bg-white/[0.02] border-white/5 text-zinc-500'
+                    }`}>
+                      <input 
+                        type="checkbox"
+                        disabled={!formData.hourlyProgression?.enabled}
+                        checked={formData.hourlyProgression?.requireScanGteH1 ?? false}
+                        onChange={e => setFormData(prev => ({
+                          ...prev,
+                          hourlyProgression: {
+                            ...(prev.hourlyProgression || DEFAULT_FILTER_SETTINGS_4H.hourlyProgression!),
+                            mode: 'custom',
+                            requireScanGteH1: e.target.checked
+                          }
+                        }))}
+                        className="rounded text-emerald-500 bg-white/10 border-white/20 accent-emerald-500"
+                      />
+                      <span>扫描时刻价格 ≥ 第1小时收盘 <span className="text-[10px] text-zinc-500 font-mono">(07:58:30 ≥ 5点收)</span></span>
+                    </label>
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  💡 勾选生效：判断4小时周期内前3个完整小时的收盘价与扫描时刻价格的阶梯关系（所有小时收盘价均由每15分钟蜡烛聚合计算）。可选择严格连续上涨（步步高升），或宽松组合（如首小时收红且扫描价格不破首小时）。
+                </p>
+              </div>
+            </div>
+
+            {/* 9. 扫描时刻 (4小时绝对周期，无勾选，始终生效) */}
             <div className="p-4 rounded-2xl bg-white/[0.03] border border-white/10 shadow-sm">
               <div className="flex items-center justify-between mb-2">
                 <div className="font-bold text-zinc-100 flex items-center gap-2">
