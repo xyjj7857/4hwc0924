@@ -3,7 +3,7 @@ import { Position, OpenOrder } from '../types';
 export interface StageCloseRule {
   id: string; // 'stage_1' | 'stage_2' | 'stage_3'
   enabled: boolean;
-  targetN: number;      // 当 N = 几时 (默认: 第1组 N=2, 第2组 N=3, 第3组 N=4)
+  targetN: number;      // 当 N = 几时 (默认: 第1组 N=2 开启, 第2组 N=3 关闭, 第3组 N=100 开启且平仓100%)
   closeRatio: number;   // 平仓现有仓位的百分之多少 (默认 50%)
   executed?: boolean;   // 是否已执行
   executedAt?: number;  // 执行时间戳
@@ -304,8 +304,8 @@ export function getDefaultConditionControlConfig(): ConditionControlConfig {
     description: 'N值阶梯平仓与动态回撤移动止损',
     stageCloseRules: [
       { id: 'stage_1', enabled: true, targetN: 2, closeRatio: 50 },
-      { id: 'stage_2', enabled: true, targetN: 3, closeRatio: 50 },
-      { id: 'stage_3', enabled: true, targetN: 4, closeRatio: 50 }
+      { id: 'stage_2', enabled: false, targetN: 3, closeRatio: 50 },
+      { id: 'stage_3', enabled: true, targetN: 100, closeRatio: 100 }
     ],
     trailingStopRule: {
       enabled: true, // 默认勾选
@@ -325,9 +325,9 @@ export function normalizeConditionControl(cc?: Partial<ConditionControlConfig>):
     stageCloseRules: Array.isArray(cc.stageCloseRules) && cc.stageCloseRules.length === 3
       ? cc.stageCloseRules.map((s, idx) => ({
           id: s.id || `stage_${idx + 1}`,
-          enabled: s.enabled !== undefined ? s.enabled : true,
-          targetN: Number(s.targetN) > 0 ? Number(s.targetN) : (idx + 2),
-          closeRatio: Number(s.closeRatio) > 0 ? Number(s.closeRatio) : 50,
+          enabled: s.enabled !== undefined ? s.enabled : defaults.stageCloseRules[idx].enabled,
+          targetN: Number(s.targetN) > 0 ? Number(s.targetN) : defaults.stageCloseRules[idx].targetN,
+          closeRatio: Number(s.closeRatio) > 0 ? Number(s.closeRatio) : defaults.stageCloseRules[idx].closeRatio,
           executed: Boolean(s.executed),
           executedAt: s.executedAt,
           executedAmount: s.executedAmount

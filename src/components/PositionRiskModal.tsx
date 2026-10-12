@@ -1219,12 +1219,12 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
                 <div className="bg-[#0D0D0E] p-2.5 rounded-lg border border-zinc-800 text-[11px] text-zinc-400 space-y-1">
                   <div className="text-purple-300 font-semibold flex items-center gap-1">
                     <Info size={12} />
-                    <span>按现有仓位分步平仓推演（例：初始持仓 100 张，每组均设平仓 50%）：</span>
+                    <span>按现有仓位分步平仓推演（例：初始持仓 100 张）：</span>
                   </div>
                   <div className="pl-4 space-y-0.5 text-zinc-400 font-mono text-[10px]">
-                    <div>• 触达 N=2：平仓现有仓位 100 × 50% = 50 张，剩余 50 张</div>
-                    <div>• 触达 N=3：平仓现有仓位 50 × 50% = 25 张，剩余 25 张</div>
-                    <div>• 触达 N=4：平仓现有仓位 25 × 50% = 12.5 张，剩余 12.5 张</div>
+                    <div>• 第1组（N=2 开启）：触达 N=2 时，平仓现有仓位 100 × 50% = 50 张，剩余 50 张</div>
+                    <div>• 第2组（N=3 默认关闭）：未勾选不触发</div>
+                    <div>• 第3组（N=100 开启）：触达 N=100 时，平仓现有仓位 50 × 100% = 50 张，全仓平仓出场</div>
                   </div>
                 </div>
               </div>
