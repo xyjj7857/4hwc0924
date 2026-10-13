@@ -66,6 +66,16 @@ export interface PositionRiskConfig {
 
   // c，条件风控：1、N值阶梯平仓（3组独立勾选）；2、N值动态移动回撤止损调整
   conditionControl: ConditionControlConfig;
+
+  // d，超时未达预期倍数平仓：该仓单自下单开始后满多少个小时，若币价未超过开仓价的多少倍则自动平仓。默认开启：24小时，1.5倍
+  timeoutPriceControl: TimeoutPriceControlConfig;
+}
+
+export interface TimeoutPriceControlConfig {
+  enabled: boolean;        // 默认开启 (true)
+  timeoutHours: number;    // 默认 24 小时
+  priceMultiplier: number; // 默认 1.5 倍
+  activatedAt?: number;   // 下单开始/激活时间戳
 }
 
 export interface PositionTpSlResult {
@@ -345,13 +355,26 @@ export function normalizeConditionControl(cc?: Partial<ConditionControlConfig>):
 }
 
 export function normalizePositionRiskConfig(cfg: PositionRiskConfig): PositionRiskConfig {
+  const tpc = (cfg as any)?.timeoutPriceControl;
   return {
     ...cfg,
-    conditionControl: normalizeConditionControl(cfg.conditionControl)
+    conditionControl: normalizeConditionControl(cfg.conditionControl),
+    timeoutPriceControl: {
+      enabled: tpc?.enabled !== undefined ? Boolean(tpc.enabled) : true,
+      timeoutHours: typeof tpc?.timeoutHours === 'number' && tpc.timeoutHours > 0 ? tpc.timeoutHours : (parseFloat(tpc?.timeoutHours) || 24),
+      priceMultiplier: typeof tpc?.priceMultiplier === 'number' && tpc.priceMultiplier > 0 ? tpc.priceMultiplier : (parseFloat(tpc?.priceMultiplier) || 1.5),
+      activatedAt: tpc?.activatedAt
+    }
   };
 }
 
-export function getDefaultPositionRiskConfig(posId: string, symbol: string, side: 'BUY' | 'SELL', entryPrice: number): PositionRiskConfig {
+export function getDefaultPositionRiskConfig(
+  posId: string, 
+  symbol: string, 
+  side: 'BUY' | 'SELL', 
+  entryPrice: number,
+  activatedAt?: number
+): PositionRiskConfig {
   return {
     positionId: posId,
     symbol,
@@ -370,6 +393,12 @@ export function getDefaultPositionRiskConfig(posId: string, symbol: string, side
       slPercent: 3.0,
       slPrice: side === 'BUY' ? entryPrice * 0.97 : entryPrice * 1.03,
     },
-    conditionControl: getDefaultConditionControlConfig()
+    conditionControl: getDefaultConditionControlConfig(),
+    timeoutPriceControl: {
+      enabled: true, // 默认开启
+      timeoutHours: 24, // 默认 24 小时
+      priceMultiplier: 1.5, // 默认 1.5 倍
+      activatedAt: activatedAt || Date.now()
+    }
   };
 }

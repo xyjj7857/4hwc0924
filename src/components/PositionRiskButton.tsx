@@ -69,6 +69,32 @@ export const PositionRiskButton: React.FC<PositionRiskButtonProps> = ({
     return () => clearInterval(timer);
   }, [config?.timeControl?.enabled, config?.timeControl?.activatedAt, config?.timeControl?.maxHoldMinutes]);
 
+  // 实时超时未达倍数风控倒计时（每张仓单独立统计）
+  const [timeoutText, setTimeoutText] = useState<string>('');
+  useEffect(() => {
+    const tpc = config?.timeoutPriceControl;
+    if (tpc && tpc.enabled === false) {
+      setTimeoutText('');
+      return;
+    }
+    const update = () => {
+      const startTime = tpc?.activatedAt || position.openTime || position.timestamp || Date.now();
+      const totalHours = Number(tpc?.timeoutHours) || 24;
+      const totalMs = totalHours * 3600 * 1000;
+      const elapsedMs = Math.max(0, Date.now() - startTime);
+      const leftMs = totalMs - elapsedMs;
+      if (leftMs <= 0) {
+        setTimeoutText(`满${totalHours}h`);
+      } else {
+        const leftH = (leftMs / (3600 * 1000)).toFixed(1);
+        setTimeoutText(`${leftH}h`);
+      }
+    };
+    update();
+    const t = setInterval(update, 1000);
+    return () => clearInterval(t);
+  }, [config?.timeoutPriceControl, position.openTime, position.timestamp]);
+
   // 1. 若同时存在止盈与止损挂单，则同时展示止盈与止损
   if (hasTp && hasSl) {
     const tpPriceText = formatPriceVal(tpPrice);
@@ -230,17 +256,29 @@ export const PositionRiskButton: React.FC<PositionRiskButtonProps> = ({
     );
   }
 
-  // 默认展示：死斗
+  // 默认展示：死斗 (带超时平仓保护)
+  const isTimeoutEnabled = config?.timeoutPriceControl?.enabled ?? true;
+  const timeoutHours = config?.timeoutPriceControl?.timeoutHours || 24;
+  const targetMul = config?.timeoutPriceControl?.priceMultiplier || 1.5;
+
   return (
     <button
       type="button"
       id={`btn-risk-${position.id}`}
       onClick={onClick}
-      title="当前持仓未配置止盈止损或时间/条件风控，默认处于：死斗模式（点击打开专属风控设置）"
-      className="w-[210px] h-[47px] rounded-md text-[16.5px] font-bold border transition-all flex items-center justify-center gap-2 active:scale-95 shadow-sm bg-gradient-to-r from-red-950/40 to-zinc-900 border-red-600/50 text-red-300 hover:border-red-500 hover:text-red-100 hover:from-red-900/40 shrink-0"
+      title={`当前持仓未配置独立止盈止损，默认处于：死斗模式${isTimeoutEnabled ? `\n⏱️ 超时风控保护已默认开启：满 ${timeoutHours} 小时币价未超 ${targetMul} 倍自动市价平仓 (剩余: ${timeoutText || '计算中...'})` : ''}\n点击打开专属风控设置`}
+      className="w-[210px] h-[47px] rounded-md text-[16.5px] font-bold border transition-all flex items-center justify-center gap-2 active:scale-95 shadow-sm bg-gradient-to-r from-red-950/40 to-zinc-900 border-red-600/50 text-red-300 hover:border-red-500 hover:text-red-100 hover:from-red-900/40 shrink-0 relative"
     >
       <Swords size={18} className="text-red-400 shrink-0" />
       <span>死斗</span>
+      {isTimeoutEnabled && timeoutText && (
+        <span 
+          className="absolute -top-1.5 -right-1.5 px-1.5 py-0.2 bg-amber-500/90 text-black text-[9px] font-mono font-bold rounded-full shadow-md border border-amber-300"
+          title={`超时平仓保护倒计时: ${timeoutText}`}
+        >
+          ⏱️{timeoutText}
+        </span>
+      )}
     </button>
   );
 };

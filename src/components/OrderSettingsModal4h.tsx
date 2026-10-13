@@ -11,7 +11,9 @@ import {
   DollarSign, 
   Coins,
   HelpCircle,
-  Layers
+  Layers,
+  Clock,
+  Timer
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -52,6 +54,12 @@ export interface OrderSettings4h {
     enabled: boolean;
     value: string;
   };
+  // 7. 超时未达预期倍数平仓 (自下单开始满X小时若币价未超过开仓价Y倍则自动平仓，默认开启：24小时，2倍)
+  timeoutPriceClose?: {
+    enabled: boolean;
+    hours: string; // 默认 '24'
+    multiplier: string; // 默认 '2'
+  };
 }
 
 export const DEFAULT_ORDER_SETTINGS_4H: OrderSettings4h = {
@@ -83,6 +91,11 @@ export const DEFAULT_ORDER_SETTINGS_4H: OrderSettings4h = {
   takeProfitMultiplier: {
     enabled: true,
     value: '1.05'
+  },
+  timeoutPriceClose: {
+    enabled: true,
+    hours: '24',
+    multiplier: '1.5'
   }
 };
 
@@ -106,7 +119,8 @@ export default function OrderSettingsModal4h({
   const [formData, setFormData] = useState<OrderSettings4h>(() => ({
     ...DEFAULT_ORDER_SETTINGS_4H,
     ...settings,
-    maxPositionCount: settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
+    maxPositionCount: settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount,
+    timeoutPriceClose: settings.timeoutPriceClose || DEFAULT_ORDER_SETTINGS_4H.timeoutPriceClose
   }));
   const [isApplying, setIsApplying] = useState(false);
 
@@ -115,7 +129,8 @@ export default function OrderSettingsModal4h({
       setFormData({
         ...DEFAULT_ORDER_SETTINGS_4H,
         ...settings,
-        maxPositionCount: settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
+        maxPositionCount: settings.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount,
+        timeoutPriceClose: settings.timeoutPriceClose || DEFAULT_ORDER_SETTINGS_4H.timeoutPriceClose
       });
     }
   }, [isOpen, settings]);
@@ -160,7 +175,8 @@ export default function OrderSettingsModal4h({
     formData.minOrderAmount.enabled,
     formData.fixedOrderAmount.enabled,
     formData.stopLossMultiplier.enabled,
-    formData.takeProfitMultiplier.enabled
+    formData.takeProfitMultiplier.enabled,
+    formData.timeoutPriceClose?.enabled
   ].filter(Boolean).length;
 
   return (
@@ -527,6 +543,84 @@ export default function OrderSettingsModal4h({
                   disabled={!formData.takeProfitMultiplier.enabled}
                   className="w-full px-3 py-2 bg-black/40 border border-white/15 rounded-xl font-mono text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed"
                 />
+              </div>
+            </div>
+
+            {/* 6. 超时未达预期倍数平仓 (默认开启：24小时，2倍) */}
+            <div className={`p-4 rounded-2xl border transition-all ${
+              (formData.timeoutPriceClose?.enabled ?? true)
+                ? 'bg-amber-500/[0.06] border-amber-500/40 shadow-sm' 
+                : 'bg-white/[0.02] border-white/5 opacity-75 hover:opacity-100'
+            }`}>
+              <div className="flex items-center justify-between mb-3">
+                <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                  <input 
+                    type="checkbox" 
+                    checked={formData.timeoutPriceClose?.enabled ?? true}
+                    onChange={e => setFormData(prev => ({
+                      ...prev,
+                      timeoutPriceClose: {
+                        ...(prev.timeoutPriceClose || { hours: '24', multiplier: '1.5' }),
+                        enabled: e.target.checked
+                      }
+                    }))}
+                    className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500 bg-white/10 border-white/20 accent-amber-500 cursor-pointer"
+                  />
+                  <span className="font-bold text-zinc-100 flex items-center gap-1.5">
+                    <Timer className="w-4 h-4 text-amber-400" />
+                    超时未达预期倍数平仓（默认开启）
+                  </span>
+                </label>
+                <span className="text-xs text-amber-300 font-mono">
+                  默认: 24小时未超1.5倍自动平仓
+                </span>
+              </div>
+              <p className="text-[11px] text-zinc-400 mb-3 pl-6 leading-relaxed">
+                该仓单自下单开始后满设定小时数时，若币价未超过开仓价的设定倍数，则自动市价平仓。每张仓单独立统计。
+              </p>
+              <div className="pl-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <span className="text-[11px] text-zinc-400 mb-1 block">检查超时时间 (小时)</span>
+                  <div className="relative">
+                    <input 
+                      type="text" 
+                      value={formData.timeoutPriceClose?.hours ?? '24'}
+                      placeholder="24"
+                      onChange={e => handleNumberInput(e.target.value, (val) => setFormData(prev => ({
+                        ...prev,
+                        timeoutPriceClose: {
+                          ...(prev.timeoutPriceClose || { enabled: true, multiplier: '1.5' }),
+                          hours: val,
+                          enabled: prev.timeoutPriceClose?.enabled ?? true
+                        }
+                      })))}
+                      disabled={!(formData.timeoutPriceClose?.enabled ?? true)}
+                      className="w-full px-3 py-2 bg-black/40 border border-white/15 rounded-xl font-mono text-white placeholder-zinc-600 focus:outline-none focus:border-amber-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                    />
+                    <Clock size={13} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500" />
+                  </div>
+                </div>
+                <div>
+                  <span className="text-[11px] text-zinc-400 mb-1 block">目标开仓价倍数 (倍)</span>
+                  <div className="relative">
+                    <input 
+                      type="text" 
+                      value={formData.timeoutPriceClose?.multiplier ?? '1.5'}
+                      placeholder="1.5"
+                      onChange={e => handleNumberInput(e.target.value, (val) => setFormData(prev => ({
+                        ...prev,
+                        timeoutPriceClose: {
+                          ...(prev.timeoutPriceClose || { enabled: true, hours: '24' }),
+                          multiplier: val,
+                          enabled: prev.timeoutPriceClose?.enabled ?? true
+                        }
+                      })))}
+                      disabled={!(formData.timeoutPriceClose?.enabled ?? true)}
+                      className="w-full px-3 py-2 bg-black/40 border border-white/15 rounded-xl font-mono text-white placeholder-zinc-600 focus:outline-none focus:border-amber-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                    />
+                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 text-xs font-mono">x</span>
+                  </div>
+                </div>
               </div>
             </div>
 

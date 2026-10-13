@@ -49,6 +49,25 @@ interface ScreeningRecordsModalProps {
   formatPrice?: (symbol: string, price: number) => string;
 }
 
+// 4H 周期准确对应校验工具：确保任何扫描时刻与 4H 周期字符串 (如 15:58:30 -> 12:00~16:00, 03:58:30 -> 00:00~04:00) 100% 对应
+export function getAccurate4hCycleStr(scanTime?: number, scanTimeStr?: string, fallbackCycleStr?: string): string {
+  let targetHour = -1;
+  if (scanTimeStr) {
+    const match = String(scanTimeStr).match(/(\d{1,2}):(\d{1,2}):(\d{1,2})/);
+    if (match) targetHour = parseInt(match[1], 10);
+  }
+  if (targetHour < 0 && scanTime && scanTime > 1000000000) {
+    targetHour = new Date(scanTime).getHours();
+  }
+  if (targetHour >= 0 && targetHour <= 23) {
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    const cStart = Math.floor(targetHour / 4) * 4;
+    const cEnd = (cStart + 4) % 24;
+    return `${pad(cStart)}:00~${pad(cEnd)}:00 (4H)`;
+  }
+  return fallbackCycleStr || '';
+}
+
 export const ScreeningRecordsModal: React.FC<ScreeningRecordsModalProps> = ({
   isOpen,
   onClose,
@@ -139,7 +158,7 @@ export const ScreeningRecordsModal: React.FC<ScreeningRecordsModalProps> = ({
     const rows = filteredRecords.map(r => [
       `"${r.id}"`,
       `"${r.scanTimeStr}"`,
-      `"${r.cycleStr}"`,
+      `"${getAccurate4hCycleStr(r.scanTime, r.scanTimeStr, r.cycleStr)}"`,
       `"${r.symbol}"`,
       r.currentPrice,
       r.open4h,
@@ -439,11 +458,14 @@ export const ScreeningRecordsModal: React.FC<ScreeningRecordsModalProps> = ({
                                 {datePart && <span>{datePart}</span>}
                                 <span className={datePart ? "text-white text-[12px]" : "text-amber-300"}>{timePart}</span>
                               </div>
-                              {r.cycleStr && (
-                                <div className="text-[10px] text-zinc-400 font-sans mt-0.5 flex items-center gap-1">
-                                  <span className="px-1.5 py-0.2 rounded bg-zinc-800 text-zinc-400 border border-white/5">{r.cycleStr}</span>
-                                </div>
-                              )}
+                              {(() => {
+                                const accurateCycle = getAccurate4hCycleStr(r.scanTime, r.scanTimeStr, r.cycleStr);
+                                return accurateCycle ? (
+                                  <div className="text-[10px] text-zinc-400 font-sans mt-0.5 flex items-center gap-1">
+                                    <span className="px-1.5 py-0.2 rounded bg-zinc-800 text-zinc-400 border border-white/5">{accurateCycle}</span>
+                                  </div>
+                                ) : null;
+                              })()}
                             </div>
                           );
                         })()}

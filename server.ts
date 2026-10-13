@@ -107,6 +107,39 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_screening_records_scan_time ON screening_records(scan_time DESC);
 `);
 
+// 4H 周期准确对应校验工具：确保任何扫描时刻与 4H 周期字符串 (如 15:58:30 -> 12:00~16:00, 03:58:30 -> 00:00~04:00) 100% 对应
+function getAccurate4hCycleStr(scanTime?: number, scanTimeStr?: string, fallbackCycleStr?: string): string {
+  let targetHour = -1;
+  if (scanTimeStr) {
+    const match = String(scanTimeStr).match(/(\d{1,2}):(\d{1,2}):(\d{1,2})/);
+    if (match) targetHour = parseInt(match[1], 10);
+  }
+  if (targetHour < 0 && scanTime && scanTime > 1000000000) {
+    targetHour = new Date(scanTime).getHours();
+  }
+  if (targetHour >= 0 && targetHour <= 23) {
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    const cStart = Math.floor(targetHour / 4) * 4;
+    const cEnd = (cStart + 4) % 24;
+    return `${pad(cStart)}:00~${pad(cEnd)}:00 (4H)`;
+  }
+  return fallbackCycleStr || '';
+}
+
+// 自动纠偏存量历史筛选记录中由于旧版本逆向计算导致错位的 cycle_str (如 15:58:30 错标为 08:00~12:00)
+try {
+  const existingRows = db.prepare("SELECT id, scan_time, scan_time_str, cycle_str FROM screening_records").all() as any[];
+  const updateStmt = db.prepare("UPDATE screening_records SET cycle_str = ? WHERE id = ?");
+  for (const row of existingRows) {
+    const expected = getAccurate4hCycleStr(row.scan_time, row.scan_time_str, row.cycle_str);
+    if (expected && expected !== row.cycle_str) {
+      updateStmt.run(expected, row.id);
+    }
+  }
+} catch (e) {
+  console.warn("Screening records cycle_str migration warning:", e);
+}
+
 // Initialize weight stats persistence from database (7x24 background persistence)
 weightStatsManager.initFromDatabase(db);
 
@@ -1334,6 +1367,23 @@ try {
 } catch (e) {
   console.error("Failed to load monitoring_running_4h status:", e);
 }
+
+let isAutoTrading4h = false;
+try {
+  const autoRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_auto_trading") as any;
+  if (autoRow) {
+    isAutoTrading4h = Boolean(JSON.parse(autoRow.value));
+  }
+} catch (e) {
+  console.error("Failed to load monitoring4h_auto_trading status:", e);
+}
+
+try {
+  const trigRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_last_cycle_trigger") as any;
+  if (trigRow) {
+    last4hCycleTrigger = Number(JSON.parse(trigRow.value));
+  }
+} catch (e) {}
 try {
   const configRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring_config_4h") as any;
   if (configRow) {
@@ -2092,7 +2142,8 @@ async function executeAutoTradingBackend4h(cycleId: number) {
         minOrderAmount: { enabled: true, value: '20' },
         fixedOrderAmount: { enabled: false, value: '100' },
         stopLossMultiplier: { enabled: true, value: '0.985' },
-        takeProfitMultiplier: { enabled: true, value: '1.05' }
+        takeProfitMultiplier: { enabled: true, value: '1.05' },
+        timeoutPriceClose: { enabled: true, hours: '24', multiplier: '1.5' }
       };
     }
 
@@ -2126,8 +2177,9 @@ async function executeAutoTradingBackend4h(cycleId: number) {
   const pad = (n: number) => n.toString().padStart(2, '0');
   // 增加详细的完整日期 (YYYY-MM-DD HH:mm:ss)
   const scanTimeStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-  const cycleEnd = Math.floor(now.getHours() / 4) * 4;
-  const cycleStart = (cycleEnd - 4 + 24) % 24;
+  // 正确计算所属 4H 周期起点与终点 (例如 15:58:30 属于 12:00~16:00, 03:58:30 属于 00:00~04:00)
+  const cycleStart = Math.floor(now.getHours() / 4) * 4;
+  const cycleEnd = (cycleStart + 4) % 24;
   const cycleStr = `${pad(cycleStart)}:00~${pad(cycleEnd)}:00 (4H)`;
 
   // 判断用户是否开启了筛选设置中的任何一项条件
@@ -2639,13 +2691,12 @@ function runBackgroundMonitor4h() {
     }
 
     // 检查 4H 监控与自动交易状态 (只要开启了 4H 监控或者开启了自动交易策略，后台均持续巡检与执行，关闭网页后不间断)
-    let isAutoTradingOn = false;
     try {
       const autoRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_auto_trading") as any;
-      if (autoRow) isAutoTradingOn = Boolean(JSON.parse(autoRow.value));
+      if (autoRow) isAutoTrading4h = Boolean(JSON.parse(autoRow.value));
     } catch (e) {}
 
-    const shouldRunCycle = isRunning4h || isAutoTradingOn;
+    const shouldRunCycle = isRunning4h || isAutoTrading4h;
     if (!shouldRunCycle) return;
     
     // Check 1h volume spike scan trigger
@@ -2674,6 +2725,9 @@ function runBackgroundMonitor4h() {
     // 当周期内的当前秒数达到或超过目标时刻，且本周期尚未执行时触发（保证每个周期在后台精准执行一次，无论前端是否开启）
     if (totalSecondsInCycle >= effectiveTargetSec && last4hCycleTrigger !== currentCycleStart) {
       last4hCycleTrigger = currentCycleStart;
+      try {
+        db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run("monitoring4h_last_cycle_trigger", JSON.stringify(currentCycleStart));
+      } catch (e) {}
       await runCycleScan4h(true);
       executeAutoTradingBackend4h(currentCycleStart).catch(err => {
         console.error('[4H自动策略-后端执行异常]:', err);
@@ -2682,6 +2736,171 @@ function runBackgroundMonitor4h() {
   }, 1000);
 }
 runBackgroundMonitor4h();
+
+// 24小时后台常驻持仓风控巡检（即使关闭前端网页，策略仍持续在后台巡检）
+// 核心规则：条件D（超时未达预期倍数平仓）满设定小时数（默认24h）若价格未超开仓价设定倍数（默认1.5倍），自动市价平仓
+let isCheckingPositionRiskBackend = false;
+async function checkPositionsRiskBackend() {
+  if (isCheckingPositionRiskBackend) return;
+  isCheckingPositionRiskBackend = true;
+  try {
+    let apiConfig: any = null;
+    const apiRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("apiConfig") as any;
+    if (apiRow) {
+      try { apiConfig = JSON.parse(apiRow.value); } catch {}
+    }
+    if (!apiConfig || !apiConfig.apiKey) {
+      try {
+        const credRow = db.prepare("SELECT * FROM api_credentials LIMIT 1").get() as any;
+        if (credRow && credRow.api_key && credRow.api_secret) {
+          apiConfig = {
+            accountName: credRow.account_name,
+            apiKey: credRow.api_key,
+            apiSecret: credRow.api_secret,
+            baseUrl: credRow.base_url || 'https://fapi.binance.com'
+          };
+        }
+      } catch (e) {}
+    }
+    if (!apiConfig || !apiConfig.apiKey || !apiConfig.apiSecret) {
+      isCheckingPositionRiskBackend = false;
+      return;
+    }
+
+    // 1. 获取币安持仓
+    const posRes = await callBinanceSigned(
+      '/fapi/v2/positionRisk',
+      'GET',
+      {},
+      apiConfig.apiKey,
+      apiConfig.apiSecret,
+      apiConfig.baseUrl
+    );
+    if (!Array.isArray(posRes)) {
+      isCheckingPositionRiskBackend = false;
+      return;
+    }
+    const activePositions = posRes.filter((p: any) => Math.abs(parseFloat(p.positionAmt || '0')) > 0);
+    if (activePositions.length === 0) {
+      isCheckingPositionRiskBackend = false;
+      return;
+    }
+
+    // 2. 获取该账户保存的风控配置及4H下单设置中的默认超时设置
+    let allConfigs: Record<string, any> = {};
+    try {
+      const arcRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("accountPositionRiskConfigs") as any;
+      if (arcRow) allConfigs = JSON.parse(arcRow.value);
+    } catch (e) {}
+    const accountKey = apiConfig.accountName || 'default';
+    const accountConfigs = allConfigs[accountKey] || {};
+
+    let orderSettings: any = null;
+    try {
+      const osRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("monitoring4h_order_settings") as any;
+      if (osRow) orderSettings = JSON.parse(osRow.value);
+    } catch (e) {}
+    const defaultHours = Number(orderSettings?.timeoutPriceClose?.hours) || 24;
+    const defaultMultiplier = Number(orderSettings?.timeoutPriceClose?.multiplier) || 1.5;
+    const defaultEnabled = orderSettings?.timeoutPriceClose?.enabled ?? true;
+
+    const now = Date.now();
+    let exInfo: any = null;
+
+    for (const p of activePositions) {
+      const sym = p.symbol;
+      const posAmt = parseFloat(p.positionAmt);
+      const isLong = posAmt > 0;
+      const posId = `${sym}_${isLong ? 'BUY' : 'SELL'}`;
+      const entryPrice = parseFloat(p.entryPrice) || 0;
+      const markPrice = parseFloat(p.markPrice) || marketDataManager.getSymbolPrice(sym) || 0;
+      if (entryPrice <= 0 || markPrice <= 0) continue;
+
+      const posCfg = accountConfigs[posId] || accountConfigs[sym];
+      const tpc = posCfg?.timeoutPriceControl;
+
+      const isEnabled = tpc?.enabled !== undefined ? Boolean(tpc.enabled) : defaultEnabled;
+      if (!isEnabled) continue;
+
+      const timeoutHours = Number(tpc?.timeoutHours) || defaultHours;
+      const targetMultiplier = Number(tpc?.priceMultiplier) || defaultMultiplier;
+      const timeoutMs = timeoutHours * 3600 * 1000;
+
+      // 下单开始时间：优先取风控激活时间，其次取币安更新时间
+      const orderStartTime = Number(tpc?.activatedAt) || Number(p.updateTime) || now;
+      const elapsed = now - orderStartTime;
+
+      if (elapsed >= timeoutMs) {
+        const currentPriceRatio = isLong ? (markPrice / entryPrice) : (entryPrice / markPrice);
+        if (currentPriceRatio < targetMultiplier) {
+          addMonitorLog4h(
+            `[4H超时平仓-后台常驻] ⏱️ 仓单 ${sym} (${isLong ? '多单' : '空单'}) 已满 ${timeoutHours} 小时，当前价格 (${markPrice}) 未达到开仓价 (${entryPrice}) 的 ${targetMultiplier} 倍 (当前倍数: ${currentPriceRatio.toFixed(2)}x)，后台常驻策略自动市价平仓出场！`,
+            'TRADE'
+          );
+
+          if (!exInfo) {
+            try { exInfo = await getBackendExchangeInfo(); } catch (e) {}
+          }
+
+          // 1. 撤销该币对所有历史委托单
+          try {
+            await callBinanceSigned(
+              '/fapi/v1/allOpenOrders',
+              'DELETE',
+              { symbol: sym },
+              apiConfig.apiKey,
+              apiConfig.apiSecret,
+              apiConfig.baseUrl
+            );
+          } catch (e) {}
+
+          // 2. 市价平仓
+          const formattedQty = formatQtyForBackend(sym, Math.abs(posAmt), exInfo);
+          const closeParams: any = {
+            symbol: sym,
+            side: isLong ? 'SELL' : 'BUY',
+            type: 'MARKET',
+            quantity: formattedQty,
+            reduceOnly: 'true'
+          };
+          if (p.positionSide && p.positionSide !== 'BOTH') {
+            closeParams.positionSide = p.positionSide;
+            delete closeParams.reduceOnly;
+          }
+
+          try {
+            const closeRes = await callBinanceSigned(
+              '/fapi/v1/order',
+              'POST',
+              closeParams,
+              apiConfig.apiKey,
+              apiConfig.apiSecret,
+              apiConfig.baseUrl
+            );
+            if (closeRes && (closeRes.orderId || closeRes.clientOrderId)) {
+              addMonitorLog4h(`[4H超时平仓-后台常驻] ✅ ${sym} 超时平仓市价单执行成功！订单ID: ${closeRes.orderId || closeRes.clientOrderId}`, 'SUCCESS');
+            } else {
+              addMonitorLog4h(`[4H超时平仓-后台常驻] ❌ ${sym} 超时平仓失败: ${closeRes?.msg || '未知原因'}`, 'ERROR');
+            }
+          } catch (err: any) {
+            addMonitorLog4h(`[4H超时平仓-后台常驻] ❌ ${sym} 平仓接口异常: ${err?.message || err}`, 'ERROR');
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[4H超时风控-后端检查异常]:', e);
+  } finally {
+    isCheckingPositionRiskBackend = false;
+  }
+}
+
+function runBackgroundPositionRiskLoop() {
+  setInterval(() => {
+    checkPositionsRiskBackend().catch(() => {});
+  }, 5000);
+}
+runBackgroundPositionRiskLoop();
 
 // 周期性（每 1 秒）高频 SSE 广播：
 // 1. 全市场实时价格 (0 API 消耗，直接读取内存)
@@ -2727,6 +2946,7 @@ setInterval(() => {
     type: '4H_STATUS',
     data: {
       isRunning: Boolean(isRunning4h),
+      isAutoTrading: Boolean(isAutoTrading4h),
       config: config4h,
       scanStats: scanStats4h,
       results: enriched4h,
@@ -2960,6 +3180,10 @@ async function startServer() {
       const transaction = db.transaction((settings: Record<string, any>) => {
         for (const [key, value] of Object.entries(settings)) {
           insert.run(key, JSON.stringify(value));
+          if (key === 'monitoring4h_auto_trading') {
+            isAutoTrading4h = Boolean(value);
+            broadcastSSE({ type: '4H_AUTO_TRADING_STATUS', data: { isAutoTrading: isAutoTrading4h } });
+          }
         }
       });
       transaction(req.body);
@@ -2993,6 +3217,7 @@ async function startServer() {
       },
       status4h: {
         isRunning: Boolean(isRunning4h),
+        isAutoTrading: Boolean(isAutoTrading4h),
         config: config4h,
         scanStats: scanStats4h,
         results: enrichedInitial4h,
@@ -3137,6 +3362,7 @@ async function startServer() {
     const currentResults = getFullResults4h();
     res.json({
       isRunning: Boolean(isRunning4h),
+      isAutoTrading: Boolean(isAutoTrading4h),
       config: config4h,
       scanStats: scanStats4h,
       results: currentResults,
@@ -3191,6 +3417,7 @@ async function startServer() {
       type: '4H_STATUS',
       data: {
         isRunning: Boolean(isRunning4h),
+        isAutoTrading: Boolean(isAutoTrading4h),
         config: config4h,
         scanStats: scanStats4h,
         results: currentResults,
@@ -3218,6 +3445,7 @@ async function startServer() {
       success: true,
       status: "success",
       isRunning: isRunning4h,
+      isAutoTrading: isAutoTrading4h,
       results: currentResults,
       fourHourBoards: {
         gainers: currentResults.gainers,
@@ -3235,6 +3463,32 @@ async function startServer() {
       },
       scanStats: scanStats4h
     });
+  });
+
+  // 4H 自动交易策略全局开关 API (服务端 SQLite 唯一权威源，跨任意设备实时同步)
+  app.post("/api/monitoring-4h/toggle-auto", (req, res) => {
+    try {
+      if (typeof req.body?.isAuto === "boolean") {
+        isAutoTrading4h = req.body.isAuto;
+      } else {
+        isAutoTrading4h = !isAutoTrading4h;
+      }
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run("monitoring4h_auto_trading", JSON.stringify(isAutoTrading4h));
+      broadcastSSE({ type: '4H_AUTO_TRADING_STATUS', data: { isAutoTrading: isAutoTrading4h } });
+      broadcastSSE({
+        type: '4H_STATUS',
+        data: {
+          isRunning: Boolean(isRunning4h),
+          isAutoTrading: Boolean(isAutoTrading4h),
+          config: config4h,
+          scanStats: scanStats4h,
+          results: getFullResults4h()
+        }
+      });
+      res.json({ success: true, isAutoTrading: isAutoTrading4h });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   });
 
   app.post("/api/monitoring-4h/config", (req, res) => {
@@ -3377,8 +3631,16 @@ async function startServer() {
   app.get("/api/screening-records", (req, res) => {
     try {
       const limit = parseInt(req.query.limit as string, 10) || 1000;
-      const records = db.prepare("SELECT * FROM screening_records ORDER BY scan_time DESC, created_at DESC LIMIT ?").all(limit);
-      res.json(records);
+      const records = db.prepare("SELECT * FROM screening_records ORDER BY scan_time DESC, created_at DESC LIMIT ?").all(limit) as any[];
+      const sanitized = records.map(r => {
+        const accurateCycle = getAccurate4hCycleStr(r.scan_time, r.scan_time_str, r.cycle_str);
+        return {
+          ...r,
+          cycle_str: accurateCycle,
+          cycleStr: accurateCycle
+        };
+      });
+      res.json(sanitized);
     } catch (e: any) {
       console.error("Failed to fetch screening_records:", e);
       res.status(500).json({ error: e.message });
@@ -3409,11 +3671,15 @@ async function startServer() {
       const insertMany = db.transaction((records: any[]) => {
         for (const r of records) {
           if (!r || !r.symbol) continue;
+          const sTime = r.scan_time || r.scanTime || Date.now();
+          const sTimeStr = r.scan_time_str || r.scanTimeStr || new Date().toISOString().replace('T', ' ').slice(0, 19);
+          const accurateCycle = getAccurate4hCycleStr(sTime, sTimeStr, r.cycle_str || r.cycleStr);
+
           insertStmt.run(
             r.id || `sr_${Date.now()}_${r.symbol}_${Math.random().toString(36).substring(2, 6)}`,
-            r.scan_time || r.scanTime || Date.now(),
-            r.scan_time_str || r.scanTimeStr || new Date().toISOString().replace('T', ' ').slice(0, 19),
-            r.cycle_str || r.cycleStr || '',
+            sTime,
+            sTimeStr,
+            accurateCycle,
             (r.symbol || '').toUpperCase(),
             r.current_price ?? r.currentPrice ?? 0,
             r.open_4h ?? r.open4h ?? 0,

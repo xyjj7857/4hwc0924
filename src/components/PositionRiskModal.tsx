@@ -68,9 +68,17 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
     if (config) {
       const cloned = JSON.parse(JSON.stringify(config));
       cloned.conditionControl = normalizeConditionControl(cloned.conditionControl);
+      if (!cloned.timeoutPriceControl) {
+        cloned.timeoutPriceControl = {
+          enabled: true,
+          timeoutHours: 24,
+          priceMultiplier: 1.5,
+          activatedAt: position?.openTime || position?.timestamp || Date.now()
+        };
+      }
       return cloned;
     }
-    if (position) return getDefaultPositionRiskConfig(position.id, position.symbol, position.side, entryPrice);
+    if (position) return getDefaultPositionRiskConfig(position.id, position.symbol, position.side, entryPrice, position.openTime || position.timestamp);
     return getDefaultPositionRiskConfig('default', '', 'BUY', 0);
   });
 
@@ -79,11 +87,19 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
     if (config) {
       const cloned = JSON.parse(JSON.stringify(config));
       cloned.conditionControl = normalizeConditionControl(cloned.conditionControl);
+      if (!cloned.timeoutPriceControl) {
+        cloned.timeoutPriceControl = {
+          enabled: true,
+          timeoutHours: 24,
+          priceMultiplier: 1.5,
+          activatedAt: position?.openTime || position?.timestamp || Date.now()
+        };
+      }
       setCurrentConfig(cloned);
     } else if (position) {
-      setCurrentConfig(getDefaultPositionRiskConfig(position.id, position.symbol, position.side, entryPrice));
+      setCurrentConfig(getDefaultPositionRiskConfig(position.id, position.symbol, position.side, entryPrice, position.openTime || position.timestamp));
     }
-  }, [config, position?.id, position?.symbol, position?.side, entryPrice]);
+  }, [config, position?.id, position?.symbol, position?.side, entryPrice, position?.openTime, position?.timestamp]);
 
   // 提交止盈止损时的加载状态与结果
   const [isSubmittingTpSl, setIsSubmittingTpSl] = useState(false);
@@ -115,6 +131,48 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
     const t = setInterval(update, 1000);
     return () => clearInterval(t);
   }, [currentConfig.timeControl.enabled, currentConfig.timeControl.activatedAt, currentConfig.timeControl.maxHoldMinutes]);
+
+  // 弹窗内实时超时未达倍数风控倒计时与统计展示 (每张仓单各自独立统计)
+  const [timeoutPriceCountdown, setTimeoutPriceCountdown] = useState<{
+    elapsedHours: number;
+    leftHours: number;
+    leftMins: number;
+    leftSecs: number;
+    isTimeout: boolean;
+    text: string;
+  }>({ elapsedHours: 0, leftHours: 24, leftMins: 0, leftSecs: 0, isTimeout: false, text: '' });
+
+  useEffect(() => {
+    const tpc = currentConfig.timeoutPriceControl;
+    if (!tpc?.enabled) {
+      setTimeoutPriceCountdown({ elapsedHours: 0, leftHours: 24, leftMins: 0, leftSecs: 0, isTimeout: false, text: '' });
+      return;
+    }
+    const update = () => {
+      const orderStartTime = tpc.activatedAt || position?.openTime || position?.timestamp || Date.now();
+      const totalHours = Number(tpc.timeoutHours) || 24;
+      const totalMs = totalHours * 3600 * 1000;
+      const elapsedMs = Math.max(0, Date.now() - orderStartTime);
+      const elapsedHours = elapsedMs / (3600 * 1000);
+      const leftMs = totalMs - elapsedMs;
+      const isTimeout = leftMs <= 0;
+      const totalSec = Math.max(0, Math.floor(leftMs / 1000));
+      const leftH = Math.floor(totalSec / 3600);
+      const leftM = Math.floor((totalSec % 3600) / 60);
+      const leftS = totalSec % 60;
+
+      let text = '';
+      if (isTimeout) {
+        text = `已满 ${totalHours} 小时 (已持仓 ${elapsedHours.toFixed(1)}h)`;
+      } else {
+        text = `剩余 ${leftH} 小时 ${leftM} 分 ${leftS} 秒 (已持仓 ${elapsedHours.toFixed(1)}h / 设定 ${totalHours}h)`;
+      }
+      setTimeoutPriceCountdown({ elapsedHours, leftHours: leftH, leftMins: leftM, leftSecs: leftS, isTimeout, text });
+    };
+    update();
+    const t = setInterval(update, 1000);
+    return () => clearInterval(t);
+  }, [currentConfig.timeoutPriceControl, position?.openTime, position?.timestamp]);
 
   // 快捷动态联动计算：止盈
   const calculatedTpPrice = useMemo(() => {
@@ -530,6 +588,8 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
 
     // 规则 4.a: 这一条件在用户设置完成、关闭子界面的时刻开始生效
     const isTimeControlActive = currentConfig.timeControl.enabled;
+    const isTimeoutPriceActive = currentConfig.timeoutPriceControl?.enabled ?? true;
+
     const finalConfig: PositionRiskConfig = {
       ...currentConfig,
       positionId: position.id,
@@ -538,6 +598,12 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
       timeControl: {
         ...currentConfig.timeControl,
         activatedAt: isTimeControlActive ? (currentConfig.timeControl.activatedAt || Date.now()) : undefined
+      },
+      timeoutPriceControl: {
+        enabled: isTimeoutPriceActive,
+        timeoutHours: Number(currentConfig.timeoutPriceControl?.timeoutHours) || 24,
+        priceMultiplier: Number(currentConfig.timeoutPriceControl?.priceMultiplier) || 1.5,
+        activatedAt: currentConfig.timeoutPriceControl?.activatedAt || position.openTime || position.timestamp || Date.now()
       }
     };
 
@@ -549,6 +615,9 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
     }
     if (finalConfig.conditionControl.enabled) {
       addLog(`[条件风控] 已为持仓 ${position.symbol} 启用条件风控 (阶梯分批平仓 & 动态回撤移动止损已生效)`, 'SUCCESS');
+    }
+    if (finalConfig.timeoutPriceControl.enabled) {
+      addLog(`[超时平仓风控] 已为持仓 ${position.symbol} 启用超时未超开仓价倍数平仓 (${finalConfig.timeoutPriceControl.timeoutHours}小时内未超${finalConfig.timeoutPriceControl.priceMultiplier}倍自动平仓)`, 'SUCCESS');
     }
 
     onClose();
@@ -1379,6 +1448,185 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
               </div>
 
             </div>
+          </div>
+
+          {/* 条件 D: 超时未达预期倍数平仓 (自下单开始满设定小时数，若币价未超过开仓价设定倍数则自动平仓，默认开启: 24小时，2倍) */}
+          <div className={`p-4 rounded-xl border transition-all ${
+            (currentConfig.timeoutPriceControl?.enabled ?? true)
+              ? 'bg-amber-950/20 border-amber-500/40 shadow-sm shadow-amber-500/10'
+              : 'bg-[#18181A] border-[#27272A]'
+          }`}>
+            <div className="flex items-center justify-between mb-3 pb-2 border-b border-zinc-800/80">
+              <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                <input 
+                  type="checkbox"
+                  checked={currentConfig.timeoutPriceControl?.enabled ?? true}
+                  onChange={(e) => {
+                    const isChecked = e.target.checked;
+                    setCurrentConfig(prev => ({
+                      ...prev,
+                      timeoutPriceControl: {
+                        ...(prev.timeoutPriceControl || { timeoutHours: 24, priceMultiplier: 1.5 }),
+                        enabled: isChecked,
+                        activatedAt: isChecked ? (prev.timeoutPriceControl?.activatedAt || position.openTime || position.timestamp || Date.now()) : undefined
+                      }
+                    }));
+                  }}
+                  className="w-4 h-4 rounded text-amber-500 bg-zinc-900 border-zinc-700 focus:ring-amber-500"
+                />
+                <div className="flex items-center gap-1.5">
+                  <Timer size={16} className={(currentConfig.timeoutPriceControl?.enabled ?? true) ? 'text-amber-400' : 'text-zinc-400'} />
+                  <span className="text-sm font-bold text-white">条件 D：超时涨幅未达预期平仓（默认开启）</span>
+                </div>
+              </label>
+
+              <span className={`text-[11px] px-2 py-0.5 rounded font-mono ${
+                (currentConfig.timeoutPriceControl?.enabled ?? true) ? 'bg-amber-500/20 text-amber-300 font-semibold' : 'bg-zinc-800 text-zinc-500'
+              }`}>
+                {(currentConfig.timeoutPriceControl?.enabled ?? true) ? '已勾选生效' : '未勾选'}
+              </span>
+            </div>
+
+            <p className="text-xs text-zinc-400 mb-3 leading-relaxed">
+              该仓单自下单开始后满设定小时数时，若币价未超过该仓单开仓价的设定倍数，则自动市价平仓。默认 24 小时未超 1.5 倍开仓价自动平仓。每张仓单独立统计各自数据。
+            </p>
+
+            {/* 参数配置区域 */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-center mb-4">
+              <div>
+                <label className="text-xs text-zinc-300 font-medium block mb-1.5 flex items-center justify-between">
+                  <span>检查等待时长 (小时)</span>
+                  <span className="text-[10px] text-zinc-500 font-mono">默认 24 小时</span>
+                </label>
+                <div className="relative">
+                  <input 
+                    type="number" 
+                    step="0.5"
+                    min="0.1"
+                    disabled={!(currentConfig.timeoutPriceControl?.enabled ?? true)}
+                    value={currentConfig.timeoutPriceControl?.timeoutHours ?? 24}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value) || 0;
+                      setCurrentConfig(prev => ({
+                        ...prev,
+                        timeoutPriceControl: {
+                          ...(prev.timeoutPriceControl || { enabled: true, priceMultiplier: 1.5 }),
+                          timeoutHours: val,
+                          enabled: prev.timeoutPriceControl?.enabled ?? true
+                        }
+                      }));
+                    }}
+                    className="w-full bg-[#121214] border border-[#333336] rounded-lg px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-amber-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    placeholder="24"
+                  />
+                  <Clock size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500" />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs text-zinc-300 font-medium block mb-1.5 flex items-center justify-between">
+                  <span>目标开仓价倍数 (倍)</span>
+                  <span className="text-[10px] text-zinc-500 font-mono">默认 1.5 倍</span>
+                </label>
+                <div className="relative">
+                  <input 
+                    type="number" 
+                    step="0.1"
+                    min="0.1"
+                    disabled={!(currentConfig.timeoutPriceControl?.enabled ?? true)}
+                    value={currentConfig.timeoutPriceControl?.priceMultiplier ?? 1.5}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value) || 0;
+                      setCurrentConfig(prev => ({
+                        ...prev,
+                        timeoutPriceControl: {
+                          ...(prev.timeoutPriceControl || { enabled: true, timeoutHours: 24 }),
+                          priceMultiplier: val,
+                          enabled: prev.timeoutPriceControl?.enabled ?? true
+                        }
+                      }));
+                    }}
+                    className="w-full bg-[#121214] border border-[#333336] rounded-lg px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-amber-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    placeholder="1.5"
+                  />
+                  <span className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 text-xs font-mono font-bold">x</span>
+                </div>
+              </div>
+            </div>
+
+            {/* 本张仓单独立统计面板 */}
+            {(() => {
+              const tpc = currentConfig.timeoutPriceControl || { enabled: true, timeoutHours: 24, priceMultiplier: 1.5 };
+              const targetMultiplier = Number(tpc.priceMultiplier) || 1.5;
+              const timeoutHours = Number(tpc.timeoutHours) || 24;
+              const currentPrice = position.markPrice || entryPrice;
+              const liveRatio = entryPrice > 0 ? (isLong ? currentPrice / entryPrice : entryPrice / currentPrice) : 1;
+              const targetThresholdPrice = isLong ? entryPrice * targetMultiplier : entryPrice / targetMultiplier;
+              const orderTimeStr = position.openTime || position.timestamp 
+                ? new Date(position.openTime || position.timestamp).toLocaleString()
+                : '当前持仓启动时刻';
+
+              const isReached = liveRatio >= targetMultiplier;
+              const isExpired = timeoutPriceCountdown.isTimeout;
+
+              return (
+                <div className="bg-[#0D0D0E] p-3 rounded-xl border border-zinc-800 space-y-2.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-zinc-400 font-semibold flex items-center gap-1.5">
+                      <Sliders size={13} className="text-amber-400" />
+                      本张仓单独立运行数据
+                    </span>
+                    <span className="text-zinc-500 font-mono text-[11px]">
+                      下单时间: {orderTimeStr}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono bg-[#141416] p-2.5 rounded-lg border border-zinc-800/80">
+                    <div>
+                      <span className="text-zinc-500 block text-[10px]">开仓基准价</span>
+                      <span className="text-emerald-400 font-bold">{formatPrice(position.symbol, entryPrice)}</span>
+                    </div>
+                    <div>
+                      <span className="text-zinc-500 block text-[10px]">目标达标价 ({targetMultiplier}x)</span>
+                      <span className="text-amber-300 font-bold">{formatPrice(position.symbol, targetThresholdPrice)}</span>
+                    </div>
+                    <div>
+                      <span className="text-zinc-500 block text-[10px]">当前最新价 (实时倍数)</span>
+                      <span className={`font-bold ${isReached ? 'text-emerald-400' : 'text-zinc-200'}`}>
+                        {formatPrice(position.symbol, currentPrice)} ({liveRatio.toFixed(2)}x)
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-zinc-500 block text-[10px]">已持仓时长</span>
+                      <span className="text-cyan-300 font-bold">{timeoutPriceCountdown.elapsedHours.toFixed(1)}h / {timeoutHours}h</span>
+                    </div>
+                  </div>
+
+                  {/* 状态诊断说明 */}
+                  <div className="text-[11px] leading-relaxed pt-1 border-t border-zinc-800/60">
+                    {isExpired ? (
+                      !isReached ? (
+                        <div className="text-rose-400 flex items-start gap-1.5 bg-rose-950/30 p-2 rounded border border-rose-500/30">
+                          <AlertTriangle size={14} className="shrink-0 mt-0.5 text-rose-400" />
+                          <span>已满 {timeoutHours} 小时且币价未超过开仓价的 {targetMultiplier} 倍 (当前仅 {liveRatio.toFixed(2)}x)，满足平仓条件，系统将自动市价全流程平仓出场！</span>
+                        </div>
+                      ) : (
+                        <div className="text-emerald-400 flex items-start gap-1.5 bg-emerald-950/30 p-2 rounded border border-emerald-500/30">
+                          <CheckCircle2 size={14} className="shrink-0 mt-0.5 text-emerald-400" />
+                          <span>已满 {timeoutHours} 小时且币价已达到 {liveRatio.toFixed(2)}x (超过 {targetMultiplier}x 目标)，无需超时平仓，继续享受趋势盈利！</span>
+                        </div>
+                      )
+                    ) : (
+                      <div className="text-amber-300 flex items-start gap-1.5 bg-amber-950/20 p-2 rounded border border-amber-500/20">
+                        <Clock size={14} className="shrink-0 mt-0.5 text-amber-400" />
+                        <span>倒计时监控中：{timeoutPriceCountdown.text || `剩余进行中...`}。若到达 {timeoutHours} 小时时刻币价仍未超过 {targetMultiplier} 倍将自动市价平仓。</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
           </div>
 
           {/* 规则 5 动态优先级提示横幅 */}

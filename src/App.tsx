@@ -59,7 +59,8 @@ import {
   getAllLocalPositionRiskConfigs,
   saveAllLocalPositionRiskConfigs,
   detectPositionTpSl,
-  normalizePositionRiskConfig
+  normalizePositionRiskConfig,
+  getDefaultPositionRiskConfig
 } from './types/positionRisk';
 import { 
   matchSymbolWithVerificationList, 
@@ -3418,8 +3419,7 @@ export default function App() {
     const currentConfigs = positionRiskConfigsRef.current;
 
     for (const pos of currentPositions) {
-      const cfg = currentConfigs[pos.id];
-      if (!cfg) continue;
+      const cfg = currentConfigs[pos.id] || getDefaultPositionRiskConfig(pos.id, pos.symbol, pos.side, pos.entryPrice, pos.openTime || pos.timestamp);
 
       // 若当前持仓已经在执行平仓出场流程中，避免重复触发
       if (closingPositionIdsRef.current.has(pos.id)) continue;
@@ -3814,6 +3814,42 @@ export default function App() {
                 }
               })();
             }
+          }
+        }
+      }
+
+      // 5. 检查条件D：超时未达预期倍数平仓 (自下单开始满X小时，币价未超开仓价Y倍自动平仓，默认开启: 24小时，1.5倍)
+      const tpc = cfg.timeoutPriceControl ?? { enabled: true, timeoutHours: 24, priceMultiplier: 1.5 };
+      if (tpc?.enabled) {
+        const timeoutHours = Number(tpc.timeoutHours) || 24;
+        const timeoutMs = timeoutHours * 3600 * 1000;
+        const orderStartTime = tpc.activatedAt || pos.openTime || pos.timestamp || now;
+        if (!tpc.activatedAt) {
+          handleSavePositionRiskConfig({
+            ...cfg,
+            timeoutPriceControl: {
+              ...tpc,
+              activatedAt: orderStartTime
+            }
+          });
+        }
+
+        const elapsed = now - orderStartTime;
+        if (elapsed >= timeoutMs) {
+          const isLong = pos.side === 'BUY';
+          const targetMultiplier = Number(tpc.priceMultiplier) || 1.5;
+          const currentPriceRatio = pos.entryPrice > 0 
+            ? (isLong ? currentMarkPrice / pos.entryPrice : pos.entryPrice / currentMarkPrice) 
+            : 1;
+
+          if (currentPriceRatio < targetMultiplier && currentMarkPrice > 0 && pos.entryPrice > 0) {
+            const reason = `⏱️ 超时未达预期倍数平仓触发 (下单已满 ${timeoutHours} 小时, 当前倍数 ${currentPriceRatio.toFixed(2)}x 未超 ${targetMultiplier}x)`;
+            addLogRef.current(
+              `[超时风控触发] ⏱️ 仓单 ${pos.symbol} (${isLong ? '多单' : '空单'}) 下单已满 ${timeoutHours} 小时，当前币价 (${currentMarkPrice}) 未达到开仓价 (${pos.entryPrice}) 的 ${targetMultiplier} 倍 (当前仅 ${currentPriceRatio.toFixed(2)} 倍)，立即执行全流程平仓出场！`,
+              'WARN'
+            );
+            handleClosePositionRef.current(pos.id, currentPositions, reason);
+            continue;
           }
         }
       }

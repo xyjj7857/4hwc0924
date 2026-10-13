@@ -42,7 +42,7 @@ import { TradeLog, Position } from '../types';
 import BoardRecordModal from './BoardRecordModal';
 import FilterSettingsModal4h, { FilterSettings4h, DEFAULT_FILTER_SETTINGS_4H } from './FilterSettingsModal4h';
 import OrderSettingsModal4h, { OrderSettings4h, DEFAULT_ORDER_SETTINGS_4H } from './OrderSettingsModal4h';
-import { ScreeningRecordsModal, ScreeningRecord } from './ScreeningRecordsModal';
+import { ScreeningRecordsModal, ScreeningRecord, getAccurate4hCycleStr } from './ScreeningRecordsModal';
 import { matchSymbolWithPositions } from '../utils/entryVerification';
 import { useMarketPrices } from '../context/MarketPriceContext';
 
@@ -458,7 +458,8 @@ export default function MonitoringAssistant4h({
         return {
           ...DEFAULT_ORDER_SETTINGS_4H,
           ...parsed,
-          maxPositionCount: parsed.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount
+          maxPositionCount: parsed.maxPositionCount || DEFAULT_ORDER_SETTINGS_4H.maxPositionCount,
+          timeoutPriceClose: parsed.timeoutPriceClose || DEFAULT_ORDER_SETTINGS_4H.timeoutPriceClose
         };
       }
     } catch {}
@@ -479,7 +480,15 @@ export default function MonitoringAssistant4h({
   const [screeningRecords, setScreeningRecords] = useState<ScreeningRecord[]>(() => {
     try {
       const saved = localStorage.getItem('monitoring4h_screening_records');
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          return parsed.map((r: any) => ({
+            ...r,
+            cycleStr: getAccurate4hCycleStr(r.scanTime, r.scanTimeStr, r.cycleStr)
+          }));
+        }
+      }
     } catch {}
     return [];
   });
@@ -494,7 +503,7 @@ export default function MonitoringAssistant4h({
             id: d.id,
             scanTime: d.scan_time || d.scanTime,
             scanTimeStr: d.scan_time_str || d.scanTimeStr,
-            cycleStr: d.cycle_str || d.cycleStr || '',
+            cycleStr: getAccurate4hCycleStr(d.scan_time || d.scanTime, d.scan_time_str || d.scanTimeStr, d.cycle_str || d.cycleStr || ''),
             symbol: d.symbol,
             currentPrice: d.current_price ?? d.currentPrice ?? 0,
             open4h: d.open_4h ?? d.open4h ?? 0,
@@ -524,8 +533,12 @@ export default function MonitoringAssistant4h({
   // 保存筛选记录辅助函数 (双重持久化: 状态 + 本地数据库 + localStorage)
   const saveScreeningRecords = useCallback((newRecords: ScreeningRecord[]) => {
     if (newRecords.length === 0) return;
+    const sanitized = newRecords.map(r => ({
+      ...r,
+      cycleStr: getAccurate4hCycleStr(r.scanTime, r.scanTimeStr, r.cycleStr)
+    }));
     setScreeningRecords(prev => {
-      const updated = [...newRecords, ...prev].slice(0, 1000);
+      const updated = [...sanitized, ...prev].slice(0, 1000);
       try {
         localStorage.setItem('monitoring4h_screening_records', JSON.stringify(updated.slice(0, 500)));
       } catch {}
@@ -535,7 +548,7 @@ export default function MonitoringAssistant4h({
     fetch('/api/screening-records', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: newRecords })
+      body: JSON.stringify({ records: sanitized })
     }).catch(err => console.warn('Failed to save screening records to backend DB:', err));
   }, []);
 
@@ -713,6 +726,13 @@ export default function MonitoringAssistant4h({
         monitoring4h_filter_settings: filterSettings,
         monitoring4h_order_settings: orderSettings
       });
+      // 并立即调用后端专用 toggle-auto 接口广播给所有设备
+      fetch('/api/monitoring-4h/toggle-auto', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isAuto: next })
+      }).catch(() => {});
+
       if (next) {
         const sm = filterSettings.scanMoment || { hour: 3, minute: 58, second: 30 };
         const maxPos = orderSettings.maxPositionCount?.enabled !== false ? (orderSettings.maxPositionCount?.value || '10') : '10';
@@ -779,7 +799,8 @@ export default function MonitoringAssistant4h({
       orderSettings.minOrderAmount.enabled ||
       orderSettings.fixedOrderAmount.enabled ||
       orderSettings.stopLossMultiplier.enabled ||
-      orderSettings.takeProfitMultiplier.enabled
+      orderSettings.takeProfitMultiplier.enabled ||
+      orderSettings.timeoutPriceClose?.enabled
     );
   }, [orderSettings]);
 
@@ -792,7 +813,8 @@ export default function MonitoringAssistant4h({
       orderSettings.minOrderAmount.enabled,
       orderSettings.fixedOrderAmount.enabled,
       orderSettings.stopLossMultiplier.enabled,
-      orderSettings.takeProfitMultiplier.enabled
+      orderSettings.takeProfitMultiplier.enabled,
+      orderSettings.timeoutPriceClose?.enabled
     ].filter(Boolean).length;
   }, [orderSettings]);
 
@@ -2734,6 +2756,10 @@ export default function MonitoringAssistant4h({
       if (typeof sse4h.isRunning === 'boolean') {
         setIsRunning(Boolean(sse4h.isRunning));
       }
+      if (typeof sse4h.isAutoTrading === 'boolean') {
+        setIsAutoTradingActive(Boolean(sse4h.isAutoTrading));
+        try { localStorage.setItem('monitoring4h_auto_trading', String(sse4h.isAutoTrading)); } catch {}
+      }
       if (sse4h.config) {
         setConfig(sse4h.config);
         if (sse4h.config.volumeKCount && !localStorage.getItem('monitor_4h_volume_k_count')) {
@@ -2780,7 +2806,7 @@ export default function MonitoringAssistant4h({
     }
   }, [contextFundingRates]);
 
-  // Initial status fetch on mount
+  // Initial status fetch on mount & periodic sync
   useEffect(() => {
     const fetchStatus = async () => {
       try {
@@ -2790,6 +2816,10 @@ export default function MonitoringAssistant4h({
           if (!text || text.trim().startsWith('<')) return;
           const data = JSON.parse(text);
           setIsRunning(data.isRunning);
+          if (typeof data.isAutoTrading === 'boolean') {
+            setIsAutoTradingActive(Boolean(data.isAutoTrading));
+            try { localStorage.setItem('monitoring4h_auto_trading', String(data.isAutoTrading)); } catch {}
+          }
           if (data.config) setConfig(data.config);
           setScanStats(data.scanStats);
           if (data.results) {
@@ -2816,6 +2846,8 @@ export default function MonitoringAssistant4h({
       }
     };
     fetchStatus();
+    const statusTimer = setInterval(fetchStatus, 4000);
+    return () => clearInterval(statusTimer);
   }, []);
 
   // Live clock & 4H cycle countdown calculation (single source of truth matching 15M architecture)
