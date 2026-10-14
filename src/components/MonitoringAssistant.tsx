@@ -279,6 +279,17 @@ export default function MonitoringAssistant({
   const [isAlerting, setIsAlerting] = useState(false);
   const [activeAlert, setActiveAlert] = useState<'gain' | 'loss' | 'amp' | null>(null);
 
+  // 统一 15M 服务端 SQLite settings 持久化工具函数
+  const saveDbSettings = useCallback((patch: Record<string, any>) => {
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    }).catch(err => {
+      console.warn('Failed to sync 15m settings to SQLite database:', err);
+    });
+  }, []);
+
   // --- 区域 1 折叠状态持久化控制 ---
   const [isArea1Collapsed, setIsArea1Collapsed] = useState<boolean>(() => {
     try {
@@ -295,9 +306,10 @@ export default function MonitoringAssistant({
       try {
         localStorage.setItem('area1_collapsed_15m', String(next));
       } catch {}
+      saveDbSettings({ area1_collapsed_15m: next });
       return next;
     });
-  }, []);
+  }, [saveDbSettings]);
 
   // --- 区域 2 各个榜单模块的独立向上折叠状态控制 ---
   const [collapsedModules, setCollapsedModules] = useState<Record<string, boolean>>(() => {
@@ -316,9 +328,10 @@ export default function MonitoringAssistant({
       try {
         localStorage.setItem('area2_collapsed_modules_15m', JSON.stringify(next));
       } catch {}
+      saveDbSettings({ area2_collapsed_modules_15m: next });
       return next;
     });
-  }, []);
+  }, [saveDbSettings]);
 
   const collapseAllModules = () => {
     const all = {
@@ -332,6 +345,7 @@ export default function MonitoringAssistant({
     try {
       localStorage.setItem('area2_collapsed_modules_15m', JSON.stringify(all));
     } catch {}
+    saveDbSettings({ area2_collapsed_modules_15m: all });
   };
 
   const expandAllModules = () => {
@@ -339,6 +353,7 @@ export default function MonitoringAssistant({
     try {
       localStorage.removeItem('area2_collapsed_modules_15m');
     } catch {}
+    saveDbSettings({ area2_collapsed_modules_15m: {} });
   };
 
   // --- 自定义 量k 数量 (默认 12 条，取当前未完结 15m 前 N 根完整 K 线的最低交易额 USDT) ---
@@ -352,16 +367,6 @@ export default function MonitoringAssistant({
     } catch {}
     return 12;
   });
-
-  const saveDbSettings = useCallback((patch: Record<string, any>) => {
-    fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch)
-    }).catch(err => {
-      console.warn('Failed to sync 15m settings to SQLite database:', err);
-    });
-  }, []);
 
   const handleUpdateVolumeKCount = useCallback(async (val: number) => {
     const clamped = Math.max(1, Math.min(30, val));
@@ -469,6 +474,17 @@ export default function MonitoringAssistant({
         if (settings.monitor_15m_sort_scheme === 'fixed' || settings.monitor_15m_sort_scheme === 'dynamic') {
           setSortScheme(settings.monitor_15m_sort_scheme);
           try { localStorage.setItem('monitor_15m_sort_scheme', settings.monitor_15m_sort_scheme); } catch {}
+        }
+        if (settings.area1_collapsed_15m !== undefined) {
+          setIsArea1Collapsed(Boolean(settings.area1_collapsed_15m));
+          try { localStorage.setItem('area1_collapsed_15m', String(settings.area1_collapsed_15m)); } catch {}
+        }
+        if (settings.area2_collapsed_modules_15m && typeof settings.area2_collapsed_modules_15m === 'object') {
+          setCollapsedModules(settings.area2_collapsed_modules_15m);
+          try { localStorage.setItem('area2_collapsed_modules_15m', JSON.stringify(settings.area2_collapsed_modules_15m)); } catch {}
+        }
+        if (settings.monitoring_config_15m && typeof settings.monitoring_config_15m === 'object') {
+          setConfig(prev => ({ ...prev, ...settings.monitoring_config_15m }));
         }
       })
       .catch(err => {

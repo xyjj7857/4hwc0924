@@ -51,9 +51,13 @@ import { EntryVerificationModal } from './components/EntryVerificationModal';
 import { EntryVerificationAlert, VerificationAlertState } from './components/EntryVerificationAlert';
 import { PositionRiskModal } from './components/PositionRiskModal';
 import { PositionRiskButton } from './components/PositionRiskButton';
+import { BatchRiskCandDModal } from './components/BatchRiskCandDModal';
+import { SettingsBackupModal } from './components/SettingsBackupModal';
 import { useMarketPrices } from './context/MarketPriceContext';
 import { 
   PositionRiskConfig, 
+  ConditionControlConfig,
+  TimeoutPriceControlConfig,
   getLocalPositionRiskConfigs, 
   saveLocalPositionRiskConfigs,
   getAllLocalPositionRiskConfigs,
@@ -436,6 +440,9 @@ export default function App() {
   const [isAlarmModalOpen, setIsAlarmModalOpen] = useState(false);
   const [isKellyModalOpen, setIsKellyModalOpen] = useState(false);
   const [isVerificationModalOpen, setIsVerificationModalOpen] = useState(false);
+  const [isSettingsBackupModalOpen, setIsSettingsBackupModalOpen] = useState(false);
+  const [isBatchRiskModalOpen, setIsBatchRiskModalOpen] = useState(false);
+  const loadFromDbRef = useRef<() => Promise<void>>(async () => {});
   const [verificationList, setVerificationList] = useState<string[]>(() => getLocalVerificationList());
   const [verificationAlert, setVerificationAlert] = useState<VerificationAlertState | null>(null);
   const [ringingAlarm, setRingingAlarm] = useState<AlarmItem | null>(null);
@@ -498,6 +505,96 @@ export default function App() {
     const tpStr = updated.tpSlControl?.tpEnabled ? `${updated.tpSlControl.tpPrice || updated.tpSlControl.tpPercent + '%'} (${updated.tpSlControl.tpMode})` : '关';
     const slStr = updated.tpSlControl?.slEnabled ? `${updated.tpSlControl.slPrice || updated.tpSlControl.slPercent + '%'} (${updated.tpSlControl.slMode})` : '关';
     addLogRef.current?.(`[风控设置] [账户: ${currentAccount}] 已保存 ${updated.symbol} (${updated.side === 'BUY' ? '多' : '空'}) 风控策略 (时间: ${tcStr}, 止盈: ${tpStr}, 止损: ${slStr})`, 'INFO', 'RISK_SETTING', updated.symbol);
+    setTimeout(() => {
+      checkPositionsRiskRef.current?.();
+    }, 50);
+  }, []);
+
+  // 一键调整所有持仓仓单的 条件C 和 条件D 参数 (本地缓存 + 服务端 SQLite settings 双重持久化)
+  const handleBatchApplyConditionCandD = useCallback((
+    conditionControl: ConditionControlConfig,
+    timeoutPriceControl: TimeoutPriceControlConfig
+  ) => {
+    const currentAccount = apiConfigRef.current?.accountName || 'default';
+    const currentPositions = positionsRef.current || [];
+    if (currentPositions.length === 0) {
+      addLogRef.current?.('[一键批量风控] 当前无活跃合约持仓仓单', 'WARN');
+      return;
+    }
+
+    setPositionRiskConfigs(prev => {
+      const next = { ...prev };
+      for (const pos of currentPositions) {
+        const existing = next[pos.id] || getDefaultPositionRiskConfig(
+          pos.id,
+          pos.symbol,
+          pos.side,
+          pos.entryPrice,
+          pos.openTime || pos.timestamp
+        );
+
+        next[pos.id] = {
+          ...existing,
+          conditionControl: {
+            ...conditionControl,
+            // 复制阶梯平仓规则配置，重置执行状态
+            stageCloseRules: (conditionControl.stageCloseRules || []).map(r => ({
+              ...r,
+              executed: false,
+              executedAt: undefined,
+              executedAmount: undefined
+            })),
+            trailingStopRule: {
+              ...conditionControl.trailingStopRule,
+              lastAdjustedN: undefined,
+              currentAlgoId: undefined,
+              currentStopPrice: undefined
+            }
+          },
+          timeoutPriceControl: {
+            enabled: timeoutPriceControl.enabled,
+            timeoutHours: timeoutPriceControl.timeoutHours,
+            priceMultiplier: timeoutPriceControl.priceMultiplier,
+            activatedAt: existing.timeoutPriceControl?.activatedAt || pos.openTime || pos.timestamp || Date.now()
+          }
+        };
+      }
+
+      positionRiskConfigsRef.current = next;
+
+      // 1. 本地存储：按当前登录账号持久化隔离
+      saveLocalPositionRiskConfigs(next, currentAccount);
+
+      // 2. 更新内存全局映射
+      allAccountRiskConfigsRef.current[currentAccount] = next;
+      saveAllLocalPositionRiskConfigs(allAccountRiskConfigsRef.current);
+
+      // 3. 服务端 SQLite 持久化：保存所有账户字典及当前账户专属字段
+      fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          accountPositionRiskConfigs: allAccountRiskConfigsRef.current,
+          [`positionRiskConfigs_${currentAccount}`]: next,
+          positionRiskConfigs: next
+        })
+      }).catch(err => {
+        console.error('Failed to sync batch position risk configs to DB:', err);
+      });
+
+      return next;
+    });
+
+    const cState = conditionControl.enabled ? '已启用' : '未启用';
+    const dHours = timeoutPriceControl.timeoutHours;
+    const dMul = timeoutPriceControl.priceMultiplier;
+    const dState = timeoutPriceControl.enabled ? `${dHours}h内未达${dMul}x平仓` : '未启用';
+
+    addLogRef.current?.(
+      `[一键批量风控] ✅ 已成功将条件C (${cState}) 与 条件D (${dState}) 同步应用至全部 ${currentPositions.length} 个持仓仓单，并已永久存入本地数据库！`,
+      'SUCCESS'
+    );
+
     setTimeout(() => {
       checkPositionsRiskRef.current?.();
     }, 50);
@@ -1856,12 +1953,25 @@ export default function App() {
       }
     };
     
+    loadFromDbRef.current = loadFromDb;
     loadFromDb();
     
     return () => {
       active = false;
     };
   }, [addLog, fetchAvailableAccounts, fetchSavedApiAccounts]);
+
+  // 跨设备/多标签页实时同步：监听设置导入事件以热加载最新配置
+  useEffect(() => {
+    const handleSettingsImported = () => {
+      loadFromDbRef.current();
+      fetchSavedApiAccounts();
+    };
+    window.addEventListener('app_settings_imported', handleSettingsImported);
+    return () => {
+      window.removeEventListener('app_settings_imported', handleSettingsImported);
+    };
+  }, [fetchSavedApiAccounts]);
 
   // Debounced auto-save of configuration & parameters to SQLite
   useEffect(() => {
@@ -5522,6 +5632,17 @@ export default function App() {
             <span className="text-xs font-semibold">{isMuted ? '静音' : '恢复'}</span>
           </button>
 
+          {/* 设置参数 导入与导出按钮 */}
+          <button
+            onClick={() => setIsSettingsBackupModalOpen(true)}
+            id="btn-settings-backup-modal"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-[#141416] border border-[#232326] text-zinc-300 hover:text-white hover:border-cyan-500/50 hover:bg-cyan-500/10 rounded-md transition-all active:scale-[0.97] cursor-pointer"
+            title="一键备份、导出或导入所有系统参数与策略设置 (存入本地 SQLite 数据库)"
+          >
+            <Sliders size={14} className="text-cyan-400" />
+            <span className="text-xs font-semibold">设置导入/导出</span>
+          </button>
+
           <div className="flex items-center gap-2 px-3 py-1.5 bg-[#141416] border border-[#232326] rounded-md">
             <Server size={14} className="text-zinc-500" />
             <span className="text-xs font-mono text-zinc-400">
@@ -6560,7 +6681,20 @@ export default function App() {
 
               <div className="flex items-center gap-3 text-[12px] font-mono text-zinc-400">
                 {activeContractTab === 'positions' ? (
-                  <span>共 <strong className="text-zinc-200">{sortedPositions.length}</strong> 个活跃持仓</span>
+                  <div className="flex items-center gap-3">
+                    <span>共 <strong className="text-zinc-200">{sortedPositions.length}</strong> 个活跃持仓</span>
+                    {sortedPositions.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setIsBatchRiskModalOpen(true)}
+                        className="flex items-center gap-1.5 px-3 py-1 bg-gradient-to-r from-purple-600/20 to-indigo-600/20 hover:from-purple-600/35 hover:to-indigo-600/35 border border-purple-500/40 hover:border-purple-500/60 text-purple-300 hover:text-white rounded-lg text-xs font-semibold transition-all active:scale-95 cursor-pointer shadow-sm shadow-purple-500/10"
+                        title="一键批量调整所有持仓仓单的条件 C (阶梯平仓/动态移动止损) 与 条件 D (超时平仓) 参数"
+                      >
+                        <Layers size={13} className="text-purple-400" />
+                        <span>一键调整所有仓单 (条件C与D)</span>
+                      </button>
+                    )}
+                  </div>
                 ) : (
                   <span>共 <strong className="text-zinc-200">{openOrders.length}</strong> 个活跃委托</span>
                 )}
@@ -6580,7 +6714,21 @@ export default function App() {
                       <th className="px-5 py-2 font-medium text-center">持仓量 / 市值</th>
                       <th className="px-5 py-2 font-medium text-center">未实现盈亏 (ROE%)</th>
                       <th className="px-5 py-2 font-medium text-center">累计资金费</th>
-                      <th className="px-5 py-2 font-medium text-center">风控</th>
+                      <th className="px-5 py-2 font-medium text-center">
+                        <div className="flex items-center justify-center gap-1.5">
+                          <span>风控</span>
+                          {sortedPositions.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => setIsBatchRiskModalOpen(true)}
+                              className="text-[11px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 hover:bg-purple-500/35 border border-purple-500/40 font-mono transition-all cursor-pointer"
+                              title="点击一键批量调整所有持仓的条件C与条件D参数"
+                            >
+                              一键C/D
+                            </button>
+                          )}
+                        </div>
+                      </th>
                       <th className="px-5 py-2 font-medium text-center">操作</th>
                     </tr>
                   </thead>
@@ -6932,6 +7080,7 @@ export default function App() {
           positions={positions}
           exchangeInfo={exchangeInfo}
           balance={balance}
+          onOpenSettingsBackup={() => setIsSettingsBackupModalOpen(true)}
         />
       </div>
 
@@ -7099,6 +7248,8 @@ export default function App() {
           position={selectedRiskPosition}
           config={selectedRiskPosition ? positionRiskConfigs[selectedRiskPosition.id] : undefined}
           onSaveConfig={handleSavePositionRiskConfig}
+          onBatchApplyConditionCandD={handleBatchApplyConditionCandD}
+          totalPositionsCount={sortedPositions.length}
           apiConfig={apiConfig}
           isConnected={isConnected}
           addLog={addLog}
@@ -7109,6 +7260,27 @@ export default function App() {
           currentN={selectedRiskPosition ? (positionNValues[selectedRiskPosition.id] || Math.max(1, Math.floor(selectedRiskPosition.side === 'BUY' ? (selectedRiskPosition.markPrice / (selectedRiskPosition.entryPrice || 1)) : ((selectedRiskPosition.entryPrice || 1) / (selectedRiskPosition.markPrice || 1))))) : 1}
         />
       )}
+
+      {/* 一键调整所有仓单 条件C与条件D 专属批量弹窗 */}
+      <BatchRiskCandDModal
+        isOpen={isBatchRiskModalOpen}
+        onClose={() => setIsBatchRiskModalOpen(false)}
+        positions={positions}
+        onApplyBatch={handleBatchApplyConditionCandD}
+        initialConditionControl={selectedRiskPosition ? positionRiskConfigs[selectedRiskPosition.id]?.conditionControl : undefined}
+        initialTimeoutPriceControl={selectedRiskPosition ? positionRiskConfigs[selectedRiskPosition.id]?.timeoutPriceControl : undefined}
+      />
+
+      {/* 系统设置参数 备份与导入导出弹窗 (存入本地 SQLite 数据库) */}
+      <SettingsBackupModal
+        isOpen={isSettingsBackupModalOpen}
+        onClose={() => setIsSettingsBackupModalOpen(false)}
+        onImportSuccess={() => {
+          loadFromDbRef.current();
+          fetchSavedApiAccounts();
+        }}
+        addLog={addLog}
+      />
 
       {/* Footer Status Bar */}
       <footer className="fixed bottom-0 left-0 right-0 bg-[#0A0A0B] border-t border-[#232326] px-4 py-2 flex items-center justify-between text-[10px] text-zinc-500 font-mono z-50">

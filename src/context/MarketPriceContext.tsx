@@ -121,6 +121,24 @@ export const MarketPriceProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
                 break;
 
+              case 'SETTINGS_IMPORTED':
+                try {
+                  window.dispatchEvent(new CustomEvent('app_settings_imported', { detail: parsed.data }));
+                } catch {}
+                break;
+
+              case '4H_AUTO_TRADING_STATUS':
+                if (parsed.data && typeof parsed.data.isAutoTrading === 'boolean') {
+                  setStatus4h((prev: any) => ({
+                    ...prev,
+                    isAutoTrading: parsed.data.isAutoTrading
+                  }));
+                  try {
+                    window.dispatchEvent(new CustomEvent('4h_auto_trading_status_changed', { detail: parsed.data }));
+                  } catch {}
+                }
+                break;
+
               default:
                 break;
             }

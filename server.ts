@@ -3194,6 +3194,144 @@ async function startServer() {
     }
   });
 
+  // 导出所有设置参数 (含4H筛选与下单设置、15M监控参数、仓单风控、报警设置、终端配置及API账户等)
+  app.get("/api/settings/export", (req, res) => {
+    try {
+      const rows = db.prepare("SELECT key, value FROM settings").all() as { key: string; value: string }[];
+      const systemSettings: Record<string, any> = {};
+      for (const row of rows) {
+        // 排除大型运行时榜单计算缓存，保持导出备份小巧纯净
+        if (row.key === 'four_hour_results_4h' || row.key === 'volume_spike_24h_results_4h') continue;
+        try {
+          systemSettings[row.key] = JSON.parse(row.value);
+        } catch {
+          systemSettings[row.key] = row.value;
+        }
+      }
+
+      // 获取保存的 API 账号列表
+      let apiAccounts: any[] = [];
+      try {
+        apiAccounts = db.prepare("SELECT * FROM api_credentials").all();
+      } catch (e) {}
+
+      const backupData = {
+        appletId: "49d63972-7a58-4b70-b7b3-5222972e83e7",
+        version: "1.0",
+        exportTime: new Date().toISOString(),
+        timestamp: Date.now(),
+        systemSettings,
+        apiAccounts,
+        metadata: {
+          name: "Trading Terminal Complete Settings Backup",
+          settingsCount: Object.keys(systemSettings).length,
+          accountsCount: apiAccounts.length
+        }
+      };
+
+      const now = new Date();
+      const pad = (n: number) => n.toString().padStart(2, '0');
+      const filename = `trading_settings_backup_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}.json`;
+
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.json(backupData);
+    } catch (err: any) {
+      console.error("Export settings failed:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 导入所有设置参数并全量存入本地 SQLite 数据库
+  app.post("/api/settings/import", (req, res) => {
+    try {
+      const data = req.body;
+      if (!data || typeof data !== 'object') {
+        return res.status(400).json({ error: "无效的备份配置数据" });
+      }
+
+      let rawSettingsMap: Record<string, any> = data.systemSettings || data.settings || (data.apiAccounts || data.system_settings ? data.system_settings : data);
+      if (!rawSettingsMap || typeof rawSettingsMap !== 'object') {
+        return res.status(400).json({ error: "备份数据中未检测到配置项" });
+      }
+
+      const settingsMap: Record<string, any> = {};
+      const ignoredKeys = new Set(['appletId', 'version', 'exportTime', 'timestamp', 'apiAccounts', 'metadata', 'systemSettings', 'settings', 'system_settings']);
+      for (const [k, v] of Object.entries(rawSettingsMap)) {
+        if (!ignoredKeys.has(k)) {
+          settingsMap[k] = v;
+        }
+      }
+
+      // 1. 批量持久化到 settings 表
+      const insertSetting = db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+      const transaction = db.transaction((entries: [string, any][]) => {
+        for (const [k, v] of entries) {
+          if (k === 'four_hour_results_4h' || k === 'volume_spike_24h_results_4h') continue;
+          insertSetting.run(k, JSON.stringify(v));
+        }
+      });
+
+      transaction(Object.entries(settingsMap));
+
+      // 2. 如果包含 apiAccounts，导入到 api_credentials 表
+      let importedAccountsCount = 0;
+      const accountsToImport = Array.isArray(data.apiAccounts) ? data.apiAccounts : (Array.isArray(data.systemSettings?.apiAccounts) ? data.systemSettings.apiAccounts : []);
+      if (accountsToImport.length > 0) {
+        const insertCred = db.prepare(`
+          INSERT OR REPLACE INTO api_credentials (account_name, api_key, api_secret, base_url)
+          VALUES (?, ?, ?, ?)
+        `);
+        for (const acc of data.apiAccounts) {
+          if (acc.account_name && acc.api_key && acc.api_secret) {
+            insertCred.run(acc.account_name, acc.api_key, acc.api_secret, acc.base_url || 'https://fapi.binance.com');
+            importedAccountsCount++;
+          }
+        }
+      }
+
+      // 3. 实时热同步更新服务端内存核心参数
+      if (settingsMap.monitoring_config_4h && typeof settingsMap.monitoring_config_4h === 'object') {
+        config4h = { ...DEFAULT_CONFIG_4H, ...settingsMap.monitoring_config_4h };
+      }
+      if (settingsMap.monitoring_config_15m && typeof settingsMap.monitoring_config_15m === 'object') {
+        config = { ...config, ...settingsMap.monitoring_config_15m };
+      }
+      if (settingsMap.monitoring4h_auto_trading !== undefined) {
+        isAutoTrading4h = Boolean(settingsMap.monitoring4h_auto_trading);
+      }
+      if (settingsMap.monitoring_running_4h !== undefined) {
+        isRunning4h = Boolean(settingsMap.monitoring_running_4h);
+      }
+
+      // 4. 全局广播 SSE 变更事件通知所有前端即时热更新
+      broadcastSSE({ type: 'SETTINGS_IMPORTED', data: { timestamp: Date.now() } });
+      broadcastSSE({ type: '4H_AUTO_TRADING_STATUS', data: { isAutoTrading: isAutoTrading4h } });
+      broadcastSSE({
+        type: '4H_STATUS',
+        data: {
+          isRunning: Boolean(isRunning4h),
+          isAutoTrading: Boolean(isAutoTrading4h),
+          config: config4h,
+          scanStats: scanStats4h,
+          results: getFullResults4h()
+        }
+      });
+
+      addMonitorLog4h(`[系统设置导入] ✅ 成功恢复导入 ${Object.keys(settingsMap).length} 项配置参数${importedAccountsCount > 0 ? `及 ${importedAccountsCount} 个API账户` : ''}并存入本地数据库`, 'SUCCESS');
+
+      res.json({
+        success: true,
+        message: "所有设置参数已成功导入并同步至本地数据库",
+        importedSettingsCount: Object.keys(settingsMap).length,
+        importedAccountsCount
+      });
+    } catch (err: any) {
+      console.error("Import settings failed:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Real-time Push SSE Event Stream for frontend boards, live prices, and instant alerts
   app.get("/api/stream/events", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");

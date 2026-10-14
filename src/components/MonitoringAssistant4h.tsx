@@ -35,7 +35,8 @@ import {
   Settings2,
   FileSpreadsheet,
   ShieldAlert,
-  Sparkles
+  Sparkles,
+  Database
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TradeLog, Position } from '../types';
@@ -203,6 +204,7 @@ interface MonitoringAssistant4hProps {
   balance?: { spotBalance: number; futuresBalance: number };
   openOrders?: any[];
   onRefreshOrders?: () => void;
+  onOpenSettingsBackup?: () => void;
 }
 
 const TRANSLATIONS = {
@@ -304,7 +306,8 @@ export default function MonitoringAssistant4h({
   exchangeInfo,
   balance,
   openOrders = [],
-  onRefreshOrders
+  onRefreshOrders,
+  onOpenSettingsBackup
 }: MonitoringAssistant4hProps) {
   const t = TRANSLATIONS;
   const { 
@@ -603,12 +606,11 @@ export default function MonitoringAssistant4h({
   }, [addLog]);
 
   // 从本地数据库 (SQLite settings 表) 初始化恢复所有 4H 相关参数配置 (以服务端数据库为核心权威源)
-  useEffect(() => {
-    let active = true;
+  const fetchAndApplyDbSettings = useCallback(() => {
     fetch('/api/settings')
       .then(res => res.ok ? res.json() : null)
       .then((settings: Record<string, any> | null) => {
-        if (!active || !settings) return;
+        if (!settings) return;
         const missingFromDb: Record<string, any> = {};
 
         // 1. 筛选设置 (优先采用数据库中的持久化配置)
@@ -711,8 +713,42 @@ export default function MonitoringAssistant4h({
       .catch(err => {
         console.warn('Failed to load 4H settings from DB:', err);
       });
-    return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    fetchAndApplyDbSettings();
+  }, [fetchAndApplyDbSettings]);
+
+  // 跨设备/跨标签页实时同步：监听 SSE 推送与导入事件
+  useEffect(() => {
+    if (sse4h && typeof sse4h.isAutoTrading === 'boolean') {
+      setIsAutoTradingActive(sse4h.isAutoTrading);
+      try {
+        localStorage.setItem('monitoring4h_auto_trading', String(sse4h.isAutoTrading));
+      } catch {}
+    }
+  }, [sse4h?.isAutoTrading]);
+
+  useEffect(() => {
+    const handleAutoChanged = (e: any) => {
+      if (e.detail && typeof e.detail.isAutoTrading === 'boolean') {
+        setIsAutoTradingActive(e.detail.isAutoTrading);
+        try {
+          localStorage.setItem('monitoring4h_auto_trading', String(e.detail.isAutoTrading));
+        } catch {}
+      }
+    };
+    const handleSettingsImported = () => {
+      fetchAndApplyDbSettings();
+    };
+
+    window.addEventListener('4h_auto_trading_status_changed', handleAutoChanged);
+    window.addEventListener('app_settings_imported', handleSettingsImported);
+    return () => {
+      window.removeEventListener('4h_auto_trading_status_changed', handleAutoChanged);
+      window.removeEventListener('app_settings_imported', handleSettingsImported);
+    };
+  }, [fetchAndApplyDbSettings]);
 
   const handleToggleAutoTrading = () => {
     setIsAutoTradingActive(prev => {
@@ -4414,6 +4450,22 @@ export default function MonitoringAssistant4h({
                       </span>
                     )}
                   </button>
+
+                  {/* 设置导入与导出 按钮 (持久化至本地 SQLite 数据库) */}
+                  {onOpenSettingsBackup && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenSettingsBackup();
+                      }}
+                      className="px-2.5 py-1.5 rounded-xl border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer select-none active:scale-95 shadow-sm shadow-cyan-500/10"
+                      title="点击一键备份、导出或导入所有系统参数与策略设置 (存入本地 SQLite 数据库)"
+                    >
+                      <Database className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>设置导入/导出</span>
+                    </button>
+                  )}
 
                   {/* 自动 交易开关按钮 */}
                   <button

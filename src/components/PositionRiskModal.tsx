@@ -43,6 +43,8 @@ interface PositionRiskModalProps {
   openOrders?: OpenOrder[];
   onRefreshOrders?: () => void;
   currentN?: number;
+  onBatchApplyConditionCandD?: (conditionControl: ConditionControlConfig, timeoutPriceControl: TimeoutPriceControlConfig) => void;
+  totalPositionsCount?: number;
 }
 
 export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
@@ -58,7 +60,9 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
   formatQty,
   openOrders = [],
   onRefreshOrders,
-  currentN
+  currentN,
+  onBatchApplyConditionCandD,
+  totalPositionsCount
 }) => {
   const isLong = position ? position.side === 'BUY' : true;
   const entryPrice = position?.entryPrice || 0;
@@ -621,6 +625,25 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
     }
 
     onClose();
+  };
+
+  // 一键将当前设置的条件 C 与 条件 D 参数同步覆盖至全部活跃仓单
+  const handleBatchApplyToAll = () => {
+    if (!position || !onBatchApplyConditionCandD) return;
+
+    // 1. 先保存当前仓单的自身完整风控配置
+    handleSaveAndClose();
+
+    // 2. 批量将条件C和条件D同步至所有仓单
+    const cond = {
+      ...currentConfig.conditionControl
+    };
+    const tpc = {
+      enabled: currentConfig.timeoutPriceControl?.enabled ?? true,
+      timeoutHours: Number(currentConfig.timeoutPriceControl?.timeoutHours) || 24,
+      priceMultiplier: Number(currentConfig.timeoutPriceControl?.priceMultiplier) || 1.5
+    };
+    onBatchApplyConditionCandD(cond, tpc);
   };
 
   // 当前风控优先级展示预览
@@ -1664,23 +1687,37 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
         </div>
 
         {/* 底部确认与关闭操作栏 */}
-        <div className="px-6 py-4 border-t border-[#232326] bg-[#141416] flex items-center justify-between">
+        <div className="px-6 py-4 border-t border-[#232326] bg-[#141416] flex items-center justify-between gap-3">
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-2 text-xs text-zinc-400 hover:text-white transition-colors"
+            className="px-4 py-2 text-xs text-zinc-400 hover:text-white transition-colors cursor-pointer"
           >
             取消 / 放弃修改
           </button>
 
-          <button
-            type="button"
-            onClick={handleSaveAndClose}
-            className="px-6 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center gap-1.5 active:scale-95"
-          >
-            <CheckCircle2 size={15} />
-            <span>保存并生效风控配置</span>
-          </button>
+          <div className="flex items-center gap-2.5">
+            {onBatchApplyConditionCandD && totalPositionsCount !== undefined && totalPositionsCount > 1 && (
+              <button
+                type="button"
+                onClick={handleBatchApplyToAll}
+                className="px-4 py-2.5 bg-gradient-to-r from-purple-600 via-indigo-600 to-purple-600 hover:brightness-110 text-white font-bold text-xs rounded-xl shadow-lg shadow-purple-500/20 transition-all flex items-center gap-1.5 active:scale-95 cursor-pointer"
+                title={`将当前设置的条件C和条件D参数一键同步应用至全部 ${totalPositionsCount} 个持仓仓单并保存`}
+              >
+                <Layers size={14} />
+                <span>一键应用到所有仓单 (C & D)</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={handleSaveAndClose}
+              className="px-6 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center gap-1.5 active:scale-95 cursor-pointer"
+            >
+              <CheckCircle2 size={15} />
+              <span>保存并生效风控配置</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>
