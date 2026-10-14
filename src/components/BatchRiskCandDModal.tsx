@@ -34,7 +34,7 @@ interface BatchRiskCandDModalProps {
 export const BatchRiskCandDModal: React.FC<BatchRiskCandDModalProps> = ({
   isOpen,
   onClose,
-  positions,
+  positions = [],
   onApplyBatch,
   initialConditionControl,
   initialTimeoutPriceControl

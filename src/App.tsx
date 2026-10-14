@@ -5768,11 +5768,11 @@ export default function App() {
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <label className="financial-label">总资产</label>
-                  <div className="text-xl font-mono font-bold text-emerald-500">{balance.balance.toFixed(2)} <span className="text-xs text-zinc-500">USDT</span></div>
+                  <div className="text-xl font-mono font-bold text-emerald-500">{(balance?.balance ?? 0).toFixed(2)} <span className="text-xs text-zinc-500">USDT</span></div>
                 </div>
                 <div className="space-y-1">
                   <label className="financial-label">可用保证金</label>
-                  <div className="text-xl font-mono font-bold text-blue-500">{balance.available.toFixed(2)} <span className="text-xs text-zinc-500">USDT</span></div>
+                  <div className="text-xl font-mono font-bold text-blue-500">{(balance?.available ?? 0).toFixed(2)} <span className="text-xs text-zinc-500">USDT</span></div>
                 </div>
                 <div className="space-y-1 pt-2 border-t border-[#232326]">
                   <label className="financial-label">现货余额</label>
@@ -6189,7 +6189,7 @@ export default function App() {
                     type="password" 
                     className="financial-input w-full" 
                     placeholder="输入币安 API Key"
-                    value={apiConfig.apiKey}
+                    value={apiConfig.apiKey || ''}
                     onChange={e => setApiConfig({...apiConfig, apiKey: e.target.value})}
                   />
                 </div>
@@ -6199,7 +6199,7 @@ export default function App() {
                     type="password" 
                     className="financial-input w-full" 
                     placeholder="输入币安 API Secret"
-                    value={apiConfig.apiSecret}
+                    value={apiConfig.apiSecret || ''}
                     onChange={e => setApiConfig({...apiConfig, apiSecret: e.target.value})}
                   />
                 </div>
@@ -6322,7 +6322,7 @@ export default function App() {
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs text-zinc-400 font-medium">总资产</span>
                     <div className="font-mono font-bold text-[15px] text-emerald-400 flex items-baseline gap-1">
-                      <span>{balance.balance.toFixed(2)}</span>
+                      <span>{(balance?.balance ?? 0).toFixed(2)}</span>
                       <span className="text-[10px] text-zinc-500 font-normal">USDT</span>
                     </div>
                   </div>
@@ -6333,7 +6333,7 @@ export default function App() {
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs text-zinc-400 font-medium">可用保证金</span>
                     <div className="font-mono font-bold text-[15px] text-blue-400 flex items-baseline gap-1">
-                      <span>{balance.available.toFixed(2)}</span>
+                      <span>{(balance?.available ?? 0).toFixed(2)}</span>
                       <span className="text-[10px] text-zinc-500 font-normal">USDT</span>
                     </div>
                   </div>
