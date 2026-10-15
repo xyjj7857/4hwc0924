@@ -51,6 +51,9 @@ import { EntryVerificationModal } from './components/EntryVerificationModal';
 import { EntryVerificationAlert, VerificationAlertState } from './components/EntryVerificationAlert';
 import { PositionRiskModal } from './components/PositionRiskModal';
 import { PositionRiskButton } from './components/PositionRiskButton';
+import { BatchPositionRiskModal } from './components/BatchPositionRiskModal';
+import { PositionKlineModal } from './components/PositionKlineModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { SettingsBackupModal } from './components/SettingsBackupModal';
 import { useMarketPrices } from './context/MarketPriceContext';
 import { 
@@ -61,7 +64,9 @@ import {
   saveAllLocalPositionRiskConfigs,
   detectPositionTpSl,
   normalizePositionRiskConfig,
-  getDefaultPositionRiskConfig
+  getDefaultPositionRiskConfig,
+  ConditionControlConfig,
+  TimeoutPriceControlConfig
 } from './types/positionRisk';
 import { 
   matchSymbolWithVerificationList, 
@@ -468,6 +473,11 @@ export default function App() {
   const [positionRiskConfigs, setPositionRiskConfigs] = useState<Record<string, PositionRiskConfig>>(() => getLocalPositionRiskConfigs());
   const [isPositionRiskModalOpen, setIsPositionRiskModalOpen] = useState(false);
   const [selectedRiskPosition, setSelectedRiskPosition] = useState<Position | null>(null);
+
+  // 批量风控与K线弹窗状态
+  const [isBatchRiskModalOpen, setIsBatchRiskModalOpen] = useState(false);
+  const [isKlineModalOpen, setIsKlineModalOpen] = useState(false);
+  const [selectedKlinePosition, setSelectedKlinePosition] = useState<Position | null>(null);
 
   // 保存持仓专属风控配置（按当前登录账号绑定 + 本地多账号隔离缓存 + 服务端 SQLite settings 双重持久化）
   const handleSavePositionRiskConfig = useCallback((updated: PositionRiskConfig) => {
@@ -1223,6 +1233,71 @@ export default function App() {
       localStorage.removeItem('trade_logs_history');
     } catch {}
   }, []);
+
+  // 一键设置所有仓单的 条件C与条件D 参数
+  const handleBatchApplyPositionRisk = useCallback((
+    conditionControl: ConditionControlConfig,
+    timeoutPriceControl: TimeoutPriceControlConfig
+  ) => {
+    const currentAccount = apiConfigRef.current?.accountName || 'default';
+    setPositionRiskConfigs(prev => {
+      const next = { ...prev };
+
+      for (const pos of positions) {
+        const existing = next[pos.id] || getDefaultPositionRiskConfig(
+          pos.id,
+          pos.symbol,
+          pos.side,
+          pos.entryPrice,
+          pos.openTime || pos.timestamp
+        );
+
+        next[pos.id] = {
+          ...existing,
+          conditionControl: {
+            ...conditionControl,
+            stageCloseRules: conditionControl.stageCloseRules.map(s => ({
+              ...s,
+              executed: false
+            })),
+            trailingStopRule: {
+              ...conditionControl.trailingStopRule
+            }
+          },
+          timeoutPriceControl: {
+            ...timeoutPriceControl,
+            activatedAt: pos.openTime || pos.timestamp || Date.now()
+          }
+        };
+      }
+
+      positionRiskConfigsRef.current = next;
+
+      // 1. 本地存储持久化
+      saveLocalPositionRiskConfigs(next, currentAccount);
+      allAccountRiskConfigsRef.current[currentAccount] = next;
+      saveAllLocalPositionRiskConfigs(allAccountRiskConfigsRef.current);
+
+      // 2. 服务端 SQLite settings 双重持久化
+      const dbPayload: Record<string, any> = {
+        [`position_risk_configs_v1_${currentAccount}`]: next
+      };
+      if (currentAccount === 'default') {
+        dbPayload.position_risk_configs = next;
+      }
+      fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dbPayload)
+      }).catch(err => {
+        console.warn('Failed to sync batch position risk configs to SQLite:', err);
+      });
+
+      return next;
+    });
+
+    addLog(`[批量风控] ⚡ 已成功为当前全部 ${positions.length} 个持仓仓单批量应用条件C (阶梯平仓&移动止损) 与 条件D (${timeoutPriceControl.timeoutHours}h未超${timeoutPriceControl.priceMultiplier}倍平仓)！`, 'SUCCESS');
+  }, [positions, addLog]);
 
   // Periodic Log Auto-Cleanup
   useEffect(() => {
@@ -6587,7 +6662,18 @@ export default function App() {
 
               <div className="flex items-center gap-3 text-[12px] font-mono text-zinc-400">
                 {activeContractTab === 'positions' ? (
-                  <span>共 <strong className="text-zinc-200">{sortedPositions.length}</strong> 个活跃持仓</span>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setIsBatchRiskModalOpen(true)}
+                      className="px-2.5 py-1 rounded-lg bg-gradient-to-r from-purple-600/25 via-indigo-600/25 to-purple-600/25 hover:from-purple-600/40 hover:to-indigo-600/40 text-purple-300 hover:text-white border border-purple-500/40 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm active:scale-95"
+                      title="一键设置当前所有持仓单的 条件C (阶梯平仓与动态回撤止损) 与 条件D (超时未超倍数平仓) 参数"
+                    >
+                      <Zap size={13} className="text-purple-400" />
+                      <span>一键设置所有仓单条件C/D</span>
+                    </button>
+                    <span>共 <strong className="text-zinc-200">{sortedPositions.length}</strong> 个活跃持仓</span>
+                  </div>
                 ) : (
                   <span>共 <strong className="text-zinc-200">{openOrders.length}</strong> 个活跃委托</span>
                 )}
@@ -6595,7 +6681,8 @@ export default function App() {
             </div>
             
             <div className="overflow-x-auto flex-1 min-h-0 overflow-y-auto custom-scrollbar">
-              {activeContractTab === 'positions' ? (
+              <ErrorBoundary fallbackTitle="合约持仓与委托数据渲染异常已安全隔离以防黑屏">
+                {activeContractTab === 'positions' ? (
                 <table className="w-full text-center border-collapse">
                   <thead className="sticky top-0 bg-[#141416] z-10">
                     <tr className="text-[15px] uppercase tracking-wider text-zinc-300 border-b border-[#232326]">
@@ -6658,7 +6745,18 @@ export default function App() {
                               className="hover:bg-[#1C1C1E]/50 transition-colors"
                             >
                               <td className="px-5 py-2 text-center">
-                                <div className="font-bold text-[16.5px] text-[#ff8a65] tracking-wide">{pos.symbol}</div>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedKlinePosition(pos);
+                                    setIsKlineModalOpen(true);
+                                  }}
+                                  className="font-bold text-[16.5px] text-[#ff8a65] hover:text-amber-300 tracking-wide inline-flex items-center justify-center gap-1.5 mx-auto group cursor-pointer transition-all hover:scale-105 active:scale-95"
+                                  title={`点击弹出 ${pos.symbol} 的 15分K线走势图（系统维护的2000条数据，支持1H/4H/日线聚合）`}
+                                >
+                                  <BarChart2 size={16} className="text-amber-400 opacity-80 group-hover:opacity-100 transition-opacity" />
+                                  <span className="underline decoration-dotted decoration-amber-400/50 group-hover:decoration-solid">{pos.symbol}</span>
+                                </button>
                                 <div className="flex items-center justify-center gap-1.5 mt-0.5">
                                   <div className={`text-[9px] font-bold px-1 py-0.2 rounded inline-block ${
                                     pos.side === 'BUY' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'
@@ -6926,8 +7024,9 @@ export default function App() {
                   </tbody>
                 </table>
               )}
-            </div>
-          </section>
+            </ErrorBoundary>
+          </div>
+        </section>
         </div>
       </div>
       </div>
@@ -7117,26 +7216,50 @@ export default function App() {
       />
 
       {/* 永续合约持仓专属风控子界面弹窗 */}
-      {isPositionRiskModalOpen && selectedRiskPosition && (
-        <PositionRiskModal 
-          isOpen={isPositionRiskModalOpen}
-          onClose={() => {
-            setIsPositionRiskModalOpen(false);
-            setSelectedRiskPosition(null);
-          }}
-          position={selectedRiskPosition}
-          config={selectedRiskPosition ? positionRiskConfigs[selectedRiskPosition.id] : undefined}
-          onSaveConfig={handleSavePositionRiskConfig}
-          apiConfig={apiConfig}
-          isConnected={isConnected}
-          addLog={addLog}
+      <ErrorBoundary fallbackTitle="持仓专属风控弹窗异常已安全拦截">
+        {isPositionRiskModalOpen && selectedRiskPosition && (
+          <PositionRiskModal 
+            isOpen={isPositionRiskModalOpen}
+            onClose={() => {
+              setIsPositionRiskModalOpen(false);
+              setSelectedRiskPosition(null);
+            }}
+            position={selectedRiskPosition}
+            config={selectedRiskPosition ? positionRiskConfigs[selectedRiskPosition.id] : undefined}
+            onSaveConfig={handleSavePositionRiskConfig}
+            onBatchApplyCd={handleBatchApplyPositionRisk}
+            apiConfig={apiConfig}
+            isConnected={isConnected}
+            addLog={addLog}
+            formatPrice={formatPrice}
+            formatQty={formatQty}
+            openOrders={openOrders}
+            onRefreshOrders={() => fetchSnapshotRef.current?.()}
+            currentN={selectedRiskPosition ? (positionNValues[selectedRiskPosition.id] || Math.max(1, Math.floor(selectedRiskPosition.side === 'BUY' ? (selectedRiskPosition.markPrice / (selectedRiskPosition.entryPrice || 1)) : ((selectedRiskPosition.entryPrice || 1) / (selectedRiskPosition.markPrice || 1))))) : 1}
+          />
+        )}
+
+        {/* 批量设置所有仓单条件C与条件D弹窗 */}
+        <BatchPositionRiskModal
+          isOpen={isBatchRiskModalOpen}
+          onClose={() => setIsBatchRiskModalOpen(false)}
+          positions={positions}
+          onBatchApply={handleBatchApplyPositionRisk}
           formatPrice={formatPrice}
-          formatQty={formatQty}
-          openOrders={openOrders}
-          onRefreshOrders={() => fetchSnapshotRef.current?.()}
-          currentN={selectedRiskPosition ? (positionNValues[selectedRiskPosition.id] || Math.max(1, Math.floor(selectedRiskPosition.side === 'BUY' ? (selectedRiskPosition.markPrice / (selectedRiskPosition.entryPrice || 1)) : ((selectedRiskPosition.entryPrice || 1) / (selectedRiskPosition.markPrice || 1))))) : 1}
         />
-      )}
+
+        {/* 仓单 15分K线走势图弹窗 (系统维护2000条数据，支持1H/4H/日线聚合，带关闭按钮) */}
+        <PositionKlineModal
+          isOpen={isKlineModalOpen}
+          onClose={() => {
+            setIsKlineModalOpen(false);
+            setSelectedKlinePosition(null);
+          }}
+          position={selectedKlinePosition}
+          formatPrice={formatPrice}
+          livePrices={livePrices}
+        />
+      </ErrorBoundary>
 
       {/* 系统设置参数 备份与导入导出弹窗 (存入本地 SQLite 数据库) */}
       <SettingsBackupModal

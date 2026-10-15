@@ -18,7 +18,8 @@ import {
   Flame,
   Target,
   Layers,
-  ArrowRight
+  ArrowRight,
+  Zap
 } from 'lucide-react';
 import { Position, ApiConfig, OpenOrder } from '../types';
 import { 
@@ -26,7 +27,9 @@ import {
   getDefaultPositionRiskConfig, 
   getRiskButtonDisplay, 
   normalizeConditionControl,
-  detectPositionTpSl
+  detectPositionTpSl,
+  ConditionControlConfig,
+  TimeoutPriceControlConfig
 } from '../types/positionRisk';
 
 interface PositionRiskModalProps {
@@ -35,6 +38,7 @@ interface PositionRiskModalProps {
   position: Position | null;
   config: PositionRiskConfig | undefined;
   onSaveConfig: (updated: PositionRiskConfig) => void;
+  onBatchApplyCd?: (conditionControl: ConditionControlConfig, timeoutPriceControl: TimeoutPriceControlConfig) => void;
   apiConfig: ApiConfig;
   isConnected: boolean;
   addLog: (msg: string, type?: 'INFO' | 'TRADE' | 'ERROR' | 'SUCCESS' | 'WARN') => void;
@@ -51,6 +55,7 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
   position,
   config,
   onSaveConfig,
+  onBatchApplyCd,
   apiConfig,
   isConnected,
   addLog,
@@ -60,8 +65,10 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
   onRefreshOrders,
   currentN
 }) => {
-  const isLong = position ? position.side === 'BUY' : true;
-  const entryPrice = position?.entryPrice || 0;
+  if (!isOpen || !position) return null;
+
+  const isLong = position.side === 'BUY';
+  const entryPrice = position.entryPrice || 0;
 
   // 内部表单临时状态，关闭或保存时生效
   const [currentConfig, setCurrentConfig] = useState<PositionRiskConfig>(() => {
@@ -1664,23 +1671,40 @@ export const PositionRiskModal: React.FC<PositionRiskModalProps> = ({
         </div>
 
         {/* 底部确认与关闭操作栏 */}
-        <div className="px-6 py-4 border-t border-[#232326] bg-[#141416] flex items-center justify-between">
+        <div className="px-6 py-4 border-t border-[#232326] bg-[#141416] flex flex-wrap items-center justify-between gap-3">
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-2 text-xs text-zinc-400 hover:text-white transition-colors"
+            className="px-4 py-2 text-xs text-zinc-400 hover:text-white transition-colors cursor-pointer"
           >
             取消 / 放弃修改
           </button>
 
-          <button
-            type="button"
-            onClick={handleSaveAndClose}
-            className="px-6 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center gap-1.5 active:scale-95"
-          >
-            <CheckCircle2 size={15} />
-            <span>保存并生效风控配置</span>
-          </button>
+          <div className="flex items-center gap-3">
+            {onBatchApplyCd && (
+              <button
+                type="button"
+                onClick={() => {
+                  onBatchApplyCd(currentConfig.conditionControl, currentConfig.timeoutPriceControl);
+                  handleSaveAndClose();
+                }}
+                className="px-4 py-2.5 bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 hover:text-purple-100 border border-purple-500/40 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-sm active:scale-95"
+                title="将当前编辑的条件C与条件D配置一键同步应用到所有持仓单"
+              >
+                <Zap size={14} className="text-purple-400" />
+                <span>⚡ 一键将条件C/D应用至所有仓单</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={handleSaveAndClose}
+              className="px-6 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center gap-1.5 active:scale-95 cursor-pointer"
+            >
+              <CheckCircle2 size={15} />
+              <span>保存并生效当前仓单配置</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>

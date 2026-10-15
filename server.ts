@@ -4039,6 +4039,34 @@ async function startServer() {
     }
   });
 
+  /**
+   * 获取系统维护的 2000 条 15m 真实 K 线数据
+   * 优先从本地内存滑动窗口中读取，若不足则按需向币安补齐至 2000 根
+   */
+  app.get("/api/market/candles", async (req, res) => {
+    try {
+      const symbol = ((req.query.symbol as string) || "").trim().toUpperCase();
+      if (!symbol) {
+        return res.status(400).json({ success: false, error: "Missing symbol query parameter" });
+      }
+      const limit = Math.min(2000, Math.max(1, parseInt(req.query.limit as string) || 2000));
+      // 确保该币对有完整 2000 根数据
+      const candles = await marketDataManager.ensureSymbolCandles(symbol, limit);
+      const resultCandles = candles.slice(-limit);
+
+      res.json({
+        success: true,
+        symbol,
+        count: resultCandles.length,
+        candles: resultCandles,
+        timestamp: Date.now()
+      });
+    } catch (err: any) {
+      console.error(`[API /api/market/candles] Failed to fetch candles for ${req.query.symbol}:`, err);
+      res.status(500).json({ success: false, error: err.message || "Failed to fetch candles" });
+    }
+  });
+
   // Get alert logs with optional filtering by date (YYYY-MM-DD) and boardName
   app.get("/api/alert-logs", (req, res) => {
     try {

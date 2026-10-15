@@ -120,7 +120,7 @@ export class MarketDataManager {
    * 启动初始化全流程：
    * 1. 获取全市场 24H 快照确定 USDT 永续合约 Universe（官方真实数据）
    * 2. 建立 WebSocket 连接（15m Kline + Mark Price + MiniTicker 全市场价格流）
-   * 3. 异步平滑分批回填每个币最近 200 根 15m 官方真实 K线
+   * 3. 异步平滑分批回填每个币最近 2000 根 15m 官方真实 K线
    */
   public async startPipeline(): Promise<void> {
     if (this.pipelineStarted) return;
@@ -140,7 +140,7 @@ export class MarketDataManager {
       this.initMarkPriceStream();
       this.initKlineStreams();
 
-      // 第四步：异步平滑补齐全市场 200 根 15m 历史 K 线
+      // 第四步：异步平滑补齐全市场 2000 根 15m 历史 K 线
       this.startHistoryBackfill();
 
       // 第五步：异步获取全市场币对自上线以来的开盘价与全历史极值（ATH/ATL及出现先后顺序）
@@ -568,7 +568,7 @@ export class MarketDataManager {
   }
 
   /**
-   * 处理实时收到的 15m K 线数据，更新本地 200 根滑动窗口
+   * 处理实时收到的 15m K 线数据，更新本地 2000 根滑动窗口
    */
   private handleLiveKlineMessage(symbol: string, k: any): void {
     const candle: KlineCandle & { isLiveWs?: boolean } = {
@@ -614,10 +614,10 @@ export class MarketDataManager {
         // 更新当前未完结的一根 K 线
         candles[candles.length - 1] = candle;
       } else if (candle.openTime > last.openTime) {
-        // 新一根 15m K 线产生，推入数组并限制最多保留 500 根
+        // 新一根 15m K 线产生，推入数组并限制最多保留 2000 根
         candles.push(candle);
-        if (candles.length > 500) {
-          record.candles15m = candles.slice(-500);
+        if (candles.length > 2000) {
+          record.candles15m = candles.slice(-2000);
         }
       }
     }
@@ -638,12 +638,12 @@ export class MarketDataManager {
         id: Date.now()
       }));
     }
-    // 异步补齐新币的历史 200 根 K 线
+    // 异步补齐新币的历史 2000 根 K 线
     this.backfillSymbols(symbols);
   }
 
   /**
-   * 异步平滑分批获取全市场 200 根 15m 历史 K 线
+   * 异步平滑分批获取全市场 2000 根 15m 历史 K 线
    * 优先回填 24H 成交额最高的流动性币对，确保开机 1 秒内头部币种全部就绪
    */
   private async startHistoryBackfill(): Promise<void> {
@@ -661,13 +661,116 @@ export class MarketDataManager {
       statusText: '异步历史回填中...'
     };
 
-    this.addLog(`[行情数据源] 开始后台平滑补齐全市场 200 根 15m 权威历史数据（共 ${total} 个币对，按流动性优先对齐）...`, 'INFO');
+    this.addLog(`[行情数据源] 开始后台平滑补齐全市场 2000 根 15m 权威历史数据（共 ${total} 个币对，按流动性优先对齐）...`, 'INFO');
     await this.backfillSymbols(allSymbols);
+  }
+
+  /**
+   * 从币安官方拉取单个币对最多 2000 根 15m 真实历史 K 线
+   * 采用分批获取策略（最新 1500 根 + 前序 500 根），保障深度达到 2000 根
+   */
+  public async fetchRaw15mKlines2000(symbol: string): Promise<KlineCandle[]> {
+    try {
+      const rawLatest = await this.fetchBinanceBackend('/fapi/v1/klines', {
+        symbol,
+        interval: '15m',
+        limit: '1500'
+      });
+
+      if (!Array.isArray(rawLatest) || rawLatest.length === 0) {
+        return [];
+      }
+
+      let allRaw = rawLatest;
+      if (rawLatest.length >= 1000) {
+        const earliestOpenTime = Number(rawLatest[0][0]);
+        if (earliestOpenTime > 0) {
+          try {
+            const rawOlder = await this.fetchBinanceBackend('/fapi/v1/klines', {
+              symbol,
+              interval: '15m',
+              endTime: String(earliestOpenTime - 1),
+              limit: '500'
+            });
+            if (Array.isArray(rawOlder) && rawOlder.length > 0) {
+              allRaw = [...rawOlder, ...rawLatest];
+            }
+          } catch (err) {
+            // 忽略老数据补齐失败，保留最新1500根
+          }
+        }
+      }
+
+      return allRaw.map((item: any) => ({
+        openTime: Number(item[0]),
+        closeTime: Number(item[6]),
+        open: parseFloat(item[1]) || 0,
+        high: parseFloat(item[2]) || 0,
+        low: parseFloat(item[3]) || 0,
+        close: parseFloat(item[4]) || 0,
+        volume: parseFloat(item[5]) || 0,
+        quoteVolume: parseFloat(item[7]) || 0,
+        trades: Number(item[8]) || 0,
+        isClosed: true
+      }));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /**
+   * 确保并获取单个币对的 2000 根 15m K 线（支持按需即时精准补齐）
+   */
+  public async ensureSymbolCandles(symbol: string, targetCount: number = 2000): Promise<KlineCandle[]> {
+    const sym = symbol.toUpperCase();
+    let record = this.symbolsMap.get(sym);
+    if (!record || record.candles15m.length < targetCount) {
+      const freshCandles = await this.fetchRaw15mKlines2000(sym);
+      if (freshCandles.length > 0) {
+        if (!record) {
+          record = {
+            symbol: sym,
+            candles15m: freshCandles.slice(-targetCount),
+            quoteVolume24h: 0,
+            priceChangePercent24h: 0,
+            lastPrice: freshCandles[freshCandles.length - 1].close,
+            markPrice: freshCandles[freshCandles.length - 1].close,
+            fundingRate: 0,
+            nextFundingTime: 0,
+            fundingIntervalHours: 8,
+            lastUpdated: Date.now()
+          };
+          this.symbolsMap.set(sym, record);
+        } else {
+          const liveCandles = record.candles15m;
+          const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
+          if (lastCandle && (lastCandle as any).isLiveWs) {
+            const merged = freshCandles.filter(c => c.openTime < lastCandle.openTime);
+            merged.push(lastCandle);
+            record.candles15m = merged.slice(-targetCount);
+          } else {
+            record.candles15m = freshCandles.slice(-targetCount);
+          }
+        }
+      }
+    }
+    return record?.candles15m || [];
+  }
+
+  /**
+   * 获取系统维护的该币对 15m K 线数据 (默认最多 2000 根)
+   */
+  public getSymbol15mCandles(symbol: string, limit: number = 2000): KlineCandle[] {
+    const sym = symbol.toUpperCase();
+    const record = this.symbolsMap.get(sym);
+    if (!record || !record.candles15m) return [];
+    const sorted = [...record.candles15m].sort((a, b) => a.openTime - b.openTime);
+    return sorted.slice(-limit);
   }
 
   private async backfillSymbols(symbols: string[]): Promise<void> {
     const GROUP_SIZE = 100;
-    const BATCH_SIZE = 8;
+    const BATCH_SIZE = 6;
     let loadedCount = this.historySyncProgress.loaded;
     const total = symbols.length;
 
@@ -685,31 +788,14 @@ export class MarketDataManager {
         const batch = groupSymbols.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(async (symbol) => {
           try {
-            const rawKlines = await this.fetchBinanceBackend('/fapi/v1/klines', {
-              symbol,
-              interval: '15m',
-              limit: '500'
-            });
+            const historicalCandles = await this.fetchRaw15mKlines2000(symbol);
 
-            if (Array.isArray(rawKlines) && rawKlines.length > 0) {
-              const historicalCandles: KlineCandle[] = rawKlines.map((item: any) => ({
-                openTime: Number(item[0]),
-                closeTime: Number(item[6]),
-                open: parseFloat(item[1]) || 0,
-                high: parseFloat(item[2]) || 0,
-                low: parseFloat(item[3]) || 0,
-                close: parseFloat(item[4]) || 0,
-                volume: parseFloat(item[5]) || 0,
-                quoteVolume: parseFloat(item[7]) || 0,
-                trades: Number(item[8]) || 0,
-                isClosed: true
-              }));
-
+            if (historicalCandles.length > 0) {
               let record = this.symbolsMap.get(symbol);
               if (!record) {
                 record = {
                   symbol,
-                  candles15m: historicalCandles,
+                  candles15m: historicalCandles.slice(-2000),
                   quoteVolume24h: 0,
                   priceChangePercent24h: 0,
                   lastPrice: historicalCandles[historicalCandles.length - 1].close,
@@ -727,9 +813,9 @@ export class MarketDataManager {
                 if (lastCandle && (lastCandle as any).isLiveWs) {
                   const merged = historicalCandles.filter(c => c.openTime < lastCandle.openTime);
                   merged.push(lastCandle);
-                  record.candles15m = merged.slice(-500);
+                  record.candles15m = merged.slice(-2000);
                 } else {
-                  record.candles15m = historicalCandles.slice(-500);
+                  record.candles15m = historicalCandles.slice(-2000);
                 }
               }
             }
@@ -759,8 +845,8 @@ export class MarketDataManager {
 
     this.historySyncProgress.isComplete = true;
     this.historySyncProgress.statusText = '已完成 (100%)';
-    this.addLog(`[行情数据源] 全市场 200 根 15m 历史 K 线数据已全部补齐完毕（共 ${symbols.length} 个币对），标记“数据完整”，正式由 WebSocket 实时流接管！`, 'SUCCESS');
-    this.addLog4h(`[行情数据源4h] 4H K线聚合所需的 15m 官方真实历史底座已完全就绪（200根深度），本地聚合计算引擎启动！`, 'SUCCESS');
+    this.addLog(`[行情数据源] 全市场 2000 根 15m 历史 K 线数据已全部补齐完毕（共 ${symbols.length} 个币对），标记“数据完整”，正式由 WebSocket 实时流接管！`, 'SUCCESS');
+    this.addLog4h(`[行情数据源4h] 4H K线聚合所需的 15m 官方真实历史底座已完全就绪（2000根深度），本地聚合计算引擎启动！`, 'SUCCESS');
   }
 
   /**

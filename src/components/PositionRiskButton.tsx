@@ -18,6 +18,8 @@ export const PositionRiskButton: React.FC<PositionRiskButtonProps> = ({
   formatPrice,
   onClick
 }) => {
+  if (!position) return null;
+
   // 检测该币对是否有对应的止盈单或止损单
   const { hasTp, hasSl, tpPrice, slPrice } = detectPositionTpSl(position, openOrders, config);
   const displayType: RiskButtonDisplay = getRiskButtonDisplay(config, openOrders, position);
@@ -25,7 +27,7 @@ export const PositionRiskButton: React.FC<PositionRiskButtonProps> = ({
   // 格式化价格辅助函数
   const formatPriceVal = (price?: number): string => {
     if (!price || price <= 0) return '';
-    if (formatPrice) return formatPrice(position.symbol, price);
+    if (formatPrice && position?.symbol) return formatPrice(position.symbol, price);
     if (price >= 1000) return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     if (price >= 1) return price.toFixed(4);
     return price.toFixed(6);
@@ -78,7 +80,7 @@ export const PositionRiskButton: React.FC<PositionRiskButtonProps> = ({
       return;
     }
     const update = () => {
-      const startTime = tpc?.activatedAt || position.openTime || position.timestamp || Date.now();
+      const startTime = tpc?.activatedAt || position?.openTime || position?.timestamp || Date.now();
       const totalHours = Number(tpc?.timeoutHours) || 24;
       const totalMs = totalHours * 3600 * 1000;
       const elapsedMs = Math.max(0, Date.now() - startTime);
@@ -93,7 +95,7 @@ export const PositionRiskButton: React.FC<PositionRiskButtonProps> = ({
     update();
     const t = setInterval(update, 1000);
     return () => clearInterval(t);
-  }, [config?.timeoutPriceControl, position.openTime, position.timestamp]);
+  }, [config?.timeoutPriceControl, position?.openTime, position?.timestamp]);
 
   // 1. 若同时存在止盈与止损挂单，则同时展示止盈与止损
   if (hasTp && hasSl) {

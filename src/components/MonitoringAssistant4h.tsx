@@ -193,7 +193,7 @@ interface SpikeAnd24hBoards {
 }
 
 interface MonitoringAssistant4hProps {
-  apiConfig: { apiKey: string; apiSecret: string; baseUrl: string };
+  apiConfig?: { apiKey?: string; apiSecret?: string; baseUrl?: string; accountName?: string };
   isConnected: boolean;
   onSelectSymbol: (symbol: string) => void;
   addLog: (message: string, type?: TradeLog['type']) => void;
@@ -296,7 +296,7 @@ const getClosePosTag = (val?: number) => {
 };
 
 export default function MonitoringAssistant4h({ 
-  apiConfig,
+  apiConfig = { apiKey: '', apiSecret: '', baseUrl: 'https://fapi.binance.com' },
   isConnected,
   onSelectSymbol,
   addLog,
@@ -1584,8 +1584,8 @@ export default function MonitoringAssistant4h({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           endpoint: '/fapi/v1/exchangeInfo',
-          apiKey: apiConfig.apiKey,
-          apiSecret: apiConfig.apiSecret
+          apiKey: apiConfig?.apiKey,
+          apiSecret: apiConfig?.apiSecret
         })
       })
       .then(res => res.json())
@@ -1596,7 +1596,7 @@ export default function MonitoringAssistant4h({
       })
       .catch(() => {});
     }
-  }, [exchangeInfo, apiConfig.apiKey, apiConfig.apiSecret]);
+  }, [exchangeInfo, apiConfig?.apiKey, apiConfig?.apiSecret]);
 
   const activeExchangeInfo = exchangeInfo?.symbols ? exchangeInfo : localExchangeInfo;
 
