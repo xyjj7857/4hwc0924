@@ -427,11 +427,13 @@ const fetchBinanceBackend = async (endpoint: string, params: Record<string, any>
         throw new Error(`HTTP status ${response.status}`);
       }
 
-      // 主动侦测分钟权重水位，接近阈值时（>2000/2400）自动平滑避震，杜绝触发 429
+      // 主动侦测分钟权重水位，接近阈值时（>=1500/2400）自动平滑避震等待至下一分钟，杜绝触发 429
       const usedWeight = parseInt(response.headers.get('x-mbx-used-weight-1m') || '0', 10);
-      if (usedWeight > 2000) {
-        console.warn(`[fetchBinanceBackend] 币安权重预警: 当前1分钟累计已用 ${usedWeight}/2400，已接近硬限，执行 3 秒微休眠降频保护`);
-        await new Promise(r => setTimeout(r, 3000));
+      if (usedWeight >= 1500) {
+        const nowSec = new Date().getSeconds();
+        const waitSec = Math.max(3, 60 - nowSec + 1);
+        console.warn(`[fetchBinanceBackend] 币安权重预警: 当前1分钟累计已用 ${usedWeight}/2400，主动平滑避震等待 ${waitSec} 秒至下一分钟重置...`);
+        await new Promise(r => setTimeout(r, waitSec * 1000));
       }
 
       const text = await response.text();

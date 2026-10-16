@@ -24,6 +24,7 @@ export interface SymbolMarketData {
   nextFundingTime: number;
   fundingIntervalHours: number;
   lastUpdated: number;
+  hasFetchedHistory?: boolean;
 }
 
 export interface HistorySyncProgress {
@@ -56,6 +57,7 @@ export class MarketDataManager {
   private klineReconnectTimers: Map<number, NodeJS.Timeout> = new Map();
   private isShuttingDown: boolean = false;
   private pipelineStarted: boolean = false;
+  private isHistoryBackfillCompleted: boolean = false;
   private fundingInfoMap: Map<string, number> = new Map(); // symbol -> intervalHours
   private allTimeStatsMap: Map<string, SymbolAllTimeStats> = new Map();
   private allTimeFetchingPromises: Map<string, Promise<SymbolAllTimeStats | null>> = new Map();
@@ -140,11 +142,13 @@ export class MarketDataManager {
       this.initMarkPriceStream();
       this.initKlineStreams();
 
-      // 第四步：异步平滑补齐全市场 2000 根 15m 历史 K 线
-      this.startHistoryBackfill();
-
-      // 第五步：异步获取全市场币对自上线以来的开盘价与全历史极值（ATH/ATL及出现先后顺序）
-      this.startAllTimeStatsSync();
+      // 第四步：异步平滑补齐全市场 2000 根 15m 历史 K 线（仅首次启动执行一次，完成后全靠 WebSocket 实时流接管）
+      this.startHistoryBackfill().then(() => {
+        // 第五步：15m 历史数据全部补齐后，再启动全历史极值同步，严格串行化，杜绝并发超频
+        this.startAllTimeStatsSync();
+      }).catch(err => {
+        console.error('[MarketDataManager] History backfill error:', err);
+      });
     } catch (err: any) {
       this.addLog(`[行情数据源] 启动失败: ${err.message || err}`, 'ERROR');
       this.ensureFallbackUniverse();
@@ -720,11 +724,13 @@ export class MarketDataManager {
 
   /**
    * 确保并获取单个币对的 2000 根 15m K 线（支持按需即时精准补齐）
+   * 严格防重复拉取：若该币对已拉取过历史或已有 K 线数据，后续均依赖 WebSocket 实时流更新，坚决不再重复调用 REST API
    */
   public async ensureSymbolCandles(symbol: string, targetCount: number = 2000): Promise<KlineCandle[]> {
     const sym = symbol.toUpperCase();
     let record = this.symbolsMap.get(sym);
-    if (!record || record.candles15m.length < targetCount) {
+    // 仅在首次且本地无任何蜡烛数据时，才拉取一次历史底座
+    if (!record || (!record.hasFetchedHistory && record.candles15m.length === 0)) {
       const freshCandles = await this.fetchRaw15mKlines2000(sym);
       if (freshCandles.length > 0) {
         if (!record) {
@@ -738,10 +744,12 @@ export class MarketDataManager {
             fundingRate: 0,
             nextFundingTime: 0,
             fundingIntervalHours: 8,
-            lastUpdated: Date.now()
+            lastUpdated: Date.now(),
+            hasFetchedHistory: true
           };
           this.symbolsMap.set(sym, record);
         } else {
+          record.hasFetchedHistory = true;
           const liveCandles = record.candles15m;
           const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
           if (lastCandle && (lastCandle as any).isLiveWs) {
@@ -770,7 +778,7 @@ export class MarketDataManager {
 
   private async backfillSymbols(symbols: string[]): Promise<void> {
     const GROUP_SIZE = 100;
-    const BATCH_SIZE = 6;
+    const BATCH_SIZE = 3; // 适度降低并发至 3，大幅平滑权重压力
     let loadedCount = this.historySyncProgress.loaded;
     const total = symbols.length;
 
@@ -788,10 +796,15 @@ export class MarketDataManager {
         const batch = groupSymbols.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(async (symbol) => {
           try {
+            let record = this.symbolsMap.get(symbol);
+            // 核心防重复：若该币对已经成功拉取过历史或已有充足蜡烛，直接跳过，后续全由 WebSocket 实时流接管
+            if (record && record.hasFetchedHistory && record.candles15m.length >= 1000) {
+              return;
+            }
+
             const historicalCandles = await this.fetchRaw15mKlines2000(symbol);
 
             if (historicalCandles.length > 0) {
-              let record = this.symbolsMap.get(symbol);
               if (!record) {
                 record = {
                   symbol,
@@ -803,10 +816,12 @@ export class MarketDataManager {
                   fundingRate: 0,
                   nextFundingTime: 0,
                   fundingIntervalHours: 8,
-                  lastUpdated: Date.now()
+                  lastUpdated: Date.now(),
+                  hasFetchedHistory: true
                 };
                 this.symbolsMap.set(symbol, record);
               } else {
+                record.hasFetchedHistory = true;
                 // 权威官方真实 K 线覆盖：若末尾有实时 WebSocket 接收到的未闭合蜡烛，平滑合并
                 const liveCandles = record.candles15m;
                 const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
@@ -831,21 +846,22 @@ export class MarketDataManager {
         this.historySyncProgress.loaded = loadedCount;
         this.historySyncProgress.percent = percent;
 
-        // 平滑休眠 150ms 防频控
-        await new Promise(r => setTimeout(r, 150));
+        // 平滑休眠 400ms 防频控超载
+        await new Promise(r => setTimeout(r, 400));
       }
 
-      // 每拉完100个币对（且后面还有待拉取的币对组），暂停20秒再拉取下一组
+      // 每拉完100个币对（且后面还有待拉取的币对组），暂停 30 秒再拉取下一组（从原20秒调整为30秒，留足分钟权重清零窗口）
       if (groupStart + GROUP_SIZE < symbols.length) {
-        this.historySyncProgress.statusText = `已拉完第 ${groupIndex}/${totalGroups} 组（共 ${loadedCount} 币对），暂停 20 秒后拉取下一组...`;
-        this.addLog(`[行情数据源] 15m K线历史数据：已拉完第 ${groupIndex}/${totalGroups} 组（累计 ${loadedCount}/${total} 个币对），按规则暂停 20 秒再拉取下一组...`, 'INFO');
-        await new Promise(r => setTimeout(r, 20000));
+        this.historySyncProgress.statusText = `已拉完第 ${groupIndex}/${totalGroups} 组（共 ${loadedCount} 币对），暂停 30 秒后拉取下一组...`;
+        this.addLog(`[行情数据源] 15m K线历史数据：已拉完第 ${groupIndex}/${totalGroups} 组（累计 ${loadedCount}/${total} 个币对），按规则暂停 30 秒再拉取下一组...`, 'INFO');
+        await new Promise(r => setTimeout(r, 30000));
       }
     }
 
+    this.isHistoryBackfillCompleted = true;
     this.historySyncProgress.isComplete = true;
     this.historySyncProgress.statusText = '已完成 (100%)';
-    this.addLog(`[行情数据源] 全市场 2000 根 15m 历史 K 线数据已全部补齐完毕（共 ${symbols.length} 个币对），标记“数据完整”，正式由 WebSocket 实时流接管！`, 'SUCCESS');
+    this.addLog(`[行情数据源] 全市场 2000 根 15m 历史 K 线数据已全部补齐完毕（共 ${symbols.length} 个币对），标记“数据完整”，正式由 WebSocket 实时流接管，后续无需再拉取！`, 'SUCCESS');
     this.addLog4h(`[行情数据源4h] 4H K线聚合所需的 15m 官方真实历史底座已完全就绪（2000根深度），本地聚合计算引擎启动！`, 'SUCCESS');
   }
 
@@ -862,7 +878,7 @@ export class MarketDataManager {
 
     this.addLog(`[行情数据源] 开始异步同步全市场 ${allSymbols.length} 个币对自上线以来的开盘价与全历史极值...`, 'INFO');
 
-    const BATCH_SIZE = 12;
+    const BATCH_SIZE = 4;
     for (let i = 0; i < allSymbols.length; i += BATCH_SIZE) {
       if (this.isShuttingDown) break;
       while (this.isCircuitBroken()) {
@@ -870,7 +886,7 @@ export class MarketDataManager {
       }
       const batch = allSymbols.slice(i, i + BATCH_SIZE);
       await Promise.all(batch.map(sym => this.fetchSymbolAllTimeStats(sym)));
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise(r => setTimeout(r, 250));
     }
 
     this.addLog(`[行情数据源] 全市场币对上线开盘价与全历史极值同步完成！已缓存 ${this.allTimeStatsMap.size} 个币对。`, 'SUCCESS');
