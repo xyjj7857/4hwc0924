@@ -389,7 +389,37 @@ export default function App() {
   const [futuresRatio, setFuturesRatio] = useState<number>(50);
   const [turnoverCoef, setTurnoverCoef] = useState<number>(3000);
   const [isCalculatingVolume, setIsCalculatingVolume] = useState<boolean>(false);
-  const positionOpenTimesRef = useRef<{[key: string]: number}>({});
+  const initialOpenTimesMeta = useMemo(() => {
+    const parsedMeta: Record<string, { openTime: number; verified?: boolean; entryPrice?: number }> = {};
+    const parsedTimes: Record<string, number> = {};
+    try {
+      const raw = localStorage.getItem('binance_position_open_times');
+      if (raw) {
+        const obj = JSON.parse(raw);
+        if (obj && typeof obj === 'object') {
+          for (const [k, v] of Object.entries(obj)) {
+            if (typeof v === 'number' && v > 0) {
+              parsedMeta[k] = { openTime: v, verified: false };
+              parsedTimes[k] = v;
+            } else if (v && typeof v === 'object' && Number((v as any).openTime) > 0) {
+              parsedMeta[k] = {
+                openTime: Number((v as any).openTime),
+                verified: Boolean((v as any).verified),
+                entryPrice: Number((v as any).entryPrice || 0) || undefined
+              };
+              parsedTimes[k] = Number((v as any).openTime);
+            }
+          }
+        }
+      }
+    } catch {}
+    return { parsedMeta, parsedTimes };
+  }, []);
+  const positionOpenTimesRef = useRef<{[key: string]: number}>(initialOpenTimesMeta.parsedTimes);
+  const positionOpenTimesMetaRef = useRef<Record<string, { openTime: number; verified?: boolean; entryPrice?: number }>>(initialOpenTimesMeta.parsedMeta);
+  const openTimeVerifyCooldownRef = useRef<Record<string, number>>({});
+  const orphanOrderCleanCooldownRef = useRef<Record<string, number>>({});
+  const nValueBackfillKeyRef = useRef<Record<string, number>>({});
   const isInitialLoadCompletedRef = useRef(false);
   const hasFetchedPositionsRef = useRef(false);
   const previousActivePositionsRef = useRef<Position[]>([]);
@@ -758,6 +788,123 @@ export default function App() {
       saveDbSettings({ binance_position_high_water_n_values: currentMap });
     }
   }, [positions, livePrices, saveDbSettings]);
+
+  // 历史高水位 N值自愈回溯：基于已执行的阶梯分批平仓记录 + 系统维护的 2000 根 15m K线最高/最低价，自动恢复持仓存续期间曾达到的最大 N值（0 币安接口权重）
+  useEffect(() => {
+    if (!positions || positions.length === 0) return;
+
+    let cancelled = false;
+
+    const recoverHighWaterN = async () => {
+      let syncUpdated = false;
+      const mergedMap = { ...positionNValuesRef.current };
+
+      // 1. 先从专属条件风控已触发记录（如阶梯分批平仓 stage.executed / 动态止损 lastAdjustedN）瞬时恢复
+      for (const pos of positions) {
+        const cfg = positionRiskConfigs[pos.id];
+        let recoveredFromCfg = 0;
+        if (cfg?.conditionControl) {
+          if (Array.isArray(cfg.conditionControl.stageCloseRules)) {
+            for (const st of cfg.conditionControl.stageCloseRules) {
+              if (st.executed && st.targetN > recoveredFromCfg) {
+                recoveredFromCfg = st.targetN;
+              }
+            }
+          }
+          const lastAdj = cfg.conditionControl.trailingStopRule?.lastAdjustedN || 0;
+          if (lastAdj > recoveredFromCfg) {
+            recoveredFromCfg = lastAdj;
+          }
+        }
+        if (recoveredFromCfg > (mergedMap[pos.id] || 0)) {
+          mergedMap[pos.id] = recoveredFromCfg;
+          syncUpdated = true;
+        }
+      }
+
+      if (syncUpdated && !cancelled) {
+        positionNValuesRef.current = mergedMap;
+        setPositionNValues({ ...mergedMap });
+        try {
+          localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(mergedMap));
+        } catch {}
+        saveDbSettings({ binance_position_high_water_n_values: mergedMap });
+      }
+
+      // 2. 从本地后端维护的 2000 条 15m K线数据回溯自开仓时间以来的真实极值，确保刷新/重启后 N值绝不丢失
+      const now = Date.now();
+      for (const pos of positions) {
+        if (cancelled) return;
+        const openTs = pos.openTime || 0;
+        if (!openTs || !pos.entryPrice || pos.entryPrice <= 0) continue;
+
+        const key = `${pos.id}_${openTs}_${pos.entryPrice}`;
+        const lastCheck = nValueBackfillKeyRef.current[key] || 0;
+        if (lastCheck === -1 || (lastCheck > 0 && now - lastCheck < 35000)) {
+          continue;
+        }
+        nValueBackfillKeyRef.current[key] = now;
+
+        try {
+          const res = await fetch(`/api/market/candles?symbol=${encodeURIComponent(pos.symbol)}&limit=2000`);
+          if (!res.ok || cancelled) continue;
+          const json = await res.json();
+          const candles = Array.isArray(json?.candles) ? json.candles : [];
+          if (candles.length === 0) continue;
+
+          const isLong = pos.side === 'BUY';
+          let bestExtreme = pos.entryPrice;
+
+          for (const c of candles) {
+            const cOpen = Number(c.openTime || 0);
+            const cClose = Number(c.closeTime || 0);
+            if (cClose < openTs) continue;
+
+            if (cOpen >= openTs) {
+              // 完整处于开仓后的 K 线：取完整最高价（多单）或最低价（空单）
+              const val = isLong ? Number(c.high || 0) : Number(c.low || 0);
+              if (val > 0) {
+                bestExtreme = isLong ? Math.max(bestExtreme, val) : Math.min(bestExtreme, val);
+              }
+            } else {
+              // 开仓当根 15m K 线（如 23:58:31 入场处于 23:45~23:59 K 线内）：仅取收盘价，避免误计入场前前13分钟的上影线
+              const closeVal = Number(c.close || 0);
+              if (closeVal > 0) {
+                bestExtreme = isLong ? Math.max(bestExtreme, closeVal) : Math.min(bestExtreme, closeVal);
+              }
+            }
+          }
+
+          const klineRatio = isLong ? (bestExtreme / pos.entryPrice) : (pos.entryPrice / bestExtreme);
+          const klineFloorN = Math.floor(klineRatio);
+
+          if (klineFloorN > (positionNValuesRef.current[pos.id] || 0) && !cancelled) {
+            const nextMap = {
+              ...positionNValuesRef.current,
+              [pos.id]: klineFloorN
+            };
+            positionNValuesRef.current = nextMap;
+            setPositionNValues(nextMap);
+            try {
+              localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(nextMap));
+            } catch {}
+            saveDbSettings({ binance_position_high_water_n_values: nextMap });
+          }
+
+          // 当后端 15m 历史 K 线池已就绪 (>=100根) 且该仓位开仓时间已校准，标记本周期回溯完成 (-1)
+          const isOpenTimeVerified = Boolean(positionOpenTimesMetaRef.current[pos.id]?.verified);
+          if (candles.length >= 100 && isOpenTimeVerified) {
+            nValueBackfillKeyRef.current[key] = -1;
+          }
+        } catch {}
+      }
+    };
+
+    recoverHighWaterN();
+    return () => {
+      cancelled = true;
+    };
+  }, [positions, positionRiskConfigs, saveDbSettings]);
 
   // 实时行情价格引擎：对活跃持仓币对及当前下单币对进行极速刷新 (500ms 轮询本地后端内存)
   useEffect(() => {
@@ -1906,9 +2053,37 @@ export default function App() {
             try { localStorage.setItem('trading_terminal_alarm_settings', JSON.stringify(alarmConfig)); } catch {}
           }
           if (settings.binance_position_high_water_n_values && typeof settings.binance_position_high_water_n_values === 'object') {
-            setPositionNValues(settings.binance_position_high_water_n_values);
-            positionNValuesRef.current = settings.binance_position_high_water_n_values;
-            try { localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(settings.binance_position_high_water_n_values)); } catch {}
+            const dbNMap = settings.binance_position_high_water_n_values as Record<string, number>;
+            const mergedN: Record<string, number> = { ...positionNValuesRef.current };
+            for (const [k, v] of Object.entries(dbNMap)) {
+              const num = Number(v) || 0;
+              if (num > (mergedN[k] || 0)) {
+                mergedN[k] = num;
+              }
+            }
+            setPositionNValues(mergedN);
+            positionNValuesRef.current = mergedN;
+            try { localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(mergedN)); } catch {}
+          }
+          if (settings.binance_position_open_times && typeof settings.binance_position_open_times === 'object') {
+            const dbOt = settings.binance_position_open_times as Record<string, any>;
+            const mergedMeta = { ...positionOpenTimesMetaRef.current };
+            const mergedTimes = { ...positionOpenTimesRef.current };
+            for (const [k, v] of Object.entries(dbOt)) {
+              const dbTime = typeof v === 'number' ? v : Number(v?.openTime || 0);
+              const dbVerified = typeof v === 'object' && Boolean(v?.verified);
+              const dbEntry = typeof v === 'object' ? Number(v?.entryPrice || 0) : 0;
+              if (dbTime > 0) {
+                const cur = mergedMeta[k];
+                if (!cur || (dbVerified && !cur.verified) || (dbVerified === Boolean(cur.verified) && dbTime < cur.openTime)) {
+                  mergedMeta[k] = { openTime: dbTime, verified: dbVerified, entryPrice: dbEntry || undefined };
+                  mergedTimes[k] = dbTime;
+                }
+              }
+            }
+            positionOpenTimesMetaRef.current = mergedMeta;
+            positionOpenTimesRef.current = mergedTimes;
+            try { localStorage.setItem('binance_position_open_times', JSON.stringify(mergedMeta)); } catch {}
           }
         }
         
@@ -2377,10 +2552,129 @@ export default function App() {
         const [posRes, ordersRes, algoRes] = await Promise.all([posPromise, ordersPromise, algoPromise]);
         
         let mappedPositions: Position[] = [];
+        let posSnapshotSucceeded = false;
+
+        // 异步校准真实首次开仓时间（通过 /fapi/v1/userTrades 逆向还原当前持仓周期起点，解决分批平仓后币安 p.updateTime 刷新导致开仓时间变更为减仓时间的问题）
+        const verifyActivePositionsOpenTimes = async (activePosList: Position[]) => {
+          if (!activePosList || activePosList.length === 0) return;
+          const nowTs = Date.now();
+          let anyUpdated = false;
+          const updatedMeta = { ...positionOpenTimesMetaRef.current };
+          const updatedTimes = { ...positionOpenTimesRef.current };
+          const updatedPosMap = new Map<string, number>();
+
+          for (const pos of activePosList) {
+            const meta = updatedMeta[pos.id];
+            const entryChanged = meta?.entryPrice && pos.entryPrice > 0
+              ? (Math.abs(meta.entryPrice - pos.entryPrice) / pos.entryPrice > 0.01)
+              : false;
+
+            if (meta?.verified && meta.openTime > 0 && !entryChanged) {
+              continue;
+            }
+
+            const lastTry = openTimeVerifyCooldownRef.current[pos.id] || 0;
+            if (nowTs - lastTry < 60000) {
+              continue;
+            }
+            openTimeVerifyCooldownRef.current[pos.id] = nowTs;
+
+            try {
+              const trRes = await fetch('/api/binance-proxy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  method: 'GET',
+                  endpoint: '/fapi/v1/userTrades',
+                  params: { symbol: pos.symbol, limit: 200 },
+                  apiKey: apiConfigRef.current.apiKey,
+                  apiSecret: apiConfigRef.current.apiSecret,
+                  baseUrl: apiConfigRef.current.baseUrl || 'https://fapi.binance.com'
+                })
+              });
+              if (!trRes.ok) continue;
+              const trades = await trRes.json();
+              if (!Array.isArray(trades) || trades.length === 0) continue;
+
+              const posSide = pos.positionSide || 'BOTH';
+              const isLong = pos.side === 'BUY';
+              const relevant = trades
+                .filter((t: any) => posSide === 'BOTH' || !t.positionSide || t.positionSide === 'BOTH' || t.positionSide === posSide)
+                .sort((a: any, b: any) => Number(b.time) - Number(a.time) || Number(b.id || 0) - Number(a.id || 0));
+
+              let runningSigned = isLong ? pos.amount : -pos.amount;
+              let earliestCycleTime = 0;
+
+              for (const t of relevant) {
+                const qty = parseFloat(t.qty || '0');
+                if (qty <= 0) continue;
+                const delta = t.side === 'BUY' ? qty : -qty;
+                const prevSigned = runningSigned - delta;
+                earliestCycleTime = Number(t.time);
+
+                if (isLong && prevSigned <= 1e-8) {
+                  break;
+                }
+                if (!isLong && prevSigned >= -1e-8) {
+                  break;
+                }
+                runningSigned = prevSigned;
+              }
+
+              if (earliestCycleTime > 0) {
+                updatedMeta[pos.id] = {
+                  openTime: earliestCycleTime,
+                  verified: true,
+                  entryPrice: pos.entryPrice
+                };
+                updatedTimes[pos.id] = earliestCycleTime;
+                if (pos.openTime !== earliestCycleTime) {
+                  updatedPosMap.set(pos.id, earliestCycleTime);
+                }
+                anyUpdated = true;
+
+                // 若该仓位的超时风控 activatedAt 曾被错误记录为分批平仓后的 updateTime，同步修正回真实开仓时间
+                const existingCfg = positionRiskConfigsRef.current[pos.id];
+                if (existingCfg?.timeoutPriceControl?.activatedAt && existingCfg.timeoutPriceControl.activatedAt > earliestCycleTime + 60000) {
+                  handleSavePositionRiskConfig({
+                    ...existingCfg,
+                    timeoutPriceControl: {
+                      ...existingCfg.timeoutPriceControl,
+                      activatedAt: earliestCycleTime
+                    }
+                  });
+                }
+              }
+            } catch {}
+          }
+
+          if (anyUpdated) {
+            positionOpenTimesMetaRef.current = updatedMeta;
+            positionOpenTimesRef.current = updatedTimes;
+            try {
+              localStorage.setItem('binance_position_open_times', JSON.stringify(updatedMeta));
+            } catch {}
+            saveDbSettings({ binance_position_open_times: updatedMeta });
+
+            if (updatedPosMap.size > 0) {
+              setPositions(prev => {
+                const next = prev.map(p => {
+                  const corrected = updatedPosMap.get(p.id);
+                  return corrected ? { ...p, openTime: corrected } : p;
+                });
+                next.sort((a, b) => (b.openTime || b.timestamp || 0) - (a.openTime || a.timestamp || 0));
+                positionsRef.current = next;
+                fetchActiveFundingFeesRef.current?.(next);
+                return next;
+              });
+            }
+          }
+        };
         
         if (posRes.ok) {
           const data = await posRes.json();
           if (Array.isArray(data)) {
+            posSnapshotSucceeded = true;
             const now = Date.now();
             // 清理已过期的 15s 平仓防干涉记录
             for (const [id, time] of recentlyClosedPosIdsRef.current.entries()) {
@@ -2400,6 +2694,7 @@ export default function App() {
               return true;
             });
 
+            let openTimesChanged = false;
             mappedPositions = currentActivePositions.map((p: any) => {
               const amount = Math.abs(parseFloat(p.positionAmt));
               const entryPrice = parseFloat(p.entryPrice);
@@ -2408,10 +2703,21 @@ export default function App() {
               const pnlPercent = (entryPrice * amount > 0) ? (pnl / (entryPrice * amount)) * 100 : 0;
               const posId = p.symbol + p.positionSide;
 
-              let posOpenTime = positionOpenTimesRef.current[posId];
+              const existingMeta = positionOpenTimesMetaRef.current[posId];
+              const entryChanged = existingMeta?.entryPrice && entryPrice > 0
+                ? (Math.abs(existingMeta.entryPrice - entryPrice) / entryPrice > 0.01)
+                : false;
+
+              let posOpenTime = !entryChanged ? positionOpenTimesRef.current[posId] : 0;
               if (!posOpenTime) {
                 posOpenTime = (p.updateTime && Number(p.updateTime) > 0) ? Number(p.updateTime) : Date.now();
                 positionOpenTimesRef.current[posId] = posOpenTime;
+                positionOpenTimesMetaRef.current[posId] = {
+                  openTime: posOpenTime,
+                  verified: false,
+                  entryPrice
+                };
+                openTimesChanged = true;
               }
 
               return {
@@ -2429,6 +2735,12 @@ export default function App() {
               };
             });
 
+            if (openTimesChanged) {
+              try {
+                localStorage.setItem('binance_position_open_times', JSON.stringify(positionOpenTimesMetaRef.current));
+              } catch {}
+            }
+
             // 按照开仓时间由近至远从上往下排列（最新开仓在顶部）
             mappedPositions.sort((a, b) => {
               const timeA = a.openTime || a.timestamp || 0;
@@ -2440,6 +2752,8 @@ export default function App() {
             positionsRef.current = mappedPositions;
             checkPositionsRiskRef.current?.();
             fetchActiveFundingFeesRef.current?.(mappedPositions);
+            // 异步逆向校验真实首次开仓时间（避免分批平仓刷新 p.updateTime）
+            verifyActivePositionsOpenTimes(mappedPositions);
 
             // Check if any position got closed
             if (previousActiveAccountRef.current !== currentAccount) {
@@ -2512,12 +2826,16 @@ export default function App() {
           }
         }
 
-        let combinedOrders: OpenOrder[] = [];
+        let normalOrdersFetched = false;
+        let algoOrdersFetched = false;
+        let fetchedNormalOrders: OpenOrder[] = [];
+        let fetchedAlgoOrders: OpenOrder[] = [];
 
         if (ordersRes.ok) {
           const normalOrders = await ordersRes.json();
           if (Array.isArray(normalOrders)) {
-            combinedOrders = [...combinedOrders, ...normalOrders.map((o: any) => ({
+            normalOrdersFetched = true;
+            fetchedNormalOrders = normalOrders.map((o: any) => ({
               id: String(o.orderId ?? o.id ?? Math.random()),
               symbol: o.symbol,
               side: o.side,
@@ -2526,8 +2844,10 @@ export default function App() {
               stopPrice: parseFloat(o.stopPrice),
               isAlgo: false,
               time: Number(o.time || o.updateTime || Date.now()),
-              positionSide: o.positionSide
-            }))];
+              positionSide: o.positionSide,
+              reduceOnly: Boolean(o.reduceOnly === true || o.reduceOnly === 'true'),
+              closePosition: Boolean(o.closePosition === true || o.closePosition === 'true')
+            }));
           }
         }
 
@@ -2535,7 +2855,8 @@ export default function App() {
           const algoData = await algoRes.json();
           const algoOrders = Array.isArray(algoData) ? algoData : (algoData.orders || algoData.algoOrders || []);
           if (Array.isArray(algoOrders)) {
-            combinedOrders = [...combinedOrders, ...algoOrders.map((o: any) => ({
+            algoOrdersFetched = true;
+            fetchedAlgoOrders = algoOrders.map((o: any) => ({
               id: String(o.algoId ?? o.clientAlgoId ?? o.id ?? Math.random()),
               symbol: o.symbol,
               side: o.side,
@@ -2544,49 +2865,97 @@ export default function App() {
               stopPrice: parseFloat(o.triggerPrice || o.stopPrice || 0),
               isAlgo: true,
               time: Number(o.time || o.createTime || o.updateTime || o.bookTime || Date.now()),
-              positionSide: o.positionSide
-            }))];
+              positionSide: o.positionSide,
+              reduceOnly: Boolean(o.reduceOnly === true || o.reduceOnly === 'true'),
+              closePosition: Boolean(o.closePosition === true || o.closePosition === 'true')
+            }));
           }
         }
 
-        // 关键过滤：若某个币对在 mappedPositions 中已无任何持仓，且刚刚平仓归零，
-        // 则在 combinedOrders 中剔除该已平仓币对的旧委托单，防止交易所 REST 缓存延迟重新带回已撤销挂单，
-        // 同时确保其他仍然有持仓的币对的委托单完好保留、正常展示
-        const activeSymbols = new Set(mappedPositions.map(p => p.symbol));
-        const filteredOrders = combinedOrders.filter(o => {
-          if (!activeSymbols.has(o.symbol) && recentlyClosedPosIdsRef.current.has(o.symbol)) {
-            return false;
-          }
-          return true;
-        });
+        if (normalOrdersFetched || algoOrdersFetched) {
+          const fallbackNormal = normalOrdersFetched ? fetchedNormalOrders : openOrdersRef.current.filter(o => !o.isAlgo);
+          const fallbackAlgo = algoOrdersFetched ? fetchedAlgoOrders : openOrdersRef.current.filter(o => o.isAlgo);
+          const combinedOrders: OpenOrder[] = [...fallbackNormal, ...fallbackAlgo];
 
-        const sortedOrders = filteredOrders.sort((a, b) => b.time - a.time);
-        setOpenOrders(sortedOrders);
+          // 仅当本次持仓快照成功返回时才使用 mappedPositions 判断活跃币对，否则回退至上一轮可靠持仓列表
+          const authoritativePositions = posSnapshotSucceeded ? mappedPositions : positionsRef.current;
+          const activeSymbols = new Set(authoritativePositions.map(p => p.symbol));
 
-        // Always clean up refs for closed positions
-        const currentIds = new Set(mappedPositions.map(p => p.id));
-        Object.keys(positionOpenTimesRef.current).forEach(id => {
-          if (!currentIds.has(id)) {
-            delete positionOpenTimesRef.current[id];
-          }
-        });
+          // 孤儿止盈/止损挂单自愈清理：当持仓快照确认成功且某币对已无任何活跃持仓时，
+          // 若存在超过20秒的遗留止盈/止损或只减仓委托单（例如网页离线或后台超时平仓期间遗留的 STOP_MARKET），自动撤销
+          const orphanSymbolsToClean = new Set<string>();
+          if (posSnapshotSucceeded) {
+            const nowCheck = Date.now();
+            for (const o of combinedOrders) {
+              if (!o.symbol || activeSymbols.has(o.symbol)) continue;
+              if (o.time > 0 && nowCheck - o.time < 20000) continue; // 预留20秒缓冲，保护刚开仓正在同步中的挂单
+              const isClosingOrTpSl =
+                o.isAlgo ||
+                o.reduceOnly ||
+                o.closePosition ||
+                ['STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP', 'TAKE_PROFIT', 'TRAILING_STOP_MARKET'].includes(o.type);
+              if (isClosingOrTpSl) {
+                orphanSymbolsToClean.add(o.symbol);
+              }
+            }
 
-        // 同步清理已平仓持仓的 N值记录
-        let nCleaned = false;
-        const nMap = { ...positionNValuesRef.current };
-        Object.keys(nMap).forEach(id => {
-          if (!currentIds.has(id)) {
-            delete nMap[id];
-            nCleaned = true;
+            for (const orphanSym of orphanSymbolsToClean) {
+              const lastClean = orphanOrderCleanCooldownRef.current[orphanSym] || 0;
+              if (nowCheck - lastClean >= 30000) {
+                orphanOrderCleanCooldownRef.current[orphanSym] = nowCheck;
+                addLog(`[孤儿挂单自愈] 🧹 检测到已无持仓的币对 [${orphanSym}] 仍存在残留止盈/止损挂单，正在自动执行精准撤单清理...`, 'INFO');
+                handleCancelOrdersBySymbolRef.current(orphanSym);
+              }
+            }
           }
-        });
-        if (nCleaned) {
-          positionNValuesRef.current = nMap;
-          setPositionNValues(nMap);
-          try {
-            localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(nMap));
-          } catch {}
-          saveDbSettings({ binance_position_high_water_n_values: nMap });
+
+          const filteredOrders = combinedOrders.filter(o => {
+            if (!activeSymbols.has(o.symbol) && (recentlyClosedPosIdsRef.current.has(o.symbol) || orphanSymbolsToClean.has(o.symbol))) {
+              return false;
+            }
+            return true;
+          });
+
+          const sortedOrders = filteredOrders.sort((a, b) => b.time - a.time);
+          setOpenOrders(sortedOrders);
+        }
+
+        // 严禁在 posRes 失败（如网络波动、429限流、服务重启瞬间）时误将空数组当作“全部平仓”而清空 N值与开仓时间缓存！
+        // 仅当 posSnapshotSucceeded === true（币安持仓接口真实返回有效数组）时，才清理确已平仓归零的历史记录
+        if (posSnapshotSucceeded) {
+          const currentIds = new Set(mappedPositions.map(p => p.id));
+          let otCleaned = false;
+          Object.keys(positionOpenTimesRef.current).forEach(id => {
+            if (!currentIds.has(id)) {
+              delete positionOpenTimesRef.current[id];
+              delete positionOpenTimesMetaRef.current[id];
+              otCleaned = true;
+            }
+          });
+          if (otCleaned) {
+            try {
+              localStorage.setItem('binance_position_open_times', JSON.stringify(positionOpenTimesMetaRef.current));
+            } catch {}
+            saveDbSettings({ binance_position_open_times: positionOpenTimesMetaRef.current });
+          }
+
+          // 同步清理确已平仓持仓的 N值记录
+          let nCleaned = false;
+          const nMap = { ...positionNValuesRef.current };
+          Object.keys(nMap).forEach(id => {
+            if (!currentIds.has(id)) {
+              delete nMap[id];
+              nCleaned = true;
+            }
+          });
+          if (nCleaned) {
+            positionNValuesRef.current = nMap;
+            setPositionNValues(nMap);
+            try {
+              localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(nMap));
+            } catch {}
+            saveDbSettings({ binance_position_high_water_n_values: nMap });
+          }
         }
       } catch (error) {
         // Silent fail for background calibration
@@ -2652,6 +3021,26 @@ export default function App() {
             recentlyClosedPosIdsRef.current.set(posId, Date.now());
             recentlyClosedPosIdsRef.current.set(symbol, Date.now());
 
+            // 同步清理已平仓位的开仓时间与高水位 N值
+            if (positionOpenTimesRef.current[posId] || positionOpenTimesMetaRef.current[posId]) {
+              delete positionOpenTimesRef.current[posId];
+              delete positionOpenTimesMetaRef.current[posId];
+              try {
+                localStorage.setItem('binance_position_open_times', JSON.stringify(positionOpenTimesMetaRef.current));
+              } catch {}
+              saveDbSettings({ binance_position_open_times: positionOpenTimesMetaRef.current });
+            }
+            if (positionNValuesRef.current[posId] !== undefined) {
+              const nextN = { ...positionNValuesRef.current };
+              delete nextN[posId];
+              positionNValuesRef.current = nextN;
+              setPositionNValues(nextN);
+              try {
+                localStorage.setItem('binance_position_high_water_n_values', JSON.stringify(nextN));
+              } catch {}
+              saveDbSettings({ binance_position_high_water_n_values: nextN });
+            }
+
             if (existingIndex !== -1) {
               const closedPos = currentList[existingIndex];
               currentList.splice(existingIndex, 1);
@@ -2692,8 +3081,20 @@ export default function App() {
             const pnlPercent = (entryPrice * amount > 0) ? (pnl / (entryPrice * amount)) * 100 : 0;
             const side = amountAmt > 0 ? 'BUY' : 'SELL';
 
-            let posOpenTime = positionOpenTimesRef.current[posId] || (existingIndex !== -1 ? currentList[existingIndex].openTime : Date.now());
+            const eventTs = Number(accountData.T || accountData.E || Date.now());
+            let posOpenTime = positionOpenTimesRef.current[posId] || (existingIndex !== -1 ? currentList[existingIndex].openTime : eventTs) || eventTs;
             positionOpenTimesRef.current[posId] = posOpenTime;
+            if (!positionOpenTimesMetaRef.current[posId]) {
+              positionOpenTimesMetaRef.current[posId] = {
+                openTime: posOpenTime,
+                verified: existingIndex === -1,
+                entryPrice
+              };
+              try {
+                localStorage.setItem('binance_position_open_times', JSON.stringify(positionOpenTimesMetaRef.current));
+              } catch {}
+              saveDbSettings({ binance_position_open_times: positionOpenTimesMetaRef.current });
+            }
 
             const updatedPosition: Position = {
               id: posId,

@@ -722,47 +722,64 @@ export class MarketDataManager {
     }
   }
 
+  private symbolFetchingPromises: Map<string, Promise<KlineCandle[]>> = new Map();
+
   /**
    * 确保并获取单个币对的 2000 根 15m K 线（支持按需即时精准补齐）
-   * 严格防重复拉取：若该币对已拉取过历史或已有 K 线数据，后续均依赖 WebSocket 实时流更新，坚决不再重复调用 REST API
+   * 严格防重复拉取：若该币对已成功拉取过历史底座 (hasFetchedHistory === true)，后续均 100% 依赖 WebSocket 实时流维护，坚决不再调用 REST API
    */
   public async ensureSymbolCandles(symbol: string, targetCount: number = 2000): Promise<KlineCandle[]> {
     const sym = symbol.toUpperCase();
-    let record = this.symbolsMap.get(sym);
-    // 仅在首次且本地无任何蜡烛数据时，才拉取一次历史底座
-    if (!record || (!record.hasFetchedHistory && record.candles15m.length === 0)) {
-      const freshCandles = await this.fetchRaw15mKlines2000(sym);
-      if (freshCandles.length > 0) {
-        if (!record) {
-          record = {
-            symbol: sym,
-            candles15m: freshCandles.slice(-targetCount),
-            quoteVolume24h: 0,
-            priceChangePercent24h: 0,
-            lastPrice: freshCandles[freshCandles.length - 1].close,
-            markPrice: freshCandles[freshCandles.length - 1].close,
-            fundingRate: 0,
-            nextFundingTime: 0,
-            fundingIntervalHours: 8,
-            lastUpdated: Date.now(),
-            hasFetchedHistory: true
-          };
-          this.symbolsMap.set(sym, record);
-        } else {
-          record.hasFetchedHistory = true;
-          const liveCandles = record.candles15m;
-          const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
-          if (lastCandle && (lastCandle as any).isLiveWs) {
-            const merged = freshCandles.filter(c => c.openTime < lastCandle.openTime);
-            merged.push(lastCandle);
-            record.candles15m = merged.slice(-targetCount);
+    const existing = this.symbolsMap.get(sym);
+    if (existing && existing.hasFetchedHistory) {
+      return existing.candles15m;
+    }
+
+    if (this.symbolFetchingPromises.has(sym)) {
+      return this.symbolFetchingPromises.get(sym)!;
+    }
+
+    const fetchPromise = (async () => {
+      try {
+        const freshCandles = await this.fetchRaw15mKlines2000(sym);
+        let record = this.symbolsMap.get(sym);
+        if (freshCandles.length > 0) {
+          if (!record) {
+            record = {
+              symbol: sym,
+              candles15m: freshCandles.slice(-targetCount),
+              quoteVolume24h: 0,
+              priceChangePercent24h: 0,
+              lastPrice: freshCandles[freshCandles.length - 1].close,
+              markPrice: freshCandles[freshCandles.length - 1].close,
+              fundingRate: 0,
+              nextFundingTime: 0,
+              fundingIntervalHours: 8,
+              lastUpdated: Date.now(),
+              hasFetchedHistory: true
+            };
+            this.symbolsMap.set(sym, record);
           } else {
-            record.candles15m = freshCandles.slice(-targetCount);
+            record.hasFetchedHistory = true;
+            const liveCandles = record.candles15m;
+            const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
+            if (lastCandle && (lastCandle as any).isLiveWs) {
+              const merged = freshCandles.filter(c => c.openTime < lastCandle.openTime);
+              merged.push(lastCandle);
+              record.candles15m = merged.slice(-targetCount);
+            } else {
+              record.candles15m = freshCandles.slice(-targetCount);
+            }
           }
         }
+        return record?.candles15m || [];
+      } finally {
+        this.symbolFetchingPromises.delete(sym);
       }
-    }
-    return record?.candles15m || [];
+    })();
+
+    this.symbolFetchingPromises.set(sym, fetchPromise);
+    return fetchPromise;
   }
 
   /**
@@ -796,44 +813,12 @@ export class MarketDataManager {
         const batch = groupSymbols.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(async (symbol) => {
           try {
-            let record = this.symbolsMap.get(symbol);
-            // 核心防重复：若该币对已经成功拉取过历史或已有充足蜡烛，直接跳过，后续全由 WebSocket 实时流接管
-            if (record && record.hasFetchedHistory && record.candles15m.length >= 1000) {
+            const record = this.symbolsMap.get(symbol);
+            // 核心防重复：若该币对已经成功拉取过历史底座，直接跳过，后续全由 WebSocket 实时流接管
+            if (record && record.hasFetchedHistory) {
               return;
             }
-
-            const historicalCandles = await this.fetchRaw15mKlines2000(symbol);
-
-            if (historicalCandles.length > 0) {
-              if (!record) {
-                record = {
-                  symbol,
-                  candles15m: historicalCandles.slice(-2000),
-                  quoteVolume24h: 0,
-                  priceChangePercent24h: 0,
-                  lastPrice: historicalCandles[historicalCandles.length - 1].close,
-                  markPrice: historicalCandles[historicalCandles.length - 1].close,
-                  fundingRate: 0,
-                  nextFundingTime: 0,
-                  fundingIntervalHours: 8,
-                  lastUpdated: Date.now(),
-                  hasFetchedHistory: true
-                };
-                this.symbolsMap.set(symbol, record);
-              } else {
-                record.hasFetchedHistory = true;
-                // 权威官方真实 K 线覆盖：若末尾有实时 WebSocket 接收到的未闭合蜡烛，平滑合并
-                const liveCandles = record.candles15m;
-                const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
-                if (lastCandle && (lastCandle as any).isLiveWs) {
-                  const merged = historicalCandles.filter(c => c.openTime < lastCandle.openTime);
-                  merged.push(lastCandle);
-                  record.candles15m = merged.slice(-2000);
-                } else {
-                  record.candles15m = historicalCandles.slice(-2000);
-                }
-              }
-            }
+            await this.ensureSymbolCandles(symbol, 2000);
           } catch (e: any) {
             // 单个币对拉取失败不中断整个流程
           } finally {

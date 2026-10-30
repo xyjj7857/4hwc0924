@@ -81,6 +81,8 @@ export interface OpenOrder {
   isAlgo: boolean;
   time: number;
   positionSide: string;
+  reduceOnly?: boolean;
+  closePosition?: boolean;
 }
 
 export type AlarmSoundType = 'chime' | 'radar' | 'gentle' | 'tri-tone';

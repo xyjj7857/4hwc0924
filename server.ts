@@ -2590,6 +2590,17 @@ async function executeAutoTradingBackend4h(cycleId: number) {
         orderSuccess = true;
         orderId = String(orderData.orderId || orderData.clientOrderId || '');
         openedCount++;
+        const exactOpenTs = Number(orderData.updateTime || orderData.transactTime || Date.now());
+        try {
+          const otRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("binance_position_open_times") as any;
+          const otMap = otRow && otRow.value ? JSON.parse(otRow.value) : {};
+          const posKey = `${sym}${successfulPositionSide || 'BOTH'}`;
+          otMap[posKey] = { openTime: exactOpenTs, verified: true, entryPrice: currentPrice };
+          db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(
+            "binance_position_open_times",
+            JSON.stringify(otMap)
+          );
+        } catch (e) {}
         addMonitorLog4h(`[4H自动策略-后端常驻] ✅ ${sym} 市价开多单成交！订单ID: ${orderId} (数量: ${formattedQty})`, 'SUCCESS');
       } else {
         orderReason = orderData?.msg || '下单接口未返回有效订单ID';
@@ -2739,9 +2750,144 @@ function runBackgroundMonitor4h() {
 }
 runBackgroundMonitor4h();
 
+// 辅助：后端彻底撤销指定币对的所有普通挂单 + Algo 条件委托单（防止平仓后遗留孤儿止盈/止损单）
+async function cancelAllOrdersForSymbolBackend(sym: string, apiConfig: any) {
+  if (!sym || !apiConfig?.apiKey || !apiConfig?.apiSecret) return;
+  // 1. 撤销普通挂单 (LIMIT / 普通委托)
+  try {
+    await callBinanceSigned(
+      '/fapi/v1/allOpenOrders',
+      'DELETE',
+      { symbol: sym },
+      apiConfig.apiKey,
+      apiConfig.apiSecret,
+      apiConfig.baseUrl
+    );
+  } catch (e) {}
+
+  // 2. 查询并逐一撤销 Algo 算法委托单 (如 STOP_MARKET / TAKE_PROFIT_MARKET)
+  try {
+    const openAlgo = await callBinanceSigned(
+      '/fapi/v1/openAlgoOrders',
+      'GET',
+      { symbol: sym },
+      apiConfig.apiKey,
+      apiConfig.apiSecret,
+      apiConfig.baseUrl
+    );
+    const algoList = Array.isArray(openAlgo) ? openAlgo : (openAlgo?.orders || openAlgo?.algoOrders || []);
+    if (Array.isArray(algoList) && algoList.length > 0) {
+      for (const a of algoList) {
+        if (a.symbol && a.symbol !== sym) continue;
+        const aId = a.algoId ?? a.clientAlgoId ?? a.id;
+        if (aId) {
+          try {
+            await callBinanceSigned(
+              '/fapi/v1/algoOrder',
+              'DELETE',
+              { algoId: aId, symbol: sym },
+              apiConfig.apiKey,
+              apiConfig.apiSecret,
+              apiConfig.baseUrl
+            );
+          } catch (delErr) {}
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+// 辅助：通过成交历史逆向推算当前持仓周期的真实首次开仓时间（避免分批平仓后 p.updateTime 刷新覆盖真实开仓时间）
+const backendOpenTimeVerifyCooldown = new Map<string, number>();
+async function resolveTruePositionOpenTimeBackend(p: any, apiConfig: any): Promise<number> {
+  const sym = p.symbol;
+  const posSide = p.positionSide || 'BOTH';
+  const posKey = `${sym}${posSide}`;
+  const posAmt = parseFloat(p.positionAmt || '0');
+  const isLong = posAmt > 0;
+  const absAmt = Math.abs(posAmt);
+  const entryPrice = parseFloat(p.entryPrice || '0');
+  const now = Date.now();
+
+  let otMap: Record<string, any> = {};
+  try {
+    const otRow = db.prepare("SELECT value FROM settings WHERE key = ?").get("binance_position_open_times") as any;
+    if (otRow && otRow.value) otMap = JSON.parse(otRow.value);
+  } catch (e) {}
+
+  const cached = otMap[posKey];
+  const cachedOpenTime = typeof cached === 'number' ? cached : Number(cached?.openTime || 0);
+  const cachedVerified = typeof cached === 'object' && Boolean(cached?.verified);
+  const cachedEntry = typeof cached === 'object' ? Number(cached?.entryPrice || 0) : 0;
+  const entryChangedSignificantly = cachedEntry > 0 && entryPrice > 0 && (Math.abs(cachedEntry - entryPrice) / entryPrice > 0.01);
+
+  if (cachedOpenTime > 0 && cachedVerified && !entryChangedSignificantly) {
+    return cachedOpenTime;
+  }
+
+  const lastAttempt = backendOpenTimeVerifyCooldown.get(posKey) || 0;
+  if (now - lastAttempt < 60000) {
+    return cachedOpenTime || Number(p.updateTime) || now;
+  }
+  backendOpenTimeVerifyCooldown.set(posKey, now);
+
+  try {
+    const trades = await callBinanceSigned(
+      '/fapi/v1/userTrades',
+      'GET',
+      { symbol: sym, limit: 200 },
+      apiConfig.apiKey,
+      apiConfig.apiSecret,
+      apiConfig.baseUrl
+    );
+    if (Array.isArray(trades) && trades.length > 0) {
+      const relevant = trades
+        .filter((t: any) => posSide === 'BOTH' || !t.positionSide || t.positionSide === 'BOTH' || t.positionSide === posSide)
+        .sort((a: any, b: any) => Number(b.time) - Number(a.time) || Number(b.id || 0) - Number(a.id || 0));
+
+      let runningSigned = isLong ? absAmt : -absAmt;
+      let earliestCycleTime = 0;
+
+      for (const t of relevant) {
+        const qty = parseFloat(t.qty || '0');
+        if (qty <= 0) continue;
+        const delta = t.side === 'BUY' ? qty : -qty;
+        const prevSigned = runningSigned - delta;
+        earliestCycleTime = Number(t.time);
+
+        if (isLong && prevSigned <= 1e-8) {
+          break;
+        }
+        if (!isLong && prevSigned >= -1e-8) {
+          break;
+        }
+        runningSigned = prevSigned;
+      }
+
+      if (earliestCycleTime > 0) {
+        otMap[posKey] = { openTime: earliestCycleTime, verified: true, entryPrice };
+        try {
+          db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(
+            "binance_position_open_times",
+            JSON.stringify(otMap)
+          );
+        } catch (e) {}
+        return earliestCycleTime;
+      }
+    }
+  } catch (e) {}
+
+  return cachedOpenTime || Number(p.updateTime) || now;
+}
+
 // 24小时后台常驻持仓风控巡检（即使关闭前端网页，策略仍持续在后台巡检）
-// 核心规则：条件D（超时未达预期倍数平仓）满设定小时数（默认24h）若价格未超开仓价设定倍数（默认1.5倍），自动市价平仓
+// 核心规则：
+// 1. 条件D（超时未达预期倍数平仓）满设定小时数（默认24h）若价格未超开仓价设定倍数（默认1.5倍），自动市价平仓并彻底撤销普通单与Algo止盈止损单
+// 2. 孤儿止盈/止损委托单自愈巡检（每60秒检测一次已无持仓但残留的止盈/止损挂单并自动撤销）
 let isCheckingPositionRiskBackend = false;
+let backendOrphanSweepTick = 0;
+const backendOrphanCleanCooldown = new Map<string, number>();
+
 async function checkPositionsRiskBackend() {
   if (isCheckingPositionRiskBackend) return;
   isCheckingPositionRiskBackend = true;
@@ -2783,6 +2929,77 @@ async function checkPositionsRiskBackend() {
       return;
     }
     const activePositions = posRes.filter((p: any) => Math.abs(parseFloat(p.positionAmt || '0')) > 0);
+    const activeSymbols = new Set(activePositions.map((p: any) => p.symbol));
+    const now = Date.now();
+
+    // 1.5 每 60 秒（12 次 * 5s）执行一次孤儿止盈/止损挂单自愈巡检（即使当前 activePositions 为空也能清理已平仓残留挂单）
+    backendOrphanSweepTick++;
+    if (backendOrphanSweepTick >= 12) {
+      backendOrphanSweepTick = 0;
+      try {
+        const orphanSymbols = new Set<string>();
+        const openAlgo = await callBinanceSigned(
+          '/fapi/v1/openAlgoOrders',
+          'GET',
+          {},
+          apiConfig.apiKey,
+          apiConfig.apiSecret,
+          apiConfig.baseUrl
+        );
+        const algoList = Array.isArray(openAlgo) ? openAlgo : (openAlgo?.orders || openAlgo?.algoOrders || []);
+        if (Array.isArray(algoList)) {
+          for (const a of algoList) {
+            const sym = a.symbol;
+            if (!sym || activeSymbols.has(sym)) continue;
+            const orderTime = Number(a.time || a.createTime || a.updateTime || a.bookTime || 0);
+            if (orderTime > 0 && now - orderTime < 20000) continue; // 预留20秒缓冲，绝不误撤刚提交的新开仓配套单
+            orphanSymbols.add(sym);
+          }
+        }
+
+        const openNormal = await callBinanceSigned(
+          '/fapi/v1/openOrders',
+          'GET',
+          {},
+          apiConfig.apiKey,
+          apiConfig.apiSecret,
+          apiConfig.baseUrl
+        );
+        if (Array.isArray(openNormal)) {
+          for (const o of openNormal) {
+            const sym = o.symbol;
+            if (!sym || activeSymbols.has(sym)) continue;
+            const orderTime = Number(o.time || o.updateTime || 0);
+            if (orderTime > 0 && now - orderTime < 20000) continue;
+            const isClosingOrder =
+              o.reduceOnly === true ||
+              o.reduceOnly === 'true' ||
+              o.closePosition === true ||
+              o.closePosition === 'true' ||
+              ['STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP', 'TAKE_PROFIT', 'TRAILING_STOP_MARKET'].includes(String(o.type || ''));
+            if (isClosingOrder) {
+              orphanSymbols.add(sym);
+            }
+          }
+        }
+
+        for (const orphanSym of orphanSymbols) {
+          const lastCleaned = backendOrphanCleanCooldown.get(orphanSym) || 0;
+          if (now - lastCleaned < 30000) continue;
+          backendOrphanCleanCooldown.set(orphanSym, now);
+          addMonitorLog4h(
+            `[孤儿挂单自愈-后端常驻] 🧹 检测到已平仓币对 [${orphanSym}] 仍残留止盈/止损委托单，正在自动撤销清理...`,
+            'INFO'
+          );
+          await cancelAllOrdersForSymbolBackend(orphanSym, apiConfig);
+          addMonitorLog4h(
+            `[孤儿挂单自愈-后端常驻] ✅ 已平仓币对 [${orphanSym}] 残留挂单已全部自动撤销完毕`,
+            'SUCCESS'
+          );
+        }
+      } catch (sweepErr) {}
+    }
+
     if (activePositions.length === 0) {
       isCheckingPositionRiskBackend = false;
       return;
@@ -2806,19 +3023,19 @@ async function checkPositionsRiskBackend() {
     const defaultMultiplier = Number(orderSettings?.timeoutPriceClose?.multiplier) || 1.5;
     const defaultEnabled = orderSettings?.timeoutPriceClose?.enabled ?? true;
 
-    const now = Date.now();
     let exInfo: any = null;
 
     for (const p of activePositions) {
       const sym = p.symbol;
       const posAmt = parseFloat(p.positionAmt);
       const isLong = posAmt > 0;
-      const posId = `${sym}_${isLong ? 'BUY' : 'SELL'}`;
+      const posSideKey = `${sym}${p.positionSide || 'BOTH'}`;
+      const legacyPosId = `${sym}_${isLong ? 'BUY' : 'SELL'}`;
       const entryPrice = parseFloat(p.entryPrice) || 0;
       const markPrice = parseFloat(p.markPrice) || marketDataManager.getSymbolPrice(sym) || 0;
       if (entryPrice <= 0 || markPrice <= 0) continue;
 
-      const posCfg = accountConfigs[posId] || accountConfigs[sym];
+      const posCfg = accountConfigs[posSideKey] || accountConfigs[legacyPosId] || accountConfigs[sym];
       const tpc = posCfg?.timeoutPriceControl;
 
       const isEnabled = tpc?.enabled !== undefined ? Boolean(tpc.enabled) : defaultEnabled;
@@ -2828,8 +3045,12 @@ async function checkPositionsRiskBackend() {
       const targetMultiplier = Number(tpc?.priceMultiplier) || defaultMultiplier;
       const timeoutMs = timeoutHours * 3600 * 1000;
 
-      // 下单开始时间：优先取风控激活时间，其次取币安更新时间
-      const orderStartTime = Number(tpc?.activatedAt) || Number(p.updateTime) || now;
+      // 下单开始时间：优先通过历史成交逆向校准的真实首次开仓时间，避免分批平仓刷新 p.updateTime
+      const verifiedOpenTime = await resolveTruePositionOpenTimeBackend(p, apiConfig);
+      const activatedAt = Number(tpc?.activatedAt) || 0;
+      const orderStartTime = (verifiedOpenTime > 0 && (!activatedAt || activatedAt > verifiedOpenTime + 60000))
+        ? verifiedOpenTime
+        : (activatedAt || verifiedOpenTime || Number(p.updateTime) || now);
       const elapsed = now - orderStartTime;
 
       if (elapsed >= timeoutMs) {
@@ -2844,17 +3065,8 @@ async function checkPositionsRiskBackend() {
             try { exInfo = await getBackendExchangeInfo(); } catch (e) {}
           }
 
-          // 1. 撤销该币对所有历史委托单
-          try {
-            await callBinanceSigned(
-              '/fapi/v1/allOpenOrders',
-              'DELETE',
-              { symbol: sym },
-              apiConfig.apiKey,
-              apiConfig.apiSecret,
-              apiConfig.baseUrl
-            );
-          } catch (e) {}
+          // 1. 撤销该币对所有普通挂单与 Algo 算法止盈/止损委托单
+          await cancelAllOrdersForSymbolBackend(sym, apiConfig);
 
           // 2. 市价平仓
           const formattedQty = formatQtyForBackend(sym, Math.abs(posAmt), exInfo);
@@ -2881,6 +3093,8 @@ async function checkPositionsRiskBackend() {
             );
             if (closeRes && (closeRes.orderId || closeRes.clientOrderId)) {
               addMonitorLog4h(`[4H超时平仓-后台常驻] ✅ ${sym} 超时平仓市价单执行成功！订单ID: ${closeRes.orderId || closeRes.clientOrderId}`, 'SUCCESS');
+              // 平仓成交后再兜底确认撤销一次残余挂单
+              await cancelAllOrdersForSymbolBackend(sym, apiConfig);
             } else {
               addMonitorLog4h(`[4H超时平仓-后台常驻] ❌ ${sym} 超时平仓失败: ${closeRes?.msg || '未知原因'}`, 'ERROR');
             }
